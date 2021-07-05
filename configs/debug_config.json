@@ -16,16 +16,19 @@
     "data_format": "NCHW",
     "use_GPU_for_Gs": true,
     "use_mixed_precision": true,
+    "num_fp16_resolutions": 3,
     "use_XLA": false,
+    "conv_clamp": 256,
+    "fused_bias_act": true,
     "total_kimages": null,
     "transition_kimages": 8.5,
     "transition_kimages_dict": {
-        "8": 30
+        "8": 10
     },
     "stabilization_kimages": 8.5,
     "stabilization_kimages_dict": {
-        "4": 30,
-        "8": 30
+        "4": 10,
+        "8": 10
     },
     "batch_sizes": {
         "4": 64,
@@ -53,9 +56,19 @@
     },
     "reset_opt_state_for_new_lod": true,
     "max_models_to_keep": 3,
-    "summary_every": 1000000,
-    "save_model_every": 1000000,
-    "save_images_every": 10,
+    "summary_scalars_every_kimages": 0.1,
+    "summary_hists_every_kimages": 2,
+    "save_model_every_kimages": 2,
+    "save_images_every_kimages": 0.1,
+    "run_metrics_every_kimages": 2,
+    "metrics": {
+        "PPL": {
+            "num_samples": 2000,
+            "space": "w",
+            "sampling": "full",
+            "crop_face": false
+        }
+    },
     "normalize_latents": true,
     "mapping_layers": 2,
     "mapping_units": 512,
@@ -78,7 +91,7 @@
     "override_G_projecting_gain": true,
     "D_fused_scale": true,
     "D_weights_init_mode": null,
-    "D_activation": "relu",
+    "D_activation": "selu",
     "D_kernel_size": 3,
     "D_fmap_base": 8192,
     "D_fmap_max": 32,

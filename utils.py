@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 from glob import glob
 import shutil
@@ -76,6 +77,12 @@ DATA_FORMAT = 'data_format'
 USE_GPU_FOR_GS = 'use_GPU_for_Gs'
 # Use mixed precision training?
 USE_MIXED_PRECISION = 'use_mixed_precision'
+# Use FP16 for the N highest resolutions, regardless of dtype.
+NUM_FP16_RESOLUTIONS = 'num_fp16_resolutions'
+# Clamp activations to avoid float16 overflow? Note: number or None to disable
+CONV_CLAMP = 'conv_clamp'
+# Fuse bias and activation?
+FUSED_BIAS_ACT = 'fused_bias_act'
 # Data type
 # Note: it is not recommended to change it to float16, just use float32 and mixed precision training if needed
 DTYPE = 'dtype'
@@ -130,12 +137,18 @@ ADAM_BETA2 = 'adam_beta2'
 RESET_OPT_STATE_FOR_NEW_LOD = 'reset_opt_state_for_new_lod'
 # Max models to keep
 MAX_MODELS_TO_KEEP = 'max_models_to_keep'
-# How often to write summaries
-SUMMARY_EVERY = 'summary_every'
-# How often to save models weights
-SAVE_MODEL_EVERY = 'save_model_every'
-# How often to save progress images
-SAVE_IMAGES_EVERY = 'save_images_every'
+# How often to write scalar summaries (measured in thousands)
+SUMMARY_SCALARS_EVERY_KIMAGES = 'summary_scalars_every_kimages'
+# How often to write histogram summaries (measured in thousands)
+SUMMARY_HISTS_EVERY_KIMAGES = 'summary_hists_every_kimages'
+# How often to save models weights (measured in thousands)
+SAVE_MODEL_EVERY_KIMAGES = 'save_model_every_kimages'
+# How often to save progress images (measured in thousands)
+SAVE_IMAGES_EVERY_KIMAGES = 'save_images_every_kimages'
+# How often to run metrics (measured in thousands)
+RUN_METRICS_EVERY_KIMAGES = 'run_metrics_every_kimages'
+# Which metrics to compute? dict of form: {metric: [options]}
+METRICS_DICT = 'metrics'
 
 
 ### ---------- Generator Mapping network ---------- ###
@@ -258,9 +271,12 @@ VALID_MAX_PNG_RES = 'valid_max_png_res'
 
 DEFAULT_STORAGE_PATH = None
 DEFAULT_MAX_MODELS_TO_KEEP = 3
-DEFAULT_SUMMARY_EVERY = 500
-DEFAULT_SAVE_MODEL_EVERY = 5000
-DEFAULT_SAVE_IMAGES_EVERY = 500
+DEFAULT_SUMMARY_SCALARS_EVERY_KIMAGES = 5
+DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES = 25
+DEFAULT_SAVE_MODEL_EVERY_KIMAGES = 500
+DEFAULT_SAVE_IMAGES_EVERY_KIMAGES = 5
+DEFAULT_RUN_METRICS_EVERY_KIMAGES = 50
+DEFAULT_METRICS_DICT = {}
 DEFAULT_DATASET_MAX_CACHE_RES = -1
 DEFAULT_START_RESOLUTION = 8
 DEFAULT_TOTAL_KIMAGES = -1
@@ -286,8 +302,11 @@ DEFAULT_MAPPING_ACTIVATION = 'leaky_relu'
 DEFAULT_OVERRIDE_G_PROJECTING_GAIN = True
 DEFAULT_G_FUSED_SCALE = True
 DEFAULT_D_FUSED_SCALE = True
+DEFAULT_FUSED_BIAS_ACT = True
 DEFAULT_DTYPE = 'float32'
 DEFAULT_USE_MIXED_PRECISION = True
+DEFAULT_NUM_FP16_RESOLUTIONS = 'auto' # 4 - value used in the original implementation
+DEFAULT_CONV_CLAMP = None # 256 - value used in the official implementation
 DEFAULT_USE_XLA = True
 DEFAULT_G_ACTIVATION = 'leaky_relu'
 DEFAULT_D_ACTIVATION = 'leaky_relu'
@@ -302,7 +321,7 @@ DEFAULT_G_LEARNING_RATE = 0.001
 DEFAULT_D_LEARNING_RATE = 0.001
 DEFAULT_G_LEARNING_RATE_DICT = {}
 DEFAULT_D_LEARNING_RATE_DICT = {}
-DEFAULT_ADAM_BETA1 = 0.
+DEFAULT_ADAM_BETA1 = 0.0
 DEFAULT_ADAM_BETA2 = 0.99
 DEFAULT_RESET_OPT_STATE_FOR_NEW_LOD = True
 DEFAULT_USE_G_SMOOTHING = True
@@ -319,7 +338,7 @@ DEFAULT_SHUFFLE_DATASET = True
 DEFAULT_MIRROR_AUGMENT = True
 DEFAULT_VALID_GRID_NROWS = 5
 DEFAULT_VALID_GRID_NCOLS = 7
-DEFAULT_VALID_MIN_TARGET_SINGLE_IMAGE_SIZE = 2 ** 7 # or maybe 2**7  ?
+DEFAULT_VALID_MIN_TARGET_SINGLE_IMAGE_SIZE = 2 ** 7 # or maybe 2**7 ?
 DEFAULT_VALID_MAX_PNG_RES = 5
 
 # Note: by default Generator and Discriminator use the same values for these constants
@@ -352,13 +371,23 @@ ACTIVATION_FUNS_DICT = {
 }
 
 # Activation function which (might?) need to use float32 dtype
+# Should this activation only use fp32?
+# https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/grappler/optimizers/auto_mixed_precision_lists.h
 FP32_ACTIVATIONS = ['selu']
 
 # For jupyter notebooks
 EXAMPLE_IMAGES_DIR = 'example_images'
 
+# NCHW -> NHWC
+toNHWC_AXIS = [0, 2, 3, 1]
+# NHWC -> NCHW
+toNCHW_AXIS = [0, 3, 1, 2]
+
+LOSS_SCALE_KEY = 'loss_scale'
+
 DEBUG_MODE = 'debug_mode'
 DEFAULT_DEBUG_MODE = '0'
+
 
 def should_log_debug_info():
     return int(os.environ.get(DEBUG_MODE, DEFAULT_DEBUG_MODE)) > 0
@@ -413,6 +442,10 @@ def is_last_step(step, n_steps):
     return step == (n_steps - 1)
 
 
+def should_write_summary(summary_every: int, n_images: int, batch_size: int):
+    return (n_images // summary_every > 0 and n_images % summary_every < batch_size) or n_images == batch_size
+
+
 def level_of_details(res, resolution_log2):
     return resolution_log2 - res + 1
 
@@ -422,10 +455,16 @@ def compute_alpha(step, total_steps):
 
 
 def update_wsum_alpha(model, alpha):
-    for layer in model.layers:
-        if WSUM_NAME in layer.name:
-            layer.set_weights([np.array(alpha)])
-    return model
+    def recursive_update_wsum_alpha(model, alpha):
+        for layer in model.layers:
+            if isinstance(layer, tf.keras.Model):
+                recursive_update_wsum_alpha(layer, alpha)
+            else:
+                if WSUM_NAME in layer.name:
+                    layer.set_weights([np.array(alpha)])
+        return model
+
+    return recursive_update_wsum_alpha(model, alpha)
 
 
 def mult_by_zero(weights):
@@ -434,6 +473,29 @@ def mult_by_zero(weights):
 
 def create_model_type_key(res, mode):
     return f'{res}_{mode}'
+
+
+def get_start_fp16_resolution(num_fp16_resolutions, start_resolution_log2, target_resolution_log2):
+    # 1) 2 - 4 - start block resolution
+    # 2) 3 - 8 - default start resolution
+    # 3) 4 - 16
+    # 4) 5 - 32
+    # 5) 6 - 64
+    # 6) 7 - 128
+    # 7) 8 - 256
+    # 8) 9 - 512
+    # 9) 10 - 1024
+    if num_fp16_resolutions == 'auto':
+        """
+        # 1st value: a new init value, 2nd value: taken from the official implementation (N = 4)
+        return max(
+            min(start_resolution_log2 + 2, target_resolution_log2 - 4 + 1), start_resolution_log2
+        )
+        """
+        # Let start block resolution and two consequent ones use fp32
+        return 2 + 2
+    else:
+        return target_resolution_log2 - num_fp16_resolutions + 1
 
 
 #----------------------------------------------------------------------------
@@ -458,14 +520,6 @@ def set_optimizer_iters(optimizer, iters):
     return optimizer
 
 
-def old_maybe_scale_loss(loss, optimizer, mixed_precision: bool):
-    return optimizer.get_scaled_loss(loss) if mixed_precision else loss
-
-
-def old_maybe_unscale_grads(grads, optimizer, mixed_precision: bool):
-    return optimizer.get_unscaled_gradients(grads) if mixed_precision else grads
-
-
 def maybe_scale_loss(loss, optimizer):
     return optimizer.get_scaled_loss(loss) if optimizer.use_mixed_precision else loss
 
@@ -474,11 +528,12 @@ def maybe_unscale_grads(grads, optimizer):
     return optimizer.get_unscaled_gradients(grads) if optimizer.use_mixed_precision else grads
 
 
-def custom_unscale_grads(grads, vars, optimizer):
+def custom_unscale_grads(grads, vars, optimizer: tf.keras.mixed_precision.LossScaleOptimizer):
     # Note: works inside tf.function
     # All grads are casted to fp32
     dtype = tf.float32
-    coef = fp32(1. / optimizer._loss_scale())
+    # TODO: check if it should be optimizer.loss_scale or optimizer._loss_scale()
+    coef = fp32(1. / optimizer.loss_scale)
 
     def unscale_grad(g, v):
         return fp32(g) * coef if g is not None else (tf.zeros_like(v, dtype=dtype), v)
@@ -490,12 +545,12 @@ def custom_unscale_grads(grads, vars, optimizer):
     return grads_array.stack()
 
 
-def old_maybe_custom_unscale_grads(grads, vars, optimizer, mixed_precision: bool=None):
-    return custom_unscale_grads(grads, vars, optimizer) if mixed_precision else grads
-
-
 def maybe_custom_unscale_grads(grads, vars, optimizer):
     return custom_unscale_grads(grads, vars, optimizer) if optimizer.use_mixed_precision else grads
+
+
+def is_finite_grad(grad):
+    return tf.equal(tf.math.count_nonzero(~tf.math.is_finite(grad)), 0)
 
 
 def trace_vars(vars, title):
@@ -609,7 +664,7 @@ h5_weights_key = 'weights'
 
 def weights_to_dict(model, optimizer_call=False):
     vars = model.trainable_variables if not optimizer_call else model.weights
-    if optimizer_call:
+    if should_log_debug_info():
         print('\nSaving weights:')
         for idx, var in enumerate(vars):
             print(f'{idx}: {var.name}')
@@ -634,10 +689,12 @@ def save_weights(weights_dict, filename):
     f = h5py.File(filename, 'w')
     g = f.create_group(h5_weights_key)
 
-    for var_name in weights_dict.keys():
+    for idx, var_name in enumerate(weights_dict.keys()):
         value = weights_dict[var_name]
         shape = value.shape
         dset = g.create_dataset(name=var_name, shape=shape, dtype=value.dtype.name)
+        # TODO: for debugging, remove later
+        # print(f'{idx}) {var_name}: {value.mean():.4f}, std={value.std():.4f}')
         if not shape:
             # Scalar
             dset[()] = value
@@ -668,25 +725,22 @@ def load_weights_into_dict(var_names, filename):
 def load_weights(model, filename, optimizer_call=False):
     vars = model.trainable_variables if not optimizer_call else model.weights
     var_names = [var.name for var in vars]
-    if optimizer_call:
-        print('\nLoading weights, var names:\n', var_names)
     var_dict = load_weights_into_dict(var_names, filename)
 
     log_debug_info = should_log_debug_info()
     loaded_vars = []
-    i = 0
+    # Note: another approach is to use set_weights (load ur use existing value) for models and optimizers (maybe with deepcopy?)
     for var in vars:
         if var.name in var_dict.keys():
-            i += 1
-            #if log_debug_info:
-            if optimizer_call or True:
-                print(f'{i}: Loading {var.name}')
+            if log_debug_info:
+                print(f'Loading {var.name}')
             # Might be a Strange line for optimizer
             var.assign(var_dict[var.name])
             loaded_vars.append(var.name)
 
-    if optimizer_call or True:
-        print('\nLoaded these vars:\n', loaded_vars)
+    # TODO: for debugging, remove later
+    # print('\nOptimizer call:', optimizer_call)
+    # print('Loaded these vars:\n', loaded_vars)
 
     return model
 
@@ -696,7 +750,7 @@ def create_model_folder_path(model_name, res, stage, step=None, storage_path=DEF
     model_name - name of configuration model
     res - current resolution
     stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of step for given resolution and stage
+    step - number of steps (or processed images) for given resolution and stage
     storage_path - optional prefix path
     """
     res_folder = f'{2**res}x{2**res}'
@@ -719,7 +773,7 @@ def save_model(model, model_name, model_type, res,
                  used as a separate dir level
     res - current log2 resolution
     stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of step for given resolution and stage
+    step - number of steps (or processed images) for given resolution and stage
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of saving model
     """
@@ -743,6 +797,41 @@ def save_model(model, model_name, model_type, res,
     save_weights(weights_dict, filepath)
 
 
+def save_optimizer_loss_scale(optimizer: tf.keras.mixed_precision.LossScaleOptimizer,
+                              model_name: str, model_type: str, res: int, stage: str,
+                              step: int, storage_path: str = DEFAULT_STORAGE_PATH):
+    """
+    optimizer - an optimizer model from which loss scale is to be saved
+    model_name - name of configuration model
+    model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME],
+                 used as a separate dir level
+    res - current log2 resolution
+    stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
+    step - number of steps (or processed images) for given resolution and stage
+    storage_path - optional prefix path
+    Note: should probably change this fun to standard way of saving model
+    """
+    model_folder_path = create_model_folder_path(
+        model_name=model_name,
+        res=res,
+        stage=stage,
+        step=step,
+        storage_path=storage_path
+    )
+    model_folder_path += OPTIMIZER_POSTFIX
+    if not os.path.exists(model_folder_path):
+        os.makedirs(model_folder_path)
+
+    # This function is only called when loss scale is dynamic
+    loss_scale = float(optimizer._loss_scale().numpy())
+    if should_log_debug_info():
+        print(f'Saved loss scale for {model_type}: {loss_scale}')
+
+    filepath = os.path.join(model_folder_path, model_type + '.json')
+    with open(filepath, 'w') as fp:
+        json.dump({LOSS_SCALE_KEY: loss_scale}, fp)
+
+
 def load_model(model, model_name, model_type, res,
                stage, step, storage_path=DEFAULT_STORAGE_PATH):
     """
@@ -751,7 +840,7 @@ def load_model(model, model_name, model_type, res,
     model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME], used as a separate dir level
     res - current log2 resolution
     stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of step for given resolution and stage
+    step - number of steps (or processed images) for given resolution and stage
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of loading model
     """
@@ -772,6 +861,40 @@ def load_model(model, model_name, model_type, res,
     filepath = os.path.join(model_folder_path, model_type + '.h5')
     model = load_weights(model, filepath, optimizer_call=optimizer_call)
     return model
+
+
+def load_optimizer_loss_scale(model_name: str, model_type: str, res: int, stage: str,
+                              step: int, storage_path: str = DEFAULT_STORAGE_PATH):
+    """
+    optimizer - an optimizer model from which loss scale is to be saved
+    model_name - name of configuration model
+    model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME],
+                 used as a separate dir level
+    res - current log2 resolution
+    stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
+    step - number of steps (or processed images) for given resolution and stage
+    storage_path - optional prefix path
+    Note: should probably change this fun to standard way of saving model
+    """
+    model_folder_path = create_model_folder_path(
+        model_name=model_name,
+        res=res,
+        stage=stage,
+        step=step,
+        storage_path=storage_path
+    )
+    model_folder_path += OPTIMIZER_POSTFIX
+    if not os.path.exists(model_folder_path):
+        os.makedirs(model_folder_path)
+
+    filepath = os.path.join(model_folder_path, model_type +  OPTIMIZER_POSTFIX + '.json')
+    with open(filepath, 'r') as fp:
+        loss_scale = json.load(fp)[LOSS_SCALE_KEY]
+
+    if should_log_debug_info():
+        print(f'Loaded loss scale for {model_type}: {loss_scale}')
+
+    return loss_scale
 
 
 def remove_old_models(model_name, res, stage, max_models_to_keep, storage_path=DEFAULT_STORAGE_PATH):

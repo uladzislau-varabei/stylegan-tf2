@@ -3,12 +3,12 @@ import tensorflow as tf
 from tensorflow.keras.layers import Layer, Activation
 from tensorflow.keras import mixed_precision
 
-from utils import DEFAULT_DTYPE, DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT,\
+from utils import DEFAULT_DTYPE, DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT, WSUM_NAME,\
     validate_data_format, HE_GAIN, DEFAULT_USE_WSCALE, DEFAULT_TRUNCATE_WEIGHTS, DEFAULT_USE_XLA
 
 # Config constants
 from utils import ACTIVATION_FUNS_DICT, FP32_ACTIVATIONS, USE_MIXED_PRECISION, USE_WSCALE, TRUNCATE_WEIGHTS,\
-    DATA_FORMAT, RANDOMIZE_NOISE, BLUR_FILTER, USE_BIAS, MBSTD_GROUP_SIZE, MBSTD_NUM_FEATURES, \
+    DATA_FORMAT, RANDOMIZE_NOISE, BLUR_FILTER, USE_BIAS, USE_XLA, MBSTD_GROUP_SIZE, MBSTD_NUM_FEATURES, \
     DEFAULT_USE_MIXED_PRECISION, DEFAULT_RANDOMIZE_NOISE, DEFAULT_BLUR_FILTER, DEFAULT_USE_BIAS,\
     DEFAULT_MBSTD_NUM_FEATURES
 
@@ -138,7 +138,8 @@ def _downscale2d(x, factor, gain=1, data_format=DEFAULT_DATA_FORMAT):
     assert isinstance(factor, int) and factor >= 1
     validate_data_format(data_format)
 
-    if factor == 2 and x.dtype == tf.float32:
+    # Note: tf.nn.depthwise_conv2d already supports fp16
+    if factor == 2:
         f = [float(np.sqrt(gain) / factor)] * factor
         return _blur2d(x, f, normalize=False, stride=factor, data_format=data_format)
 
@@ -296,6 +297,7 @@ class ScaledLinear(Layer):
 
 
 class Bias(Layer):
+
     def __init__(self, lrmul=LRMUL, dtype=DEFAULT_DTYPE, use_xla=DEFAULT_USE_XLA,
                  data_format=DEFAULT_DATA_FORMAT, scope='', name=None):
         layer_name = make_layer_name(name, scope, 'Bias')
@@ -333,7 +335,7 @@ class Bias(Layer):
             return x + self.lrmul * self.b
         else:
             # Note: keep reshaping to allow easy weights decay between cpu and gpu models
-            return x + tf.reshape(self.lrmul * self.b, self.bias_target_shape)
+            return x + self.lrmul * tf.reshape(self.b, self.bias_target_shape)
 
 
 class Blur2d(Layer):
@@ -345,6 +347,7 @@ class Blur2d(Layer):
         self.data_format = data_format
         self.filter = filter
 
+    @tf.function
     def call(self, x, *args, **kwargs):
         return blur2d(x, filter=self.filter, data_format=self.data_format)
 
@@ -476,6 +479,7 @@ class StyleMod(Layer):
         # x: [inputs, dlatents]
         style = self.apply_bias(self.fc(x[1]))
         style = tf.reshape(style, self.style_target_shape)
+        # According to the official implementation biases associated with ys are initialized to ones
         return x[0] * (style[:, 0] + 1) + style[:, 1]
 
 
@@ -638,7 +642,7 @@ class Fused_Upscale2d_ScaledConv2d(Layer):
                  use_wscale=DEFAULT_USE_WSCALE, lrmul=LRMUL, truncate_weights=DEFAULT_TRUNCATE_WEIGHTS,
                  dtype=DEFAULT_DTYPE, use_xla=DEFAULT_USE_XLA,
                  data_format=DEFAULT_DATA_FORMAT, scope='', name=None):
-        layer_name = make_layer_name(name, scope, 'Upscale2d_Conv2d')
+        layer_name = make_layer_name(name, scope, 'Fused_Upscale2d_Conv2d')
         super(Fused_Upscale2d_ScaledConv2d, self).__init__(dtype=dtype, name=layer_name)
         assert kernel_size >= 1 and kernel_size % 2 == 1
         validate_data_format(data_format)
@@ -700,7 +704,7 @@ class Fused_ScaledConv2d_Downscale2d(Layer):
                  use_wscale=DEFAULT_USE_WSCALE, lrmul=LRMUL, truncate_weights=DEFAULT_TRUNCATE_WEIGHTS,
                  use_xla=DEFAULT_USE_XLA, dtype=DEFAULT_DTYPE,
                  data_format=DEFAULT_DATA_FORMAT, scope='', name=None):
-        layer_name = make_layer_name(name, scope, 'Conv2d_Downscale2d')
+        layer_name = make_layer_name(name, scope, 'Fused_Conv2d_Downscale2d')
         super(Fused_ScaledConv2d_Downscale2d, self).__init__(dtype=dtype, name=layer_name)
         assert kernel_size >= 1 and kernel_size % 2 == 1
         validate_data_format(data_format)
@@ -747,11 +751,101 @@ class Fused_ScaledConv2d_Downscale2d(Layer):
         return tf.nn.conv2d(x, w, strides=self.strides, padding='SAME', data_format=self.data_format)
 
 
+# See https://www.tensorflow.org/probability/api_docs/python/tfp/math/clip_by_value_preserve_gradient?hl=ru
+def clip_by_value_preserve_gradient(t, clip_value_min, clip_value_max, name=None):
+    with tf.name_scope(name or 'clip_by_value_preserve_gradient'):
+        return t + tf.stop_gradient(tf.clip_by_value(t, clip_value_min, clip_value_max) - t)
+
+
+# Fused bias + activation.
+# Custom cuda implementation is faster and uses less memory than performing the operations separately.
+# Maybe XLA helps at least a bit to achieve a similar effect.
+class Fused_Bias_Act(Layer):
+
+    def __init__(self, use_bias=True, act_name=None, lrmul=LRMUL, clamp=None,
+                 dtype=DEFAULT_DTYPE, use_xla=DEFAULT_USE_XLA,
+                 data_format=DEFAULT_DATA_FORMAT, scope='', name=None):
+        layer_name = make_layer_name(name, scope, 'Fused_Bias_Act')
+        super(Fused_Bias_Act, self).__init__(dtype=dtype, name=layer_name)
+        validate_data_format(data_format)
+        self.data_format = data_format
+        self.use_bias = use_bias
+        if act_name is None:
+            # No activation
+            self.act = None
+        elif act_name in ACTIVATION_FUNS_DICT.keys():
+            self.act = ACTIVATION_FUNS_DICT[act_name]
+        else:
+            assert False, f"Activation '{act_name}' is not supported. See ACTIVATION_FUNS_DICT"
+        self.act_name = act_name
+        self.fp32_act = (act_name in FP32_ACTIVATIONS) and (self._dtype_policy.compute_dtype != 'float32')
+        self.lrmul = lrmul
+        if clamp is not None:
+            assert clamp > 0, 'Clamp should be greater than 0'
+        self.clamp = clamp
+        self.use_xla = use_xla
+        self.scope = scope
+
+    def build(self, input_shape):
+        self.is_linear_bias = len(input_shape) == 2
+
+        if self.is_linear_bias:
+            self.units = input_shape[1]
+        else:
+            if self.data_format == NCHW_FORMAT:
+                self.bias_target_shape = [1, -1, 1, 1]
+                self.units = input_shape[1]
+            elif self.data_format == NHWC_FORMAT:
+                self.bias_target_shape = [1, 1, 1, -1]
+                self.units = input_shape[-1]
+
+        if self.use_bias:
+            with tf.name_scope(self.scope):
+                self.b = self.add_weight(
+                    name=BIASES_NAME,
+                    shape=[self.units],
+                    initializer=biases_init,
+                    trainable=True
+                )
+
+    @tf.function
+    def call(self, x, *args, **kwargs):
+        if self.use_bias:
+            # Note: keep reshaping to allow easy weights decay between cpu and gpu models
+            x += self.lrmul * (self.b if self.is_linear_bias else tf.reshape(self.b, self.bias_target_shape))
+
+        if self.act is not None:
+            x = self.act(
+                tf.cast(x, tf.float32) if self.fp32_act else x
+            )
+
+        if self.clamp is not None:
+            # Note: for some reasons when training with mixed precision (all fine for fp32)
+            # Grappler optimizer raises an error for D (but not G) network (layout failed) if values all clipped this way:
+            #   "x = tf.clip_by_value(x, -self.clamp, self.clamp)" -- doesn't work correctly
+            # The solution is to transpose inputs to NHWC format, clip them and transpose back to NCHW.
+            # Problem exists at least for NCHW format, which is the one used by GPU.
+
+            # To disable layout optimization see: https://github.com/tensorflow/tensorflow/issues/36901 (answer by ninnghazad).
+            # More about graph optimization: www.tensorflow.org/guide/graph_optimization (see layout optimizer).
+            # It should be possible to disable optimization only in current place using context manager (see tf link above).
+
+            # This approach to clipping solves all issues, however, is it correct to preserve gradient for clipped values?
+            # The official implementation uses tf.clip_by_value.
+            x = clip_by_value_preserve_gradient(x, -self.clamp, self.clamp)
+
+        return x
+
+
 #----------------------------------------------------------------------------
 # Layers as functions.
 
-def layer_dtype(config, layer_type, act_name=None):
-    use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
+def layer_dtype(layer_type, use_fp16=None, act_name=None, config=None):
+    if use_fp16 is not None:
+        use_mixed_precision = use_fp16
+    else:
+        use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
+
     if use_mixed_precision:
         policy = mixed_precision.Policy('mixed_float16')
         act_dtype = 'float32' if act_name in FP32_ACTIVATIONS else policy
@@ -766,18 +860,18 @@ def layer_dtype(config, layer_type, act_name=None):
     elif layer_type == 'act':
         return act_dtype
     elif layer_type in [
-        'pixel_norm', 'instance_norm', 'blur2d', 'upscale2d', 'downscale2d', 'minibatch_stddev'
+        'pixel_norm', 'instance_norm', 'blur2d', 'upscale2d', 'downscale2d', 'minibatch_stddev', WSUM_NAME
     ]:
         return compute_dtype
     else:
         assert False, 'Unknown layer type'
 
 
-def dense_layer(x, units, gain, lrmul=LRMUL, scope='', config=None):
+def dense_layer(x, units, gain, lrmul=LRMUL, use_fp16=None, scope='', config=None):
     use_wscale = config.get(USE_WSCALE, DEFAULT_USE_WSCALE)
     truncate_weights = config.get(TRUNCATE_WEIGHTS, DEFAULT_TRUNCATE_WEIGHTS)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    policy = layer_dtype(config, 'dense')
+    policy = layer_dtype('dense', use_fp16=use_fp16)
     return ScaledLinear(
         units=units, gain=gain,
         use_wscale=use_wscale, lrmul=lrmul, truncate_weights=truncate_weights,
@@ -786,111 +880,130 @@ def dense_layer(x, units, gain, lrmul=LRMUL, scope='', config=None):
 
 
 def conv2d_layer(x, fmaps, kernel_size, gain, lrmul=LRMUL,
-                 fused_up=False, fused_down=False, scope='', config=None):
+                 fused_up=False, fused_down=False, use_fp16=None, scope='', config=None):
     assert not (fused_up and fused_down)
 
     use_wscale = config.get(USE_WSCALE, DEFAULT_USE_WSCALE)
     truncate_weights = config.get(TRUNCATE_WEIGHTS, DEFAULT_TRUNCATE_WEIGHTS)
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    policy = layer_dtype(config, 'conv2d')
+    policy = layer_dtype('conv2d', use_fp16=use_fp16)
+
+    layer_kwargs = {
+        'fmaps': fmaps,
+        'kernel_size': kernel_size,
+        'gain': gain,
+        'use_wscale': use_wscale,
+        'lrmul': lrmul,
+        'truncate_weights': truncate_weights,
+        'dtype': policy,
+        'use_xla': use_xla,
+        'data_format': data_format,
+        'scope':scope
+    }
 
     if fused_up:
-        return Fused_Upscale2d_ScaledConv2d(
-            fmaps=fmaps, kernel_size=kernel_size, gain=gain,
-            use_wscale=use_wscale, lrmul=lrmul, truncate_weights=truncate_weights,
-            dtype=policy, data_format=data_format, scope=scope
-        )(x)
+        return Fused_Upscale2d_ScaledConv2d(**layer_kwargs)(x)
     elif fused_down:
-        return Fused_ScaledConv2d_Downscale2d(
-            fmaps=fmaps, kernel_size=kernel_size, gain=gain,
-            use_wscale=use_wscale, lrmul=lrmul, truncate_weights=truncate_weights,
-            dtype=policy, data_format=data_format, scope=scope
-        )(x)
+        return Fused_ScaledConv2d_Downscale2d(**layer_kwargs)(x)
     else:
-        return ScaledConv2d(
-            fmaps=fmaps, kernel_size=kernel_size, gain=gain,
-            use_wscale=use_wscale, lrmul=lrmul, truncate_weights=truncate_weights,
-            dtype=policy, data_format=data_format, scope=scope
-        )(x)
+        return ScaledConv2d(**layer_kwargs)(x)
 
 
-def bias_layer(x, lrmul=LRMUL, scope='', config=None):
+def bias_layer(x, lrmul=LRMUL, use_fp16=None, scope='', config=None):
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    policy = layer_dtype(config, 'bias')
-    return Bias(lrmul=lrmul, dtype=policy, data_format=data_format, scope=scope)(x)
+    policy = layer_dtype('bias', use_fp16=use_fp16)
+    return Bias(lrmul=lrmul, dtype=policy, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
 
-def act_layer(x, act_name, scope='', config=None):
+def act_layer(x, act_name, use_fp16=None, scope='', config=None):
     if act_name in ACTIVATION_FUNS_DICT.keys():
         act = ACTIVATION_FUNS_DICT[act_name]
     else:
-        assert False, f"Activation '{act_name}' not supported. See ACTIVATION_FUNS_DICT"
-    dtype = layer_dtype(config, 'act', act_name)
+        assert False, f"Activation '{act_name}' is not supported. See ACTIVATION_FUNS_DICT"
+    dtype = layer_dtype('act', use_fp16=use_fp16, act_name=act_name)
     return Activation(act, dtype=dtype, name=scope + act_name)(x)
 
 
-def const_layer(x, channel_size, scope='', config=None):
+def fused_bias_act_layer(x, act_name, lrmul=LRMUL, clamp=None, use_fp16=None, scope='', config=None):
+    use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    policy = layer_dtype(config, 'const')
+    policy = layer_dtype('bias', use_fp16=use_fp16)
+    return Fused_Bias_Act(
+        use_bias=use_bias, act_name=act_name, lrmul=lrmul, clamp=clamp,
+        dtype=policy, use_xla=use_xla, data_format=data_format, scope=scope
+    )(x)
+
+
+def const_layer(x, channel_size, use_fp16=None, scope='', config=None):
+    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    policy = layer_dtype('const', use_fp16=use_fp16)
     return Const(channel_size=channel_size, dtype=policy, data_format=data_format, scope=scope)(x)
 
 
-def noise_layer(x, scope='', config=None):
+def noise_layer(x, use_fp16=None, scope='', config=None):
     randomize_noise = config.get(RANDOMIZE_NOISE, DEFAULT_RANDOMIZE_NOISE)
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    policy = layer_dtype(config, 'noise')
-    return Noise(randomize_noise=randomize_noise, dtype=policy, data_format=data_format, scope=scope)(x)
+    policy = layer_dtype('noise', use_fp16=use_fp16)
+    return Noise(randomize_noise=randomize_noise, dtype=policy, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
 
-def blur_layer(x, scope='', config=None):
+def blur_layer(x, use_fp16=None, scope='', config=None):
     blur_filter = config.get(BLUR_FILTER, DEFAULT_BLUR_FILTER)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    dtype = layer_dtype(config, 'noise')
-    return Blur2d(filter=blur_filter, dtype=dtype, scope=scope, data_format=data_format)(x) if blur_filter is not None else x
+    dtype = layer_dtype('blur2d', use_fp16=use_fp16)
+    return Blur2d(filter=blur_filter, dtype=dtype, scope=scope, data_format=data_format)(x)
 
 
-def pixel_norm_layer(x, scope='', config=None):
+def pixel_norm_layer(x, use_fp16=None, scope='', config=None):
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    dtype = layer_dtype(config, 'pixel_norm')
-    return PixelNorm(dtype=dtype, data_format=data_format, scope=scope)(x)
+    dtype = layer_dtype('pixel_norm', use_fp16=use_fp16)
+    return PixelNorm(dtype=dtype, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
 
-def instance_norm_layer(x, scope='', config=None):
+def instance_norm_layer(x, use_fp16=None, scope='', config=None):
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    dtype = layer_dtype(config, 'instance_norm')
-    return InstanceNorm(dtype=dtype, data_format=data_format, scope=scope)(x)
+    dtype = layer_dtype('instance_norm', use_fp16=use_fp16)
+    return InstanceNorm(dtype=dtype, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
 
-def style_mod_layer(x, dlatents, scope='', config=None):
+def style_mod_layer(x, dlatents, use_fp16=None, scope='', config=None):
     use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
     use_wscale = config.get(USE_WSCALE, DEFAULT_USE_WSCALE)
     truncate_weights = config.get(TRUNCATE_WEIGHTS, DEFAULT_TRUNCATE_WEIGHTS)
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    policy = layer_dtype(config, 'style_mod')
+    policy = layer_dtype('style_mod', use_fp16=use_fp16)
     return StyleMod(
         use_bias=use_bias, use_wscale=use_wscale, truncate_weights=truncate_weights,
-        dtype=policy, data_format=data_format, scope=scope
+        use_xla=use_xla, dtype=policy, data_format=data_format, scope=scope
     )([x, dlatents])
 
 
-def downscale2d_layer(x, factor, config=None):
+def downscale2d_layer(x, factor, use_fp16=None, config=None):
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    dtype = layer_dtype(config, 'downscale2d')
+    dtype = layer_dtype('downscale2d', use_fp16=use_fp16)
     return Downscale2d(factor=factor, dtype=dtype, data_format=data_format)(x)
 
 
-def upscale2d_layer(x, factor, config=None):
+def upscale2d_layer(x, factor, use_fp16=None, config=None):
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    dtype = layer_dtype(config, 'upscale2d')
+    dtype = layer_dtype('upscale2d', use_fp16=use_fp16)
     return Upscale2d(factor=factor, dtype=dtype, data_format=data_format)(x)
 
 
-def minibatch_stddev_layer(x, scope='', config=None):
+def minibatch_stddev_layer(x, use_fp16=None, scope='', config=None):
     group_size = config.get(MBSTD_GROUP_SIZE, 4)
     num_new_features = config.get(MBSTD_NUM_FEATURES, DEFAULT_MBSTD_NUM_FEATURES)
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    dtype = layer_dtype(config, 'minibatch_stddev')
+    dtype = layer_dtype('minibatch_stddev', use_fp16=use_fp16)
     return MinibatchStdDev(
         group_size=group_size, num_new_features=num_new_features,
-        dtype=dtype, data_format=data_format, scope=scope
+        dtype=dtype, use_xla=use_xla, data_format=data_format, scope=scope
     )(x)

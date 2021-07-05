@@ -108,7 +108,7 @@ def train_model(config, config_path=None):
     # a sudden remove of a file with images paths
     images_paths = load_images_paths(config)
 
-    run_process(target=trace_graphs, args=(config, config_path))
+    #run_process(target=trace_graphs, args=(config, config_path))
     sleep(1)
 
     train_start_time = time.time()

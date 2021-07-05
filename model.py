@@ -7,16 +7,18 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import mixed_precision
 
+from metrics.metrics_utils import setup_metrics
 from losses import select_G_loss_fn, select_D_loss_fn
-from utils import compute_alpha, update_wsum_alpha,\
-    save_model, load_model,\
+from utils import compute_alpha, update_wsum_alpha, get_start_fp16_resolution,\
+    save_model, load_model, save_optimizer_loss_scale, load_optimizer_loss_scale, is_finite_grad,\
     TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
     create_images_dir_name, create_images_grid_title, remove_old_models,\
-    format_time, to_int_dict, validate_data_format, trace_vars, trace_message, mult_by_zero, is_last_step,\
+    trace_vars, trace_message,\
+    format_time, to_int_dict, validate_data_format, mult_by_zero, is_last_step, should_write_summary,\
     maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, load_images_paths, set_tf_logging
-from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, USE_MIXED_PRECISION,\
+from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, USE_MIXED_PRECISION, NUM_FP16_RESOLUTIONS,\
     DATA_FORMAT, MODEL_NAME, MAX_MODELS_TO_KEEP, \
-    SUMMARY_EVERY, SAVE_MODEL_EVERY, SAVE_IMAGES_EVERY,\
+    SUMMARY_SCALARS_EVERY_KIMAGES, SUMMARY_HISTS_EVERY_KIMAGES, SAVE_MODEL_EVERY_KIMAGES, SAVE_IMAGES_EVERY_KIMAGES, METRICS_DICT, RUN_METRICS_EVERY_KIMAGES,\
     G_LOSS_FN, D_LOSS_FN, G_LOSS_FN_PARAMS, D_LOSS_FN_PARAMS,\
     G_LEARNING_RATE, D_LEARNING_RATE, \
     G_LEARNING_RATE_DICT, D_LEARNING_RATE_DICT,\
@@ -32,13 +34,14 @@ from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, USE_MIXED_PR
     VALID_GRID_NROWS, VALID_GRID_NCOLS, VALID_MIN_TARGET_SINGLE_IMAGE_SIZE, VALID_MAX_PNG_RES,\
     TRAIN_MODE, INFERENCE_MODE, DEFAULT_MODE
 from utils import DEFAULT_STORAGE_PATH, DEFAULT_MAX_MODELS_TO_KEEP,\
-    DEFAULT_SUMMARY_EVERY, DEFAULT_SAVE_MODEL_EVERY, DEFAULT_SAVE_IMAGES_EVERY,\
+    DEFAULT_SUMMARY_SCALARS_EVERY_KIMAGES, DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES, DEFAULT_SAVE_MODEL_EVERY_KIMAGES, DEFAULT_SAVE_IMAGES_EVERY_KIMAGES, \
+    DEFAULT_METRICS_DICT, DEFAULT_RUN_METRICS_EVERY_KIMAGES,\
     DEFAULT_BATCH_REPEATS, DEFAULT_G_LOSS_FN, DEFAULT_D_LOSS_FN, DEFAULT_G_LOSS_FN_PARAMS, DEFAULT_D_LOSS_FN_PARAMS,\
     DEFAULT_G_LEARNING_RATE, DEFAULT_D_LEARNING_RATE,\
     DEFAULT_G_LEARNING_RATE_DICT, DEFAULT_D_LEARNING_RATE_DICT,\
     DEFAULT_ADAM_BETA1, DEFAULT_ADAM_BETA2, DEFAULT_RESET_OPT_STATE_FOR_NEW_LOD,\
     DEFAULT_DATASET_MAX_CACHE_RES,\
-    DEFAULT_START_RESOLUTION, DEFAULT_USE_MIXED_PRECISION,\
+    DEFAULT_START_RESOLUTION, DEFAULT_USE_MIXED_PRECISION, DEFAULT_NUM_FP16_RESOLUTIONS,\
     DEFAULT_DATASET_N_PARALLEL_CALLS,\
     DEFAULT_DATASET_N_PREFETCHED_BATCHES, DEFAULT_DATASET_N_MAX_KIMAGES,\
     DEFAULT_SHUFFLE_DATASET, DEFAULT_MIRROR_AUGMENT,\
@@ -47,7 +50,8 @@ from utils import DEFAULT_STORAGE_PATH, DEFAULT_MAX_MODELS_TO_KEEP,\
     DEFAULT_USE_G_SMOOTHING, DEFAULT_G_SMOOTHING_BETA, DEFAULT_G_SMOOTHING_BETA_KIMAGES, DEFAULT_USE_GPU_FOR_GS,\
     DEFAULT_DATA_FORMAT,\
     DEFAULT_VALID_GRID_NROWS, DEFAULT_VALID_GRID_NCOLS,\
-    DEFAULT_VALID_MIN_TARGET_SINGLE_IMAGE_SIZE, DEFAULT_VALID_MAX_PNG_RES
+    DEFAULT_VALID_MIN_TARGET_SINGLE_IMAGE_SIZE, DEFAULT_VALID_MAX_PNG_RES,\
+    toNHWC_AXIS, toNCHW_AXIS
 from dataloader_utils import create_training_dataset, convert_outputs_to_images
 from image_utils import fast_save_grid
 from networks import Generator, Discriminator
@@ -65,6 +69,17 @@ How to load model:
 2) Initialize model
 3) Load weights
 """
+
+def show_vars_stats(vars):
+    for idx, var in enumerate(vars):
+        mean = tf.math.reduce_mean(var).numpy()
+        std = tf.math.reduce_std(var).numpy()
+        print(f'{idx}) {var.name}: mean={mean:.3f}, std={std:.3f}')
+
+
+def tf_round(x, decimals=0):
+    multiplier = tf.constant(10**decimals, dtype=x.dtype)
+    return tf.math.round(x * multiplier) / multiplier
 
 
 class StyleGAN:
@@ -102,6 +117,9 @@ class StyleGAN:
 
         # Computation
         self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
+        self.num_fp16_resolutions = config.get(NUM_FP16_RESOLUTIONS, DEFAULT_NUM_FP16_RESOLUTIONS)
+        self.start_fp16_resolution_log2 =\
+            get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
         self.compute_dtype = 'float16' if self.use_mixed_precision else 'float32'
         self.use_Gs = config.get(USE_G_SMOOTHING, DEFAULT_USE_G_SMOOTHING)
         self.use_gpu_for_Gs = config.get(USE_GPU_FOR_GS, DEFAULT_USE_GPU_FOR_GS)
@@ -147,11 +165,14 @@ class StyleGAN:
         self.valid_latents = self.generate_latents(self.valid_grid_nrows * self.valid_grid_ncols)
 
         # Summaries
+        self.metrics = config.get(METRICS_DICT, DEFAULT_METRICS_DICT)
         self.storage_path = config.get(STORAGE_PATH, DEFAULT_STORAGE_PATH)
         self.max_models_to_keep = config.get(MAX_MODELS_TO_KEEP, DEFAULT_MAX_MODELS_TO_KEEP)
-        self.summary_every = config.get(SUMMARY_EVERY, DEFAULT_SUMMARY_EVERY)
-        self.save_model_every = config.get(SAVE_MODEL_EVERY, DEFAULT_SAVE_MODEL_EVERY)
-        self.save_images_every = config.get(SAVE_IMAGES_EVERY, DEFAULT_SAVE_IMAGES_EVERY)
+        self.run_metrics_every = int(1000 * config.get(RUN_METRICS_EVERY_KIMAGES, DEFAULT_RUN_METRICS_EVERY_KIMAGES))
+        self.summary_scalars_every = int(1000 * config.get(SUMMARY_SCALARS_EVERY_KIMAGES, DEFAULT_SUMMARY_SCALARS_EVERY_KIMAGES))
+        self.summary_hists_every = int(1000 * config.get(SUMMARY_HISTS_EVERY_KIMAGES, DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES))
+        self.save_model_every = int(1000 * config.get(SAVE_MODEL_EVERY_KIMAGES, DEFAULT_SAVE_MODEL_EVERY_KIMAGES))
+        self.save_images_every = int(1000 * config.get(SAVE_IMAGES_EVERY_KIMAGES, DEFAULT_SAVE_IMAGES_EVERY_KIMAGES))
         self.logs_path = os.path.join(TF_LOGS_DIR, self.model_name)
         self.writers_dirs = {
             res: os.path.join(self.logs_path, f'{2**res}x{2**res}')
@@ -176,11 +197,7 @@ class StyleGAN:
 
             if not self.use_gpu_for_Gs:
                 Gs_config[DATA_FORMAT] = NHWC_FORMAT
-                # NCHW -> NHWC
-                self.toNHWC_axis = [0, 2, 3, 1]
-                # NCHW -> NHWC -> NCHW
-                self.toNCHW_axis = [0, 3, 1, 2]
-                self.Gs_valid_latents = tf.transpose(self.valid_latents, self.toNHWC_axis)
+                self.Gs_valid_latents = tf.transpose(self.valid_latents, toNHWC_AXIS)
 
             self.Gs_object = Generator(Gs_config)
 
@@ -193,12 +210,15 @@ class StyleGAN:
                 self.create_images_generators(config)
                 self.initialize_optimizers(create_all_variables=True)
             else:
+                self.metrics_objects = setup_metrics(2 ** res, self.metrics)
                 self.setup_Gs_betas(res)
                 self.initialize_models(res, stage)
                 self.create_images_generator(res, images_paths)
-                self.initialize_optimizers(create_all_variables=False)
+                self.initialize_optimizers(create_all_variables=False, res=res, stage=stage)
 
     def initialize_models(self, model_res=None, stage=None):
+        if self.use_mixed_precision:
+            logging.info(f'Start fp16 resolution: {self.start_fp16_resolution_log2}')
         self.G_object.initialize_G_model(model_res=model_res, mode=stage)
         self.D_object.initialize_D_model(model_res=model_res, mode=stage)
         if self.use_Gs:
@@ -318,7 +338,7 @@ class StyleGAN:
 
         logging.info('G optimizer slots created!')
 
-    def initialize_G_optimizer(self, create_all_variables: bool):
+    def initialize_G_optimizer(self, create_all_variables: bool, res, stage):
         self.G_optimizer = tf.keras.optimizers.Adam(
             learning_rate=self.G_learning_rate,
             beta_1=self.beta1, beta_2=self.beta2,
@@ -326,7 +346,8 @@ class StyleGAN:
             name='G_Adam'
         )
         if self.use_mixed_precision:
-            self.G_optimizer = mixed_precision.LossScaleOptimizer(self.G_optimizer, dynamic=True)
+            initial_scale, dynamic = self.get_optimizer_initial_loss_scale(GENERATOR_NAME, res, stage)
+            self.G_optimizer = mixed_precision.LossScaleOptimizer(self.G_optimizer, dynamic=dynamic, initial_scale=initial_scale)
         self.G_optimizer.use_mixed_precision = self.use_mixed_precision
 
         if not create_all_variables:
@@ -344,8 +365,6 @@ class StyleGAN:
         print('\nG vars after initialization:')
         for idx, var in enumerate(var_names, 1):
             print(f'{idx}: {var}')
-
-        self.n_G_vars = len(self.G_optimizer.weights)
 
     def initialize_main_vars_for_D_optimizer(self, n_iters):
         # The purpose of this function is to create all variables needed for optimizer
@@ -420,7 +439,7 @@ class StyleGAN:
 
         logging.info('D optimizer slots created!')
 
-    def initialize_D_optimizer(self, create_all_variables: bool):
+    def initialize_D_optimizer(self, create_all_variables: bool, res, stage):
         self.D_optimizer = tf.keras.optimizers.Adam(
             learning_rate=self.D_learning_rate,
             beta_1=self.beta1, beta_2=self.beta2,
@@ -428,7 +447,8 @@ class StyleGAN:
             name='D_Adam'
         )
         if self.use_mixed_precision:
-            self.D_optimizer = mixed_precision.LossScaleOptimizer(self.D_optimizer, dynamic=True)
+            initial_scale, dynamic = self.get_optimizer_initial_loss_scale(DISCRIMINATOR_NAME, res, stage)
+            self.D_optimizer = mixed_precision.LossScaleOptimizer(self.D_optimizer, dynamic=dynamic, initial_scale=initial_scale)
         self.D_optimizer.use_mixed_precision = self.use_mixed_precision
 
         if not create_all_variables:
@@ -447,7 +467,43 @@ class StyleGAN:
         for idx, var in enumerate(var_names, 1):
             print(f'{idx}: {var}')
 
-        self.n_D_vars = len(self.D_optimizer.weights)
+    def get_optimizer_initial_loss_scale(self, model_type, res, stage):
+        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+        print('Get optimizer use_fp16:', use_fp16)
+        if not use_fp16:
+            logging.info(f"Res {res} doesn't use fp16, so constant loss scale for {model_type} optimizer is set to 1")
+            return 1., False
+
+        # Note: res and stage refer to the current train stage, so they should be adjusted
+        if (res is None) and (stage is None):
+            logging.info(f'Default initial loss scale is used for {model_type} optimizer as res and stage are not provided')
+            return None, True
+
+        if res <= self.start_fp16_resolution_log2:
+            logging.info(f'Default initial loss scale is used for {model_type} optimizer '
+                         f'for resolution lower then or equal to start_fp16_resolution')
+            return None, True
+
+        if stage == STABILIZATION_MODE:
+            load_res = res
+            load_stage = TRANSITION_MODE
+        else:
+            load_res = res - 1
+            load_stage = STABILIZATION_MODE
+        kwargs = {
+            'model_name': self.model_name,
+            'model_type': model_type,
+            'res': load_res,
+            'stage': load_stage,
+            'step': None,
+            'storage_path': self.storage_path
+        }
+        last_loss_scale = load_optimizer_loss_scale(**kwargs)
+        # Note: init default loss scale is 2 ** 15. Start with a value which is several steps higher than the last one
+        init_loss_scale = min(last_loss_scale * (2 ** 4), 2 ** 15)
+        logging.info(f'Loss scale for {model_type} optimizer for res={res}, stage={stage}: '
+                     f'init_loss_scale = {init_loss_scale}, last_loss_scale = {last_loss_scale}')
+        return init_loss_scale, True
 
     def reset_optimizers_state(self):
         G_optimizer_new_weights = mult_by_zero(self.G_optimizer.get_weights())
@@ -458,15 +514,15 @@ class StyleGAN:
 
         logging.info('Optimizers states reset')
 
-    def initialize_optimizers(self, create_all_variables):
+    def initialize_optimizers(self, create_all_variables, res=None, stage=None):
         start_time = time.time()
         logging.info('Initializing optimizers...')
 
         # 1: create optimizer states for all internal and final output layers
         # 2: create optimizer states for all intermediate output layers
         # 3: set slots of optimizer to zero
-        self.initialize_G_optimizer(create_all_variables)
-        self.initialize_D_optimizer(create_all_variables)
+        self.initialize_G_optimizer(create_all_variables, res, stage)
+        self.initialize_D_optimizer(create_all_variables, res, stage)
 
         if create_all_variables:
             self.reset_optimizers_state()
@@ -482,8 +538,8 @@ class StyleGAN:
         self.D_optimizer.learning_rate.assign(D_lr)
 
         logging.info(f'Optimizers learning rates for res={res}: '
-                     f'G_lr={self.G_optimizer.learning_rate.numpy():.5f}, '
-                     f'D_lr={self.D_optimizer.learning_rate.numpy():.5f}')
+                     f'G_lr={self.G_optimizer.learning_rate.numpy():.4f}, '
+                     f'D_lr={self.D_optimizer.learning_rate.numpy():.4f}')
 
     def zero_optimizers_learning_rate(self):
         self.G_optimizer.learning_rate.assign(0.)
@@ -532,8 +588,6 @@ class StyleGAN:
         # TODO: for debugging, remove later
         print('D opt iters:', self.D_optimizer.iterations)
         print('G opt iters:', self.G_optimizer.iterations)
-        self.n_G_vars = len(self.G_optimizer.weights)
-        self.n_D_vars = len(self.D_optimizer.weights)
 
     def compute_optimizer_steps(self, res, stage):
         # Note: res and stage refer to the last used model not the current one
@@ -614,6 +668,13 @@ class StyleGAN:
             Gs_model.set_weights(G_model.get_weights())
         else:
             Gs_model = None
+
+        # Log D model
+        D_model.summary(print_fn=logging.info)
+        # Log G model (mapping and synthesis networks)
+        self.G_object.G_mapping.summary(print_fn=logging.info)
+        self.G_object.G_synthesis.summary(print_fn=logging.info)
+
         return D_model, G_model, Gs_model
 
     def update_models_weights(self):
@@ -689,6 +750,25 @@ class StyleGAN:
                 n_steps += self.get_n_steps(r, STABILIZATION_MODE)
         return n_steps
 
+    def get_n_processed_images(self, res, mode):
+        """
+        Returns number of processed images when training for provided res and mode is started
+        """
+        self.validate_res_and_mode_combination(res, mode)
+        n_kimages = 0
+        # Iterate for all previous resolutions
+        for r in range(self.start_resolution_log2, res + 1):
+            images_res = 2 ** r
+            if r == res:
+                if mode == STABILIZATION_MODE and r > self.start_resolution_log2:
+                    n_kimages += self.transition_kimages_dict.get(images_res, self.transition_kimages)
+            else:
+                # The first resolution doesn't have transition stage
+                if r > self.start_resolution_log2:
+                    n_kimages += self.transition_kimages_dict.get(images_res, self.transition_kimages)
+                n_kimages += self.stabilization_kimages_dict.get(images_res, self.stabilization_kimages)
+        return int(1000 * n_kimages)
+
     def load_trained_models(self, res, mode, models=None):
         # Note: when calling this function for inference models arg should not be passed
         if models is None:
@@ -696,7 +776,14 @@ class StyleGAN:
         else:
             self.D_model, self.G_model, self.Gs_model = models
 
-        step = self.get_n_steps(res, mode) - 1
+        batch_size = self.batch_sizes[2 ** res]
+        step = batch_size * self.get_n_steps(res, mode)
+
+        # TODO: for debugging, remove later
+        # print('\nD stats after init:')
+        # show_vars_stats(self.D_model.trainable_variables)
+        # print('\nG stats after init:')
+        # show_vars_stats(self.G_model.trainable_variables)
 
         self.D_model = load_model(
             self.D_model, self.model_name, DISCRIMINATOR_NAME,
@@ -712,7 +799,13 @@ class StyleGAN:
                 res=res, stage=mode, step=step, storage_path=self.storage_path
             )
 
-        logging.info(f'Model weights loaded for res={res}, mode={mode}')
+        # TODO: for debugging, remove later
+        # print('\nD stats after loading:')
+        # show_vars_stats(self.D_model.trainable_variables)
+        # print('\nG stats after loading:')
+        # show_vars_stats(self.G_model.trainable_variables)
+
+        logging.info(f'Loaded model weights for res={res}, mode={mode}')
         return self.D_model, self.G_model, self.Gs_model
 
     def save_model_wrapper(self, model_type, res, stage, step):
@@ -759,43 +852,52 @@ class StyleGAN:
         MODEL_ARG = 'model'
         MODEL_TYPE_ARG = 'model_type'
 
+        D_model_type = DISCRIMINATOR_NAME + OPTIMIZER_POSTFIX
+        G_model_type = GENERATOR_NAME + OPTIMIZER_POSTFIX
+
         D_optimizer_kwargs = {
             MODEL_ARG: self.D_optimizer._optimizer if self.use_mixed_precision else self.D_optimizer,
-            MODEL_TYPE_ARG: DISCRIMINATOR_NAME + OPTIMIZER_POSTFIX,
+            MODEL_TYPE_ARG: D_model_type,
             **shared_kwargs
         }
         G_optimizer_kwargs = {
             MODEL_ARG: self.G_optimizer._optimizer if self.use_mixed_precision else self.G_optimizer,
-            MODEL_TYPE_ARG: GENERATOR_NAME + OPTIMIZER_POSTFIX,
+            MODEL_TYPE_ARG: G_model_type,
             **shared_kwargs
         }
 
         save_model(**D_optimizer_kwargs)
         save_model(**G_optimizer_kwargs)
 
-    def save_valid_images(self, res, step, stage, smoothed=False):
+        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+        if use_fp16:
+            OPTIMIZER_ARG = 'optimizer'
+            save_optimizer_loss_scale(**{OPTIMIZER_ARG: self.D_optimizer, MODEL_TYPE_ARG: D_model_type, **shared_kwargs})
+            save_optimizer_loss_scale(**{OPTIMIZER_ARG: self.G_optimizer, MODEL_TYPE_ARG: G_model_type, **shared_kwargs})
+
+    def save_valid_images(self, res, n_images, stage, smoothed=False):
         dir_stage = stage
         if smoothed:
             dir_stage += SMOOTH_POSTFIX
 
-        digits_in_number = 6
-        fname = ('%0' + str(digits_in_number) + 'd') % step
+        digits_in_number = 8 # Total number of training images is 25000k for resolution 1024
+        fname = ('%0' + str(digits_in_number) + 'd') % n_images
 
         valid_images_dir = create_images_dir_name(self.model_name, res, dir_stage)
         use_grid_title = False
         if use_grid_title:
-            valid_images_grid_title = create_images_grid_title(res, dir_stage, step)
+            valid_images_grid_title = create_images_grid_title(res, dir_stage, n_images)
         else:
             valid_images_grid_title = None
 
         save_in_jpg = res > self.max_png_res
 
         if smoothed:
-            valid_images = self.Gs_model(self.Gs_valid_latents)
+            valid_images = self.Gs_model(self.Gs_valid_latents, training=False)
             if not self.use_gpu_for_Gs:
-                valid_images = tf.transpose(valid_images, self.toNCHW_axis)
+                valid_images = tf.transpose(valid_images, toNCHW_AXIS)
         else:
-            valid_images = self.G_model(self.valid_latents)
+            valid_images = self.G_model(self.valid_latents, training=False)
 
         valid_images = convert_outputs_to_images(
             valid_images,
@@ -834,7 +936,7 @@ class StyleGAN:
                 a.assign(b + (a - b) * beta)
 
     @tf.function
-    def G_train_step(self, G_model, D_model, latents, write_summary, step):
+    def G_train_step(self, G_model, D_model, latents, write_scalars_summary, write_hists_summary, step):
         G_vars = G_model.trainable_variables
         # Trace which variables are used to make sure that net is training
         trace_vars(G_vars, 'Generator variables:')
@@ -843,7 +945,7 @@ class StyleGAN:
             G_tape.watch(G_vars)
             G_loss = self.G_loss_fn(G_model, D_model, self.G_optimizer,
                                     latents=latents,
-                                    write_summary=write_summary,
+                                    write_summary=write_scalars_summary,
                                     step=step,
                                     **self.G_loss_params)
             G_loss = maybe_scale_loss(G_loss, self.G_optimizer)
@@ -852,18 +954,26 @@ class StyleGAN:
         G_grads = maybe_unscale_grads(G_grads, self.G_optimizer)
         self.G_optimizer.apply_gradients(zip(G_grads, G_vars))
 
-        if write_summary:
-            # Write gradients
-            with tf.name_scope('G-grads'):
+        for grad, var in zip(G_grads, G_vars):
+            nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
+            nums = tf.math.count_nonzero(tf.math.is_finite(grad))
+            # tf.print('G, step =', step, f'{var.name}: nans =', nans, ',', tf.math.round(100 * nans / (nans + nums)), '%')
+
+        # Write gradients
+        with tf.name_scope('G-grads'):
+            if write_hists_summary:
                 for grad, var in zip(G_grads, G_vars):
-                    tf.summary.histogram(var.name, grad, step=step)
-            # Write weights
-            with tf.name_scope('G-weights'):
+                    hist_grad = tf.cond(is_finite_grad(grad), lambda: grad, lambda: tf.zeros(grad.shape, grad.dtype))
+                    tf.summary.histogram(var.name, hist_grad, step=step)
+
+        # Write weights
+        with tf.name_scope('G-weights'):
+            if write_hists_summary:
                 for var in G_vars:
                     tf.summary.histogram(var.name, var, step=step)
 
     @tf.function
-    def D_train_step(self, G_model, D_model, latents, images, write_summary, step):
+    def D_train_step(self, G_model, D_model, latents, images, write_scalars_summary, write_hists_summary, step):
         D_vars = D_model.trainable_variables
         # Trace which variables are used to make sure that net is training
         trace_vars(D_vars, 'Discriminator variables:')
@@ -873,7 +983,7 @@ class StyleGAN:
             D_loss = self.D_loss_fn(G_model, D_model, self.D_optimizer,
                                     latents=latents,
                                     real_images=images,
-                                    write_summary=write_summary,
+                                    write_summary=write_scalars_summary,
                                     step=step,
                                     **self.D_loss_params)
             D_loss = maybe_scale_loss(D_loss, self.D_optimizer)
@@ -882,50 +992,71 @@ class StyleGAN:
         D_grads = maybe_unscale_grads(D_grads, self.D_optimizer)
         self.D_optimizer.apply_gradients(zip(D_grads, D_vars))
 
-        if write_summary:
-            # Write gradients
-            with tf.name_scope('D-grads'):
+        for grad, var in zip(D_grads, D_vars):
+            nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
+            nums = tf.math.count_nonzero(tf.math.is_finite(grad))
+            # tf.print('D, step =', step, f'{var.name}: nans =', nans, ',', tf.math.round(100 * nans / (nans + nums)), '%')
+
+        # Write gradients
+        with tf.name_scope('D-grads'):
+            if write_hists_summary:
                 for grad, var in zip(D_grads, D_vars):
-                    tf.summary.histogram(var.name, grad, step=step)
-            # Write weights
-            with tf.name_scope('D-weights'):
+                    hist_grad = tf.cond(is_finite_grad(grad), lambda: grad, lambda: tf.zeros(grad.shape, grad.dtype))
+                    tf.summary.histogram(var.name, hist_grad, step=step)
+
+        # Write weights
+        with tf.name_scope('D-weights'):
+            if write_hists_summary:
                 for var in D_vars:
                     tf.summary.histogram(var.name, var, step=step)
 
     @tf.function
     def train_step(self, G_model, D_model, G_latents, D_latents,
-                   images, write_summary, step):
+                   images, write_scalars_summary, write_hists_summary, step):
         trace_message(' ...Modified train step tracing... ')
         # Note: explicit use of G and D models allows one to make sure that
         # tf.function doesn't compile models. Additionally tracing is used
         # (previously for res=3 and mode=transition G model used variables only from res=2)
-        self.D_train_step(G_model, D_model, D_latents, images, write_summary, step)
-        self.G_train_step(G_model, D_model, G_latents, write_summary, step)
+        self.D_train_step(G_model, D_model, D_latents, images, write_scalars_summary, write_hists_summary, step)
+        self.G_train_step(G_model, D_model, G_latents, write_scalars_summary, write_hists_summary, step)
 
-    def post_train_step_actions(self, res, mode, step, last_step_cond, write_summary, summary_writer):
-        if step > 0:
+    def post_train_step_actions(self, res, mode, n_images, last_step_cond, write_scalars_summary, summary_writer):
+        batch_size = self.batch_sizes[2 ** res]
+        if n_images > batch_size:
             # For the first step optimizers learning rates are zeros
             if self.use_Gs:
                 self.smooth_net_weights(
                     Gs_model=self.Gs_model, G_model=self.G_model, beta=self.Gs_betas[res]
                 )
 
-        if write_summary:
+        if should_write_summary(self.run_metrics_every, n_images, batch_size) or last_step_cond:
+            self.run_metrics(res, mode, n_images)
+
+        if self.use_mixed_precision:
+            opt_step = n_images + self.get_n_processed_images(res, mode)
+            # The first step usually uses very high scale
+            if (write_scalars_summary or last_step_cond) and (n_images > batch_size):
+                tf.summary.scalar('LossScale/D_optimizer', self.D_optimizer.loss_scale, step=opt_step)
+                tf.summary.scalar('LossScale/G_optimizer', self.G_optimizer.loss_scale, step=opt_step)
+
+        # TODO: think how to write summaries outside of this function
+        if write_scalars_summary:
             summary_writer.flush()
 
-        if step % self.save_model_every == 0 or last_step_cond:
-            self.save_models(res=res, mode=mode, step=step)
+        if should_write_summary(self.save_model_every, n_images, batch_size) or last_step_cond:
+            self.save_models(res=res, mode=mode, step=n_images)
 
-        if step % self.save_images_every == 0 or last_step_cond:
-            self.save_valid_images(res, step, stage=mode)
+        if should_write_summary(self.save_images_every, n_images, batch_size) or last_step_cond:
+            self.save_valid_images(res, n_images, stage=mode)
             if self.use_Gs:
-                self.save_valid_images(res, step, stage=mode, smoothed=True)
+                self.save_valid_images(res, n_images, stage=mode, smoothed=True)
 
     def train(self):
         # TODO: refactor this function, and make it consistent with training for each separate stage
         train_start_time = time.time()
-        tStep = tf.Variable(0, trainable=False, dtype=tf.int64)
-        tWriteSummary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_step = tf.Variable(0, trainable=False, dtype=tf.int64)
+        tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_write_hists_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
 
         for res in tqdm(range(self.start_resolution_log2, self.resolution_log2 + 1), desc='Training res'):
             logging.info(f'Training {2**res}x{2**res} model...')
@@ -957,25 +1088,30 @@ class StyleGAN:
                     self.D_model, self.G_model, self.Gs_model = self.create_models(res, mode=TRANSITION_MODE)
                     self.D_model, self.G_model, self.Gs_model = self.load_models_from_class()
 
-                    tStep.assign(n_finished_steps)
-                    tWriteSummary.assign(True)
+                    tf_step.assign(n_finished_steps)
+                    tf_write_scalars_summary.assign(True)
+                    tf_write_hists_summary.assign(True)
 
                     desc = f'{2**res}x{2**res} model, transition steps'
                     for step in tqdm(range(transition_steps), desc=desc):
-                        last_step_cond = is_last_step(step, transition_steps)
 
                         if step % self.batch_repeats == 0:
                             alpha = compute_alpha(step, transition_steps)
-                            self.G_model = update_wsum_alpha(self.G_model, alpha)
                             self.D_model = update_wsum_alpha(self.D_model, alpha)
+                            self.G_model = update_wsum_alpha(self.G_model, alpha)
                             if self.use_Gs:
                                 self.Gs_model = update_wsum_alpha(self.Gs_model, alpha)
 
-                        write_summary = step % self.summary_every == 0 or last_step_cond
-                        tWriteSummary.assign(write_summary)
-                        if write_summary:
-                            tStep.assign(step + n_finished_steps)
-                            tf.summary.scalar('alpha', alpha, step=step)
+                        last_step_cond = is_last_step(step, stabilization_steps)
+                        n_images = (step + 1) * batch_size
+                        write_scalars_summary = should_write_summary(self.summary_scalars_every, n_images, batch_size) or last_step_cond
+                        write_hists_summary = should_write_summary(self.summary_hists_every, n_images, batch_size) or last_step_cond
+                        if write_scalars_summary:
+                            tf.summary.scalar('Alpha', alpha, step=n_images)
+
+                        tf_write_scalars_summary.assign(write_scalars_summary)
+                        tf_write_hists_summary.assign(write_hists_summary)
+                        tf_step.assign(step + n_finished_steps)
 
                         G_latents = self.generate_latents(batch_size)
                         D_latents = self.generate_latents(batch_size)
@@ -984,11 +1120,12 @@ class StyleGAN:
                         self.train_step(
                             G_model=self.G_model, D_model=self.D_model,
                             G_latents=G_latents, D_latents=D_latents, images=batch_images,
-                            write_summary=tWriteSummary, step=tStep
+                            write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                         )
                         self.post_train_step_actions(
-                            res=res, mode=TRANSITION_MODE, step=step, last_step_cond=last_step_cond,
-                            write_summary=write_summary, summary_writer=summary_writer
+                            res=res, mode=TRANSITION_MODE,
+                            n_images=n_images, last_step_cond=last_step_cond,
+                            write_scalars_summary=write_scalars_summary, summary_writer=summary_writer
                         )
 
                     self.update_models_weights()
@@ -1010,17 +1147,19 @@ class StyleGAN:
                 self.D_model, self.G_model, self.Gs_model = self.create_models(res, mode=STABILIZATION_MODE)
                 self.D_model, self.G_model, self.Gs_model = self.load_models_from_class()
 
-                tStep.assign(transition_steps + n_finished_steps)
-                tWriteSummary.assign(True)
+                tf_step.assign(transition_steps + n_finished_steps)
+                tf_write_scalars_summary.assign(True)
+                tf_write_hists_summary.assign(True)
 
                 desc = f'{2**res}x{2**res} model, stabilization steps'
                 for step in tqdm(range(stabilization_steps), desc=desc):
                     last_step_cond = is_last_step(step, stabilization_steps)
-
-                    write_summary = step % self.summary_every == 0 or last_step_cond
-                    tWriteSummary.assign(write_summary)
-                    if write_summary:
-                        tStep.assign(step + transition_steps + n_finished_steps)
+                    n_images = (step + 1) * batch_size
+                    write_scalars_summary = should_write_summary(self.summary_scalars_every, n_images, batch_size) or last_step_cond
+                    write_hists_summary = should_write_summary(self.summary_hists_every, n_images, batch_size) or last_step_cond
+                    tf_write_scalars_summary.assign(write_scalars_summary)
+                    tf_write_hists_summary.assign(write_hists_summary)
+                    tf_step.assign(step + transition_steps + n_finished_steps)
 
                     G_latents = self.generate_latents(batch_size)
                     D_latents = self.generate_latents(batch_size)
@@ -1029,11 +1168,12 @@ class StyleGAN:
                     self.train_step(
                         G_model=self.G_model, D_model=self.D_model,
                         G_latents=G_latents, D_latents=D_latents, images=batch_images,
-                        write_summary=tWriteSummary, step=tStep
+                        write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                     )
                     self.post_train_step_actions(
-                        res=res, mode=STABILIZATION_MODE, step=step, last_step_cond=last_step_cond,
-                        write_summary=write_summary, summary_writer=summary_writer
+                        res=res, mode=STABILIZATION_MODE,
+                        n_images=n_images, last_step_cond=last_step_cond,
+                        write_scalars_summary=write_scalars_summary, summary_writer=summary_writer
                     )
 
                 self.update_models_weights()
@@ -1068,16 +1208,24 @@ class StyleGAN:
         batch_size = self.batch_sizes[2 ** res]
         summary_writer = self.summary_writers[res]
 
-        n_finished_steps = self.get_n_finished_steps(res, TRANSITION_MODE)
+        n_finished_images = self.get_n_processed_images(res, TRANSITION_MODE)
         transition_steps = self.get_n_steps(res, TRANSITION_MODE)
 
-        tStep = tf.Variable(n_finished_steps, trainable=False, dtype=tf.int64)
-        tWriteSummary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_step = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
+        tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_write_hists_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
 
         with summary_writer.as_default():
             desc = f'{2**res}x{2**res} model, transition steps'
             for step in tqdm(range(transition_steps), desc=desc):
                 last_step_cond = is_last_step(step, transition_steps)
+                n_images = (step + 1) * batch_size
+                write_scalars_summary = should_write_summary(self.summary_scalars_every, n_images, batch_size) or last_step_cond
+                write_hists_summary = should_write_summary(self.summary_hists_every, n_images, batch_size) or last_step_cond
+
+                tf_write_scalars_summary.assign(write_scalars_summary)
+                tf_write_hists_summary.assign(write_hists_summary)
+                tf_step.assign(n_images + n_finished_images)
 
                 if step % self.batch_repeats == 0:
                     alpha = compute_alpha(step, transition_steps)
@@ -1086,11 +1234,8 @@ class StyleGAN:
                     if self.use_Gs:
                         self.Gs_model = update_wsum_alpha(self.Gs_model, alpha)
 
-                write_summary = step % self.summary_every == 0 or last_step_cond
-                tWriteSummary.assign(write_summary)
-                if write_summary:
-                    tStep.assign(step + n_finished_steps)
-                    tf.summary.scalar('alpha', alpha, step=step)
+                if write_scalars_summary:
+                    tf.summary.scalar('Alpha', alpha, step=n_images + n_finished_images)
 
                 G_latents = self.generate_latents(batch_size)
                 D_latents = self.generate_latents(batch_size)
@@ -1099,25 +1244,22 @@ class StyleGAN:
                 self.train_step(
                     G_model=self.G_model, D_model=self.D_model,
                     G_latents=G_latents, D_latents=D_latents, images=batch_images,
-                    write_summary=tWriteSummary, step=tStep
+                    write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                 )
                 # TODO: for debugging, remove later
-                if step > 0:
-                    if len(self.G_optimizer.weights) > self.n_G_vars:
-                        print(f'Increased G_vars, step = {step}')
-                    if len(self.D_optimizer.weights) > self.n_D_vars:
-                        print(f'Increased D_vars, step = {step}')
+                if self.use_mixed_precision:
+                    print('\nD loss scale: ', self.D_optimizer.loss_scale)
+                    print('G loss scale: ', self.G_optimizer.loss_scale)
+                    1
                 if step == 0:
                     if not self.reset_opt_state_for_new_lod:
                         self.restore_optimizers_state(res - 1, STABILIZATION_MODE)
                     # Always adjust learning rates
                     self.adjust_optimizers_learning_rate(res)
-                    # TODO: for debugging, remove later
-                    self.n_G_vars = len(self.G_optimizer.weights)
-                    self.n_D_vars = len(self.D_optimizer.weights)
                 self.post_train_step_actions(
-                    res=res, mode=TRANSITION_MODE, step=step, last_step_cond=last_step_cond,
-                    write_summary=write_summary, summary_writer=summary_writer
+                    res=res, mode=TRANSITION_MODE,
+                    n_images=n_images, last_step_cond=last_step_cond,
+                    write_scalars_summary=write_scalars_summary, summary_writer=summary_writer
                 )
 
         remove_old_models(
@@ -1147,21 +1289,24 @@ class StyleGAN:
         batch_size = self.batch_sizes[2 ** res]
         summary_writer = self.summary_writers[res]
 
-        n_finished_steps = self.get_n_finished_steps(res, STABILIZATION_MODE)
+        n_finished_images = self.get_n_processed_images(res, STABILIZATION_MODE)
         stabilization_steps = self.get_n_steps(res, STABILIZATION_MODE)
 
-        tStep = tf.Variable(n_finished_steps, trainable=False, dtype=tf.int64)
-        tWriteSummary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_step = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
+        tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_write_hists_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
 
         with summary_writer.as_default():
             desc = f'{2**res}x{2**res} model, stabilization steps'
             for step in tqdm(range(stabilization_steps), desc=desc):
                 last_step_cond = is_last_step(step, stabilization_steps)
+                n_images = (step + 1) * batch_size
+                write_scalars_summary = should_write_summary(self.summary_scalars_every, n_images, batch_size) or last_step_cond
+                write_hists_summary = should_write_summary(self.summary_hists_every, n_images, batch_size) or last_step_cond
 
-                write_summary = step % self.summary_every == 0 or last_step_cond
-                tWriteSummary.assign(write_summary)
-                if write_summary:
-                    tStep.assign(step + n_finished_steps)
+                tf_write_scalars_summary.assign(write_scalars_summary)
+                tf_write_hists_summary.assign(write_hists_summary)
+                tf_step.assign(n_images + n_finished_images)
 
                 G_latents = self.generate_latents(batch_size)
                 D_latents = self.generate_latents(batch_size)
@@ -1170,25 +1315,22 @@ class StyleGAN:
                 self.train_step(
                     G_model=self.G_model, D_model=self.D_model,
                     G_latents=G_latents, D_latents=D_latents, images=batch_images,
-                    write_summary=tWriteSummary, step=tStep
+                    write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                 )
                 # TODO: for debugging, remove later
-                if step > 0:
-                    if len(self.G_optimizer.weights) > self.n_G_vars:
-                        print(f'Increased G_vars, step = {step}')
-                    if len(self.D_optimizer.weights) > self.n_D_vars:
-                        print(f'Increased D_vars, step = {step}')
+                if self.use_mixed_precision:
+                    print('\nD loss scale: ', self.D_optimizer.loss_scale)
+                    print('G loss scale: ', self.G_optimizer.loss_scale)
+                    1
                 if step == 0:
                     if res > self.start_resolution_log2:
                         self.restore_optimizers_state(res, stage=TRANSITION_MODE)
                     # Always adjust learning rates
                     self.adjust_optimizers_learning_rate(res)
-                    # TODO: for debugging, remove later
-                    self.n_G_vars = len(self.G_optimizer.weights)
-                    self.n_D_vars = len(self.D_optimizer.weights)
                 self.post_train_step_actions(
-                    res=res, mode=STABILIZATION_MODE, step=step, last_step_cond=last_step_cond,
-                    write_summary=write_summary, summary_writer=summary_writer
+                    res=res, mode=STABILIZATION_MODE,
+                    n_images=n_images, last_step_cond=last_step_cond,
+                    write_scalars_summary=write_scalars_summary, summary_writer=summary_writer
                 )
 
         remove_old_models(
@@ -1201,6 +1343,38 @@ class StyleGAN:
 
         stabilization_stage_total_time = time.time() - stabilization_stage_start_time
         logging.info(f'Stabilization stage took {format_time(stabilization_stage_total_time)}')
+
+    def run_metrics(self, res, mode, n_images):
+        batch_size = self.batch_sizes[2 ** res]
+        # TODO: make sure that weights are shared between full G model and its components
+        if self.use_Gs:
+            G_synthesis = self.Gs_object.G_synthesis
+            G_mapping = self.Gs_object.G_mapping
+        else:
+            G_synthesis = self.G_object.G_synthesis
+            G_mapping = self.G_object.G_mapping
+
+        n_finished_images = self.get_n_processed_images(res, mode)
+        step = n_finished_images + n_images
+
+        summary_writer = self.summary_writers[res]
+        with summary_writer.as_default():
+            metrics_start_time = time.time()
+            for idx, metric_object in enumerate(self.metrics_objects):
+                metric_name = metric_object.name
+
+                start_time = time.time()
+                metric_value = metric_object.run_metric(batch_size, G_synthesis, G_mapping)
+                total_time = time.time() - start_time
+
+                tf.summary.scalar(f'Metric/{metric_name}', metric_value, step=step)
+                tf.summary.scalar(f'Metric/{metric_name}/Time(s)', total_time, step=step)
+                summary_writer.flush()
+                logging.info(f'Evaluated {metric_name} metric in {format_time(total_time)}')
+
+            metrics_total_time = time.time() - metrics_start_time
+            tf.summary.scalar(f'Metric/TotalRunTime/Time(s)', metrics_total_time, step=step)
+            summary_writer.flush()
 
     def run_train_stage(self, res, mode):
         assert self.start_resolution_log2 <= res <= self.resolution_log2

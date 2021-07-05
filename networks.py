@@ -3,18 +3,18 @@ import tensorflow as tf
 from tensorflow.keras.layers import Input
 from tensorflow.keras import mixed_precision
 
-from custom_layers import WeightedSum, LRMUL,\
-    dense_layer, conv2d_layer, bias_layer, act_layer, const_layer, noise_layer, blur_layer,\
+from custom_layers import WeightedSum, LRMUL, clip_by_value_preserve_gradient, layer_dtype,\
+    dense_layer, conv2d_layer, bias_layer, act_layer, fused_bias_act_layer, const_layer, noise_layer, blur_layer,\
     pixel_norm_layer, instance_norm_layer, style_mod_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer
 from utils import TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME,\
     GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT,\
-    level_of_details, validate_data_format, create_model_type_key, to_int_dict
+    level_of_details, validate_data_format, create_model_type_key, to_int_dict, get_start_fp16_resolution
 
 from utils import TARGET_RESOLUTION, START_RESOLUTION,\
     LATENT_SIZE, DLATENT_SIZE, NORMALIZE_LATENTS,\
     USE_NOISE, RANDOMIZE_NOISE,\
-    DATA_FORMAT, USE_MIXED_PRECISION, USE_BIAS, USE_WSCALE,\
-    USE_PIXEL_NORM, USE_INSTANCE_NORM, USE_STYLES, CONST_INPUT_LAYER, TRUNCATE_WEIGHTS,\
+    DATA_FORMAT, FUSED_BIAS_ACT, USE_MIXED_PRECISION, NUM_FP16_RESOLUTIONS, CONV_CLAMP, USE_BIAS, USE_WSCALE,\
+    USE_PIXEL_NORM, USE_INSTANCE_NORM, USE_STYLES, CONST_INPUT_LAYER, TRUNCATE_WEIGHTS, BLUR_FILTER,\
     G_FUSED_SCALE, G_WEIGHTS_INIT_MODE, G_ACTIVATION, G_KERNEL_SIZE,\
     D_FUSED_SCALE, D_WEIGHTS_INIT_MODE, D_ACTIVATION, D_KERNEL_SIZE,\
     MBSTD_GROUP_SIZE, OVERRIDE_G_PROJECTING_GAIN, D_PROJECTING_NF,\
@@ -23,7 +23,8 @@ from utils import TARGET_RESOLUTION, START_RESOLUTION,\
     D_FMAP_BASE, D_FMAP_DECAY, D_FMAP_MAX,\
     BATCH_SIZES
 from utils import NCHW_FORMAT, NHWC_FORMAT, DEFAULT_DATA_FORMAT,\
-    DEFAULT_USE_MIXED_PRECISION, DEFAULT_START_RESOLUTION,\
+    DEFAULT_FUSED_BIAS_ACT, DEFAULT_USE_MIXED_PRECISION, DEFAULT_NUM_FP16_RESOLUTIONS,\
+    DEFAULT_CONV_CLAMP, DEFAULT_START_RESOLUTION,\
     DEFAULT_MAPPING_LAYERS, DEFAULT_MAPPING_UNITS, DEFAULT_MAPPING_LRMUL, DEFAULT_MAPPING_ACTIVATION,\
     DEFAULT_OVERRIDE_G_PROJECTING_GAIN, \
     DEFAULT_NORMALIZE_LATENTS, DEFAULT_CONST_INPUT_LAYER,\
@@ -32,7 +33,7 @@ from utils import NCHW_FORMAT, NHWC_FORMAT, DEFAULT_DATA_FORMAT,\
     DEFAULT_G_FUSED_SCALE, DEFAULT_D_FUSED_SCALE,\
     DEFAULT_G_KERNEL_SIZE, DEFAULT_D_KERNEL_SIZE, DEFAULT_USE_BIAS,\
     DEFAULT_USE_PIXEL_NORM, DEFAULT_USE_INSTANCE_NORM, DEFAULT_USE_STYLES,\
-    DEFAULT_TRUNCATE_WEIGHTS, DEFAULT_USE_WSCALE,\
+    DEFAULT_TRUNCATE_WEIGHTS, DEFAULT_BLUR_FILTER, DEFAULT_USE_WSCALE,\
     DEFAULT_FMAP_BASE, DEFAULT_FMAP_DECAY, DEFAULT_FMAP_MAX
 
 from utils import weights_to_dict, load_model_weights_from_dict
@@ -45,6 +46,14 @@ def n_filters(stage, fmap_base, fmap_decay, fmap_max):
     fmap_max   Maximum number of feature maps in any layer.
     """
     return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
+
+
+def get_act_name(act_name, default_act_name):
+    if act_name is None:
+        act_name = default_act_name
+    elif act_name == 'linear':
+        act_name = None
+    return act_name
 
 
 class Generator:
@@ -81,6 +90,7 @@ class Generator:
         self.G_fmap_decay = config.get(G_FMAP_DECAY, DEFAULT_FMAP_DECAY)
         self.G_fmap_max = config.get(G_FMAP_MAX, DEFAULT_FMAP_MAX)
         self.G_act_name = config.get(G_ACTIVATION, DEFAULT_G_ACTIVATION)
+        self.blur_filter = config.get(BLUR_FILTER, DEFAULT_BLUR_FILTER)
 
         self.mapping_layers = config.get(MAPPING_LAYERS, DEFAULT_MAPPING_LAYERS)
         self.mapping_units = config.get(MAPPING_UNITS, DEFAULT_MAPPING_UNITS)
@@ -88,9 +98,14 @@ class Generator:
         self.mapping_act_name = config.get(MAPPING_ACTIVATION, DEFAULT_MAPPING_ACTIVATION)
         self.mapping_gain = GAIN_ACTIVATION_FUNS_DICT[self.mapping_act_name]
 
+        self.fused_bias_act = config.get(FUSED_BIAS_ACT, DEFAULT_FUSED_BIAS_ACT)
         self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
+        self.num_fp16_resolutions = config.get(NUM_FP16_RESOLUTIONS, DEFAULT_NUM_FP16_RESOLUTIONS)
+        self.start_fp16_resolution_log2 =\
+            get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
         self.policy = mixed_precision.Policy('mixed_float16') if self.use_mixed_precision else 'float32'
         self.compute_dtype = self.policy.compute_dtype if self.use_mixed_precision else 'float32'
+        self.conv_clamp = config.get(CONV_CLAMP, DEFAULT_CONV_CLAMP)
 
         self.weights_init_mode = config.get(G_WEIGHTS_INIT_MODE, None)
         if self.weights_init_mode is None:
@@ -141,109 +156,138 @@ class Generator:
     def to_rgb_layer(self, res):
         lod = level_of_details(res, self.resolution_log2)
         block_name = f'ToRGB_lod{lod}'
+        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
 
         with tf.name_scope(block_name) as scope:
             x = Input(self.G_output_shape(res))
-            y = self.apply_bias(self.conv2d(x, fmaps=3, kernel_size=1, gain=1., scope=scope), scope=scope)
+            y = self.conv2d(x, fmaps=3, kernel_size=1, gain=1., use_fp16=use_fp16, scope=scope)
+            y = self.bias_act(y, act_name='linear', clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
 
         return tf.keras.Model(x, y, name=block_name)
 
     def to_rgb(self, x, res):
         return self.toRGB_layers[res](x)
 
-    def blur(self, x, scope=''):
-        return blur_layer(x, scope=scope, config=self.config)
+    def blur(self, x, use_fp16=None, scope=''):
+        return blur_layer(x, use_fp16=use_fp16, scope=scope, config=self.config) if self.blur_filter is not None else x
 
-    def dense(self, x, units, gain=None, lrmul=None, scope=''):
+    def dense(self, x, units, gain=None, lrmul=None, use_fp16=None, scope=''):
         if gain is None: gain = self.gain
         if lrmul is None: lrmul = LRMUL
-        return dense_layer(x, units, lrmul=lrmul, gain=gain, config=self.config, scope=scope)
+        return dense_layer(x, units, lrmul=lrmul, gain=gain, use_fp16=use_fp16, scope=scope, config=self.config)
 
-    def conv2d(self, x, fmaps, kernel_size=None, gain=None, fused_up=False, scope=''):
+    def conv2d(self, x, fmaps, kernel_size=None, gain=None, fused_up=False, use_fp16=None, scope=''):
         if kernel_size is None: kernel_size = self.G_kernel_size
         if gain is None: gain = self.gain
         return conv2d_layer(
-            x, fmaps, kernel_size=kernel_size, gain=gain,
-            fused_up=fused_up, scope=scope, config=self.config
+            x, fmaps, kernel_size=kernel_size, gain=gain, fused_up=fused_up,
+            use_fp16=use_fp16, scope=scope, config=self.config
         )
 
-    def upscale2d(self, x):
-        return upscale2d_layer(x, factor=2, config=self.config)
+    def upscale2d(self, x, use_fp16=None):
+        return upscale2d_layer(x, factor=2, use_fp16=use_fp16, config=self.config)
 
-    def upscale2d_conv2d(self, x, fmaps, scope=''):
+    def upscale2d_conv2d(self, x, fmaps, use_fp16=None, scope=''):
         if self.G_fused_scale:
-            x = self.conv2d(x, fmaps=fmaps, fused_up=True, scope=scope)
+            x = self.conv2d(x, fmaps=fmaps, fused_up=True, use_fp16=use_fp16, scope=scope)
         else:
-            x = self.upscale2d(x)
-            x = self.conv2d(x, fmaps=fmaps, scope=scope)
+            x = self.upscale2d(x, use_fp16=use_fp16)
+            x = self.conv2d(x, fmaps=fmaps, use_fp16=use_fp16, scope=scope)
         return x
 
-    def act(self, x, act_name=None, scope=''):
+    def act(self, x, act_name=None, use_fp16=None, scope=''):
         if act_name is None: act_name = self.G_act_name
-        return act_layer(x, act_name, scope=scope, config=self.config)
+        return act_layer(x, act_name, use_fp16=use_fp16, scope=scope, config=self.config)
 
-    def apply_bias(self, x, lrmul=None, scope=''):
+    def apply_bias(self, x, lrmul=None, use_fp16=None, scope=''):
         if lrmul is None: lrmul=LRMUL
-        return bias_layer(x, lrmul, scope=scope, config=self.config) if self.use_bias else x
+        return bias_layer(x, lrmul, use_fp16=use_fp16, scope=scope, config=self.config) if self.use_bias else x
 
-    def layer_epilogue(self, x, layer_idx, scope):
+    def bias_act(self, x, act_name=None, lrmul=None, clamp=None, use_fp16=None, scope=''):
+        act_name = get_act_name(act_name, self.G_act_name)
+        if lrmul is None: lrmul = LRMUL
+
+        if self.fused_bias_act:
+            return fused_bias_act_layer(x, act_name, lrmul=lrmul, clamp=clamp, use_fp16=use_fp16, scope=scope, config=self.config)
+        else:
+            x = self.apply_bias(x, use_fp16=use_fp16,scope=scope)
+            # Linear activation for rgb layer
+            if act_name is not None:
+                x = self.act(x, use_fp16=use_fp16, scope=scope)
+            if clamp is not None:
+                assert clamp > 0, 'Clamp should be greater than 0'
+                # See Fused_bias_Act layer for details
+                x = clip_by_value_preserve_gradient(x, -clamp, clamp)
+            return x
+
+    def layer_epilogue(self, x, layer_idx, use_fp16=None, scope=''):
         if self.use_noise:
-            x = noise_layer(x, scope=scope, config=self.config)
-        x = self.apply_bias(x, scope=scope)
-        x = self.act(x, scope=scope)
+            x = noise_layer(x, use_fp16=use_fp16, scope=scope, config=self.config)
+        x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
         if self.use_pixel_norm:
-            x = pixel_norm_layer(x, scope=scope, config=self.config)
+            x = pixel_norm_layer(x, use_fp16=use_fp16, scope=scope, config=self.config)
         if self.use_instance_norm:
-            x = instance_norm_layer(x, scope=scope, config=self.config)
+            x = instance_norm_layer(x, use_fp16=use_fp16, scope=scope, config=self.config)
         if self.use_styles:
-            x = style_mod_layer(x, self.dlatents[:, layer_idx], scope=scope, config=self.config)
+            x = style_mod_layer(x, self.dlatents[:, layer_idx], use_fp16=use_fp16, scope=scope, config=self.config)
         return x
 
     def create_G_mapping(self):
+        # TODO: think about fp16 for this network
+        use_fp16 = self.use_mixed_precision
         x = self.latents
         if self.normalize_latents:
             #with tf.name_scope('Latents_normalizer') as scope:
-            x = pixel_norm_layer(x, config=self.config)
+            x = pixel_norm_layer(x, use_fp16=use_fp16, config=self.config)
 
         with tf.name_scope('G_mapping'):
             for layer_idx in range(self.mapping_layers):
-                with tf.name_scope('Dense%d' % layer_idx) as scope:
+                with tf.name_scope(f'Dense{layer_idx}') as scope:
                     units = self.dlatent_size if layer_idx == self.mapping_layers - 1 else self.mapping_units
-                    x = self.dense(x, units, gain=self.mapping_gain, lrmul=self.mapping_lrmul, scope=scope)
-                    x = self.apply_bias(x, lrmul=self.mapping_lrmul, scope=scope)
-                    x = self.act(x, act_name=self.mapping_act_name, scope=scope)
+                    x = self.dense(x, units, gain=self.mapping_gain, lrmul=self.mapping_lrmul, use_fp16=use_fp16, scope=scope)
+                    x = self.bias_act(x, act_name=self.mapping_act_name, lrmul=self.mapping_lrmul, use_fp16=use_fp16, scope=scope)
 
             with tf.name_scope('Broadcast'):
+                x = tf.cast(x, tf.float32)
                 x = tf.tile(x[:, np.newaxis], [1, self.num_styles, 1])
+            # TODO: should x be casted to fp32? Can be important if model starts using mixed precision starting from some resolution
+            #  (e.g. in metrics calculation)
 
         self.G_mapping = tf.keras.Model(self.latents, tf.identity(x, name='dlatents'), name='G_mapping')
-        self.dlatents = self.G_mapping(self.latents)
+        # Old
+        # self.dlatents = self.G_mapping(self.latents)
+        # Use mapping network to get shape of dlatents
+        self.dlatents = Input(self.G_mapping.output_shape[1:], dtype=self.compute_dtype, name='Dlatents')
 
     def input_block(self):
+        use_fp16 = 2 >= self.start_fp16_resolution_log2 and self.use_mixed_precision
         with tf.name_scope('4x4'):
             if self.const_input_layer:
                 with tf.name_scope('Const') as scope:
-                    x = const_layer(self.latents, self.latent_size, scope=scope, config=self.config)
-                    x = self.layer_epilogue(x, 0, scope=scope)
+                    # TODO: changes the first argument from self.latents to self.dlatents
+                    x = const_layer(self.dlatents, self.latent_size, use_fp16=use_fp16, scope=scope, config=self.config)
+                    x = self.layer_epilogue(x, 0, use_fp16=use_fp16, scope=scope)
             else:
                 with tf.name_scope('Dense') as scope:
                     x = self.dense(
-                        self.dlatents[:, 0], units=self.projecting_units,
-                        gain=self.projecting_gain, scope=scope
+                        self.dlatents[:, 0], units=self.projecting_units, gain=self.projecting_gain,
+                        use_fp16=use_fp16, scope=scope
                     )
-                    x = self.layer_epilogue(tf.reshape(x, self.projecting_target_shape), 0, scope=scope)
+                    x = self.layer_epilogue(tf.reshape(x, self.projecting_target_shape), 0, use_fp16=use_fp16, scope=scope)
             with tf.name_scope('Conv1') as scope:
-                x = self.layer_epilogue(self.conv2d(x, fmaps=self.G_n_filters(1), scope=scope), 1, scope=scope)
+                x = self.layer_epilogue(self.conv2d(x, fmaps=self.G_n_filters(1), use_fp16=use_fp16, scope=scope), 1, use_fp16=use_fp16, scope=scope)
         return x
 
     def G_block(self, x, res):
         # res = 3 ... resolution_log2
+        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
         with tf.name_scope(f'{2**res}x{2**res}'):
             with tf.name_scope('Conv0_up') as scope:
-                x = self.blur(self.upscale2d_conv2d(x, fmaps=self.G_n_filters(res - 1), scope=scope), scope=scope)
-                x = self.layer_epilogue(x, res * 2 - 4, scope=scope)
+                x = self.blur(self.upscale2d_conv2d(x, fmaps=self.G_n_filters(res - 1), use_fp16=use_fp16, scope=scope), use_fp16, scope)
+                x = self.layer_epilogue(x, res * 2 - 4, use_fp16=use_fp16, scope=scope)
             with tf.name_scope('Conv1') as scope:
-                x = self.layer_epilogue(self.conv2d(x, fmaps=self.G_n_filters(res - 1), scope=scope), res * 2 - 3, scope=scope)
+                x = self.conv2d(x, fmaps=self.G_n_filters(res - 1), use_fp16=use_fp16, scope=scope)
+                x = self.layer_epilogue(x, res * 2 - 3, use_fp16=use_fp16, scope=scope)
         return x
 
     def create_G_model(self, model_res, mode=STABILIZATION_MODE):
@@ -265,15 +309,25 @@ class Generator:
                     images_out = self.to_rgb(x, model_res)
                 else:
                     # Last output layers
+                    use_fp16 = model_res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
                     images1 = self.to_rgb(x, model_res - 1)
-                    images1 = self.upscale2d(images1)
+                    images1 = self.upscale2d(images1, use_fp16=use_fp16)
                     # Introduce new layers
                     images2 = self.G_block(x, model_res)
                     images2 = self.to_rgb(images2, model_res)
+                    # Merge images
                     lod = level_of_details(model_res, self.resolution_log2)
                     wsum_name = f'G_{WSUM_NAME}_lod{lod}'
-                    images_out = WeightedSum(dtype=self.policy, name=wsum_name)([images1, images2])
+                    wsum_dtype = layer_dtype(WSUM_NAME, use_fp16)
+                    images_out = WeightedSum(dtype=wsum_dtype, name=wsum_name)([images1, images2])
 
+            # TODO: think about training models in the same process. Maybe save synthesis networks in a dict?
+            self.G_synthesis = tf.keras.Model(
+                self.dlatents, tf.identity(images_out, name='images_out'), name='G_synthesis'
+            )
+            # Create full G model
+            dlatents = self.G_mapping(self.latents)
+            images_out = self.G_synthesis(dlatents)
             self.G_models[model_type_key] = tf.keras.Model(
                 self.latents, tf.identity(images_out, name='images_out'), name='G_style'
             )
@@ -376,10 +430,16 @@ class Discriminator:
         self.D_fmap_decay = config.get(D_FMAP_DECAY, DEFAULT_FMAP_DECAY)
         self.D_fmap_max = config.get(D_FMAP_MAX, DEFAULT_FMAP_MAX)
         self.D_act_name = config.get(D_ACTIVATION, DEFAULT_D_ACTIVATION)
+        self.blur_filter = config.get(BLUR_FILTER, DEFAULT_BLUR_FILTER)
 
+        self.fused_bias_act = config.get(FUSED_BIAS_ACT, DEFAULT_FUSED_BIAS_ACT)
         self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
+        self.num_fp16_resolutions = config.get(NUM_FP16_RESOLUTIONS, DEFAULT_NUM_FP16_RESOLUTIONS)
+        self.start_fp16_resolution_log2 =\
+            get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
         self.policy = mixed_precision.Policy('mixed_float16') if self.use_mixed_precision else 'float32'
         self.compute_dtype = self.policy.compute_dtype if self.use_mixed_precision else 'float32'
+        self.conv_clamp = config.get(CONV_CLAMP, DEFAULT_CONV_CLAMP)
 
         self.weights_init_mode = config.get(D_WEIGHTS_INIT_MODE, None)
         if self.weights_init_mode is None:
@@ -419,65 +479,89 @@ class Discriminator:
     def from_rgb_layer(self, res):
         lod = level_of_details(res, self.resolution_log2)
         block_name = f'FromRGB_lod{lod}'
+        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
 
         with tf.name_scope(block_name) as scope:
             x = Input(self.D_input_shape(res))
-            y = self.apply_bias(self.conv2d(x, fmaps=self.D_n_filters(res - 1), kernel_size=1, scope=scope), scope=scope)
+            y = self.conv2d(x, fmaps=self.D_n_filters(res - 1), kernel_size=1, use_fp16=use_fp16, scope=scope)
+            y = self.bias_act(y, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
 
         return tf.keras.Model(x, y, name=block_name)
 
     def from_rgb(self, x, res):
         return self.fromRGB_layers[res](x)
 
-    def blur(self, x, scope=''):
-        return blur_layer(x, scope=scope, config=self.config)
+    def blur(self, x, use_fp16=None, scope=''):
+        return blur_layer(x, use_fp16=use_fp16, scope=scope, config=self.config) if self.blur_filter is not None else x
 
-    def dense(self, x, units, gain=None, scope=''):
+    def dense(self, x, units, gain=None, use_fp16=None, scope=''):
         if gain is None: gain = self.gain
-        return dense_layer(x, units, gain=gain, config=self.config, scope=scope)
+        return dense_layer(x, units, gain=gain, use_fp16=use_fp16, scope=scope, config=self.config)
 
-    def conv2d(self, x, fmaps, kernel_size=None, gain=None, fused_down=False, scope=''):
+    def conv2d(self, x, fmaps, kernel_size=None, gain=None, fused_down=False, use_fp16=None, scope=''):
         if kernel_size is None: kernel_size = self.D_kernel_size
         if gain is None: gain = self.gain
         return conv2d_layer(
-            x, fmaps, kernel_size=kernel_size, gain=gain,
-            fused_down=fused_down, scope=scope, config=self.config
+            x, fmaps, kernel_size=kernel_size, gain=gain, fused_down=fused_down,
+            use_fp16=use_fp16, scope=scope, config=self.config
         )
 
-    def downscale2d(self, x):
-        return downscale2d_layer(x, factor=2, config=self.config)
+    def downscale2d(self, x, use_fp16=None):
+        return downscale2d_layer(x, factor=2, use_fp16=use_fp16, config=self.config)
 
-    def conv2d_downscale2d(self, x, fmaps, scope=''):
+    def conv2d_downscale2d(self, x, fmaps, use_fp16=None, scope=''):
         if self.D_fused_scale:
-            x = self.conv2d(x, fmaps=fmaps, fused_down=True, scope=scope)
+            x = self.conv2d(x, fmaps=fmaps, fused_down=True, use_fp16=use_fp16, scope=scope)
         else:
-            x = self.conv2d(x, fmaps=fmaps, scope=scope)
-            x = self.downscale2d(x)
+            x = self.conv2d(x, fmaps=fmaps, use_fp16=use_fp16, scope=scope)
+            x = self.downscale2d(x, use_fp16=use_fp16)
         return x
 
-    def act(self, x, scope=''):
-        return act_layer(x, self.D_act_name, scope=scope, config=self.config)
+    def act(self, x, use_fp16=None, scope=''):
+        return act_layer(x, self.D_act_name, use_fp16=use_fp16, scope=scope, config=self.config)
 
-    def apply_bias(self, x, scope=''):
-        return bias_layer(x, scope=scope, config=self.config) if self.use_bias else x
+    def apply_bias(self, x, use_fp16=None, scope=''):
+        return bias_layer(x, use_fp16=use_fp16, scope=scope, config=self.config) if self.use_bias else x
+
+    def bias_act(self, x, act_name=None, lrmul=None, clamp=None, use_fp16=None, scope=''):
+        act_name = get_act_name(act_name, self.D_act_name)
+        if lrmul is None: lrmul = LRMUL
+
+        if self.fused_bias_act:
+            return fused_bias_act_layer(x, act_name, lrmul=lrmul, clamp=clamp, use_fp16=use_fp16, scope=scope, config=self.config)
+        else:
+            x = self.apply_bias(x, use_fp16=use_fp16, scope=scope)
+            # Linear activation for rgb layer
+            if act_name is not None:
+                x = self.act(x, use_fp16=use_fp16, scope=scope)
+            if clamp is not None:
+                assert clamp > 0, 'Clamp should be greater than 0'
+                # See Fused_bias_Act layer for details
+                x = clip_by_value_preserve_gradient(x, -clamp, clamp)
+            return x
 
     def D_block(self, x, res):
+        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
         with tf.name_scope(f'{2**res}x{2**res}') as top_scope:
             if res >= 3: # 8x8 and up
                 with tf.name_scope('Conv') as scope:
-                    x = self.act(self.apply_bias(self.conv2d(x, fmaps=self.D_n_filters(res - 1), scope=scope), scope), scope)
+                    x = self.conv2d(x, fmaps=self.D_n_filters(res - 1), use_fp16=use_fp16, scope=scope)
+                    x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
                 with tf.name_scope('Conv1_down') as scope:
-                    x = self.conv2d_downscale2d(self.blur(x, scope), fmaps=self.D_n_filters(res - 2), scope=scope)
-                    x = self.act(self.apply_bias(x, scope), scope)
+                    x = self.conv2d_downscale2d(self.blur(x, use_fp16, scope), fmaps=self.D_n_filters(res - 2), use_fp16=use_fp16, scope=scope)
+                    x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
             else: # 4x4
                 if self.mbstd_group_size > 1:
-                    x = minibatch_stddev_layer(x, scope=top_scope, config=self.config)
+                    x = minibatch_stddev_layer(x, use_fp16, scope=top_scope, config=self.config)
                 with tf.name_scope('Conv') as scope:
-                    x = self.act(self.apply_bias(self.conv2d(x, fmaps=self.D_n_filters(res - 1), scope=scope), scope), scope)
+                    x = self.conv2d(x, fmaps=self.D_n_filters(res - 1), use_fp16=use_fp16, scope=scope)
+                    x = self.bias_act(x, clamp=self.conv_clamp, use_fp16=use_fp16, scope=scope)
                 with tf.name_scope('Dense0') as scope:
-                    x = self.act(self.apply_bias(self.dense(x, units=self.D_n_filters(res - 2), scope=scope), scope), scope)
+                    x = self.dense(x, units=self.D_n_filters(res - 2), use_fp16=use_fp16, scope=scope)
+                    x = self.bias_act(x, use_fp16=use_fp16, scope=scope)
                 with tf.name_scope('Dense1') as scope:
-                    x = self.apply_bias(self.dense(x, units=1, gain=1., scope=scope), scope)
+                    x = self.dense(x, units=1, gain=1., use_fp16=use_fp16, scope=scope)
+                    x = self.bias_act(x, act_name='linear', use_fp16=use_fp16, scope=scope)
             return x
 
     def create_D_model(self, model_res, mode=STABILIZATION_MODE):
@@ -493,15 +577,19 @@ class Discriminator:
                     x = self.from_rgb(inputs, model_res)
                     x = self.D_block(x, model_res)
                 elif mode == TRANSITION_MODE:
+                    # TODO: fix dtypes for images and wsum
                     # Last input layers
-                    x1 = self.downscale2d(inputs)
+                    use_fp16 = (model_res - 1) >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+                    x1 = self.downscale2d(inputs, use_fp16=use_fp16)
                     x1 = self.from_rgb(x1, model_res - 1)
                     # Introduce new layers
                     x2 = self.from_rgb(inputs, model_res)
                     x2 = self.D_block(x2, model_res)
+                    # Merge features
                     lod = level_of_details(model_res, self.resolution_log2)
                     wsum_name = f'D_{WSUM_NAME}_lod{lod}'
-                    x = WeightedSum(dtype=self.policy, name=wsum_name)([x1, x2])
+                    wsum_dtype = layer_dtype(WSUM_NAME, use_fp16)
+                    x = WeightedSum(dtype=wsum_dtype, name=wsum_name)([x1, x2])
 
                 for res in range(model_res - 1, 2 - 1, -1):
                     x = self.D_block(x, res)

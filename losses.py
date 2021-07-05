@@ -41,9 +41,11 @@ def G_wgan(G, D, optimizer, latents, write_summary, step, **kwargs):
     fake_images = G(latents)
     fake_scores = fp32(D(fake_images))
     loss = tf.reduce_mean(-fake_scores)
-    if write_summary:
-        with tf.name_scope('G_WGAN-GP'):
-            tf.summary.scalar('Loss', loss, step=step)
+
+    with tf.name_scope('Loss/G_WGAN'):
+        if write_summary:
+            tf.summary.scalar('TotalLoss', loss, step=step)
+
     return loss
 
 
@@ -63,8 +65,8 @@ def D_wgan(G, D, optimizer, latents, real_images, write_summary, step,
     epsilon_penalty = tf.reduce_mean(tf.square(real_scores))
     loss += wgan_epsilon * epsilon_penalty
 
-    if write_summary:
-        with tf.name_scope('D_WGAN-GP'):
+    with tf.name_scope('Loss/D_WGAN'):
+        if write_summary:
             tf.summary.scalar('FakePartLoss', fake_part_loss, step=step)
             tf.summary.scalar('RealPartLoss', real_part_loss, step=step)
             tf.summary.scalar('EpsilonPenalty', epsilon_penalty, step=step)
@@ -112,8 +114,8 @@ def D_wgan_gp(G, D, optimizer, latents, real_images, write_summary, step,
     epsilon_penalty = tf.reduce_mean(tf.square(real_scores))
     loss += wgan_epsilon * epsilon_penalty
 
-    if write_summary:
-        with tf.name_scope('D_WGAN-GP'):
+    with tf.name_scope('Loss/D_WGAN-GP'):
+        if write_summary:
             tf.summary.scalar('FakePartLoss', fake_part_loss, step=step)
             tf.summary.scalar('RealPartLoss', real_part_loss, step=step)
             tf.summary.scalar('GradsPenalty', grads_penalty, step=step)
@@ -132,9 +134,11 @@ def G_logistic_saturating(G, D, optimizer, latents, write_summary, step, **kwarg
     fake_images = G(latents)
     fake_scores = fp32(D(fake_images))
     loss = -tf.math.softplus(fake_scores) # log(1 - logistic(fake_scores))
-    if write_summary:
-        with tf.name_scope('G_logistic_saturating'):
-            tf.summary.scalar('Loss', tf_mean(loss), step=step)
+
+    with tf.name_scope('Loss/G_logistic_saturating'):
+        if write_summary:
+            tf.summary.scalar('TotalLoss', tf_mean(loss), step=step)
+
     return loss
 
 
@@ -143,9 +147,11 @@ def G_logistic_nonsaturating(G, D, optimizer, latents, write_summary, step, **kw
     fake_images = G(latents)
     fake_scores = fp32(D(fake_images))
     loss = tf.math.softplus(-fake_scores) # -log(logistic(fake_scores))
-    if write_summary:
-        with tf.name_scope('G_logistic_nonsaturating'):
-            tf.summary.scalar('Loss', tf_mean(loss), step=step)
+
+    with tf.name_scope('Loss/G_logistic_nonsaturating'):
+        if write_summary:
+            tf.summary.scalar('TotalLoss', tf_mean(loss), step=step)
+
     return loss
 
 
@@ -156,11 +162,13 @@ def D_logistic(G, D, optimizer, latents, real_images, write_summary, step, **kwa
     real_scores = fp32(D(real_images))
     loss = tf.nn.softplus(fake_scores) # -log(1 - logistic(fake_scores))
     loss += tf.nn.softplus(-real_scores) # -log(logistic(real_scores))
-    if write_summary:
-        with tf.name_scope('D_logistic'):
+
+    with tf.name_scope('Loss/D_logistic'):
+        if write_summary:
             tf.summary.scalar('FakePartLoss', tf_mean(fake_scores), step=step)
             tf.summary.scalar('RealPartLoss', tf_mean(real_scores), step=step)
             tf.summary.scalar('TotalLoss', tf_mean(loss), step=step)
+
     return loss
 
 
@@ -200,8 +208,8 @@ def D_logistic_simplegp(G, D, optimizer, latents, real_images, write_summary, st
         r2_penalty = tf_grads_reduce_fn(tf.square(fake_grads), axis=[1, 2, 3])
         loss += r2_penalty * (r2_gamma * 0.5)
 
-    if write_summary:
-        with tf.name_scope('D_logistic_simpleGP'):
+    with tf.name_scope('Loss/D_logistic_simpleGP'):
+        if write_summary:
             tf.summary.scalar('FakePartLoss', tf_mean(fake_scores), step=step)
             tf.summary.scalar('RealPartLoss', tf_mean(real_scores), step=step)
             if use_r1_penalty:

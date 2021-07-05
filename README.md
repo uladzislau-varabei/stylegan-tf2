@@ -9,9 +9,9 @@ Tensorflow 2 implementation of the paper
 **"A Style-Based Generator Architecture for Generative Adversarial Networks"** (https://arxiv.org/abs/1812.04948) <br>
 The code is based on the official implementation: https://github.com/NVlabs/stylegan.
 
-**Note:** currently the code is in beta version, and some things have not yet been tested, so it should be used very carefully.
-E.g., training in mixed precision doesn't work (see Tensorboard for details).
-
+**Note:** the code is under active development, so some things have not yet been tested, though when training in 
+*fp32* or *mixed precision* no problems were observed. 
+Settings for stabilization for *mixed precision* tricks might need to be improved to stabilize training for various configs and datasets.
 
 This implementation allows finer control of a training process and model complexity: 
 one can use different parameters which define number of filters of each network (consider function `n_filters()` in `networks.py`), 
@@ -36,7 +36,13 @@ To train a model one needs to:
 
 To get maximum performance one should prefer training each model in a separate process (`single_process_training` in `train.py`), 
 as in this case all GPU resources are released after process is finished.  <br>
-Another way to increase performance is to use mixed precision training, which not just speeds operations up (especially on Nvidia cards with compute capability 7.0 or higher, e.g. Turing GPUs), but also allows to increase batch size. <br>
+Another way to increase performance is to use mixed precision training, which not just speeds operations up 
+(especially on Nvidia cards with compute capability 7.0 or higher, e.g., Turing or Ampere GPUs), but also allows to increase batch size. <br>
+
+Some notes about the tricks to enable stable mixed precision training (inspired by one of next papers from the same authors):
+* Enable mixed precision only for the N (set to 4 in the official implementation) highest resolutions
+* Clamp the output of every convolutional layer to 2^8, i.e., an order of magnitude wider range than is needed in practise.
+* No need to pre-normalize style vector (how to do it and why) or inputs x (instance norm is used by default).
 
 
 ## GPU memory usage
@@ -62,7 +68,7 @@ By default, on Linux `memory_growth` option is used, while on Windows memory is 
 * For some reason on Windows 10 with mentioned versions of NVIDIA libraries CUPTI must be manually configured. To do this:
   - Go to folder `c:\Program Files\NVIDIA Corporation\` and search for files `cupti*.dll`. 
   - Copy all of them to your CUPTI folder. 
-    Let `cuda_base = c:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2\`. 
+    Let `cuda_base = c:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2`. 
     Then it would be `{cuda_base}\extras\CUPTI\lib64\`. 
     File `cupti64_2020.3.1.dll` already was there.
   - Add CUPTI path to `Path` variable: `{cuda_base}\extras\CUPTI\lib64`
@@ -74,11 +80,35 @@ By default, on Linux `memory_growth` option is used, while on Windows memory is 
 you should check CUDA and cuDNN versions on the official TensorFlow site.
 
 
+## Metrics
+
+Supported metrics are:
+* Perceptual Path Length (PPL)
+  - Similarly to the official implementation it supports a number of options:
+      * Space: *w*, *z*
+      * Sampling method: *full*, *end*
+      * Epsilon: default is *1e-4*
+      * Number of images (the official implementation uses 100k, which takes lots of time to run, 
+        so consider using a lower value, e.g., 20k or 50k)
+  - To calculate the metric when the resolution of generated images is less than 256 (VGG was trained for 224) 
+    images are naively upsampled to resolution 32, if their resolution is lower than that.
+      * Probably images should be upsampled to 256 resolution. It's not obvious how the case is handled in the official implementation.
+  - This implementation uses the same type of noise (random or same) for metric evaluation as for training (random by default). 
+    The official implementation doesn't randomize noise to evaluate metric.
+  - *TensorFlow 2* port of lpips model by `moono` is used: https://github.com/moono/lpips-tf2.x.
+* Frechet Inception Distance (FID) is to be added soon.
+
+
 ## Further improvements
 
-- Fix problems with mixed precision training
-- Implement evaluation of metrics (especially Perceptual Path Length) to track numbers of quality progress
+- Tune settings for *mixed precision* training stabilization tricks
+- Fix implementation of PPL metric, so that non-random noise is used for the entire batch 
+- Implement FID (Frechet Inception Distance) metric
 - Implement Style mixing
 - Implement Truncation trick
 - Add XLA support  
 - Add multi GPU support
+- Refactor generation of latents to allow diffrent types of noise (random, uniform, etc.)
+- Fix problems with name scopes inside `tf.function()`. 
+  The current solution relies on the answer by `demmerichs`: https://github.com/tensorflow/tensorflow/issues/36464 
+  
