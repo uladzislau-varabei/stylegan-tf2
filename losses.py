@@ -44,7 +44,7 @@ def G_wgan(G, D, optimizer, latents, write_summary, step, **kwargs):
 
     with tf.name_scope('Loss/G_WGAN'):
         if write_summary:
-            tf.summary.scalar('TotalLoss', loss, step=step)
+            tf.summary.scalar('Total', loss, step=step)
 
     return loss
 
@@ -67,10 +67,10 @@ def D_wgan(G, D, optimizer, latents, real_images, write_summary, step,
 
     with tf.name_scope('Loss/D_WGAN'):
         if write_summary:
-            tf.summary.scalar('FakePartLoss', fake_part_loss, step=step)
-            tf.summary.scalar('RealPartLoss', real_part_loss, step=step)
+            tf.summary.scalar('FakePart', fake_part_loss, step=step)
+            tf.summary.scalar('RealPart', real_part_loss, step=step)
             tf.summary.scalar('EpsilonPenalty', epsilon_penalty, step=step)
-            tf.summary.scalar('TotalLoss', loss, step=step)
+            tf.summary.scalar('Total', loss, step=step)
 
     return loss
 
@@ -116,11 +116,11 @@ def D_wgan_gp(G, D, optimizer, latents, real_images, write_summary, step,
 
     with tf.name_scope('Loss/D_WGAN-GP'):
         if write_summary:
-            tf.summary.scalar('FakePartLoss', fake_part_loss, step=step)
-            tf.summary.scalar('RealPartLoss', real_part_loss, step=step)
+            tf.summary.scalar('FakePart', fake_part_loss, step=step)
+            tf.summary.scalar('RealPart', real_part_loss, step=step)
             tf.summary.scalar('GradsPenalty', grads_penalty, step=step)
             tf.summary.scalar('EpsilonPenalty', epsilon_penalty, step=step)
-            tf.summary.scalar('TotalLoss', loss, step=step)
+            tf.summary.scalar('Total', loss, step=step)
 
     return loss
 
@@ -137,7 +137,7 @@ def G_logistic_saturating(G, D, optimizer, latents, write_summary, step, **kwarg
 
     with tf.name_scope('Loss/G_logistic_saturating'):
         if write_summary:
-            tf.summary.scalar('TotalLoss', tf_mean(loss), step=step)
+            tf.summary.scalar('Total', tf_mean(loss), step=step)
 
     return loss
 
@@ -150,7 +150,7 @@ def G_logistic_nonsaturating(G, D, optimizer, latents, write_summary, step, **kw
 
     with tf.name_scope('Loss/G_logistic_nonsaturating'):
         if write_summary:
-            tf.summary.scalar('TotalLoss', tf_mean(loss), step=step)
+            tf.summary.scalar('Total', tf_mean(loss), step=step)
 
     return loss
 
@@ -165,9 +165,9 @@ def D_logistic(G, D, optimizer, latents, real_images, write_summary, step, **kwa
 
     with tf.name_scope('Loss/D_logistic'):
         if write_summary:
-            tf.summary.scalar('FakePartLoss', tf_mean(fake_scores), step=step)
-            tf.summary.scalar('RealPartLoss', tf_mean(real_scores), step=step)
-            tf.summary.scalar('TotalLoss', tf_mean(loss), step=step)
+            tf.summary.scalar('FakePart', tf_mean(fake_scores), step=step)
+            tf.summary.scalar('RealPart', tf_mean(real_scores), step=step)
+            tf.summary.scalar('Total', tf_mean(loss), step=step)
 
     return loss
 
@@ -210,12 +210,12 @@ def D_logistic_simplegp(G, D, optimizer, latents, real_images, write_summary, st
 
     with tf.name_scope('Loss/D_logistic_simpleGP'):
         if write_summary:
-            tf.summary.scalar('FakePartLoss', tf_mean(fake_scores), step=step)
-            tf.summary.scalar('RealPartLoss', tf_mean(real_scores), step=step)
+            tf.summary.scalar('FakePart', tf_mean(fake_scores), step=step)
+            tf.summary.scalar('RealPart', tf_mean(real_scores), step=step)
             if use_r1_penalty:
                 tf.summary.scalar('R1Penalty', tf_mean(r1_penalty), step=step)
             if use_r2_penalty:
                 tf.summary.scalar('R2Penalty', tf_mean(r2_penalty), step=step)
-            tf.summary.scalar('TotalLoss', tf_mean(loss), step=step)
+            tf.summary.scalar('Total', tf_mean(loss), step=step)
 
     return loss

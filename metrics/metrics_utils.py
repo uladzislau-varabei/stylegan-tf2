@@ -4,7 +4,7 @@ from .perceptual_path_length import PPL
 
 
 DEFAULT_PPL_PARAMS = {
-    'num_samples': 1000,
+    'num_samples': 10000,
     'epsilon': 1e-4,
     'space': 'z',
     'sampling': 'full',

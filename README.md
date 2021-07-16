@@ -20,16 +20,26 @@ use different optimizers settings,
 etc.
 
 
-## Model training
+## Training
 
 To train a model one needs to:
 
-1. Define a training config (example in `default_config.json`, all available options and their default values can be found in `utils.py`). *Note:* some values in config are different from original implementation due to memory constraints.
+1. Define a training config (example in `default_config.json`, all available options and their default values can be found in `utils.py`). 
+   <br>*Note 1:* some values in config are different from original implementation due to memory constraints.
+   <br>*Note 2:* Paths to images should be saved in a separate .txt file, 
+   which is to be provided under key `images_paths_filename` in config.
 2. Optionally configure gpu memory options (consider **GPU memory usage** section).
 3. Optionally set training mode (consider **Training speed** section).
 4. Start training with command: <br>
 
-> python train.py --config=path_to_config (e.g. --config=default_config.json)
+> python train.py --config path_to_config (e.g. --config default_config.json)
+
+
+## Inference
+
+To run inference consider file `inference.py`. <br>
+Example call: <br>
+> python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --image_fname images --grid_cols 12 --grid_rows 9
 
 
 ## Training speed
@@ -40,9 +50,15 @@ Another way to increase performance is to use mixed precision training, which no
 (especially on Nvidia cards with compute capability 7.0 or higher, e.g., Turing or Ampere GPUs), but also allows to increase batch size. <br>
 
 Some notes about the tricks to enable stable mixed precision training (inspired by one of next papers from the same authors):
-* Enable mixed precision only for the N (set to 4 in the official implementation) highest resolutions
-* Clamp the output of every convolutional layer to 2^8, i.e., an order of magnitude wider range than is needed in practise.
-* No need to pre-normalize style vector (how to do it and why) or inputs x (instance norm is used by default).
+* Enable mixed precision only for the N (set to 4 in the official implementation) highest resolutions;
+* Clamp the output of every convolutional layer to 2^8, i.e., an order of magnitude wider range than is needed in practise;
+* No need to pre-normalize style vector (how to do it and why?) or inputs x (instance norm is used by default).
+
+Note: when training with mixed precision on LSUN Living Room dataset loss scale became 1 for both (G and D) optimizers
+after about 8.5M images (around 3M for the last train stage). 
+It might indicate that mixed precision should be made more stable. 
+As a result of this behaviour some of valid images became all black (after converting), 
+yet after a number of iterations other images might become black and others become normal again.
 
 
 ## GPU memory usage
@@ -88,6 +104,7 @@ Supported metrics are:
       * Space: *w*, *z*
       * Sampling method: *full*, *end*
       * Epsilon: default is *1e-4*
+      * Optional face crop for dataset with human faces (default is *False*) 
       * Number of images (the official implementation uses 100k, which takes lots of time to run, 
         so consider using a lower value, e.g., 20k or 50k)
   - To calculate the metric when the resolution of generated images is less than 256 (VGG was trained for 224) 
@@ -99,8 +116,12 @@ Supported metrics are:
 * Frechet Inception Distance (FID) is to be added soon.
 
 
+
 ## Further improvements
 
+- Implement the same noise for valid images across all train stages 
+  (currently the noise is reset at every stage)
+- Add config similar to the one used in the original implementation
 - Tune settings for *mixed precision* training stabilization tricks
 - Fix implementation of PPL metric, so that non-random noise is used for the entire batch 
 - Implement FID (Frechet Inception Distance) metric
@@ -108,7 +129,6 @@ Supported metrics are:
 - Implement Truncation trick
 - Add XLA support  
 - Add multi GPU support
-- Refactor generation of latents to allow diffrent types of noise (random, uniform, etc.)
 - Fix problems with name scopes inside `tf.function()`. 
   The current solution relies on the answer by `demmerichs`: https://github.com/tensorflow/tensorflow/issues/36464 
   

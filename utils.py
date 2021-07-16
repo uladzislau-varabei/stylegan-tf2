@@ -406,6 +406,12 @@ def format_time(seconds):
     return '>100d'
 
 
+def load_config(config_path):
+    with open(config_path, 'r') as fp:
+        config = json.load(fp)
+    return config
+
+
 def to_int_dict(d: dict) -> dict:
     return {int(k): v for k, v in d.items()}
 
@@ -428,7 +434,7 @@ def load_images_paths(config):
         file_lines = f.readlines()
     images_paths = [x.strip() for x in file_lines]
 
-    dataset_n_max_images = 1000 * config.get(DATASET_N_MAX_KIMAGES, DEFAULT_DATASET_N_MAX_KIMAGES)
+    dataset_n_max_images = int(1000 * config.get(DATASET_N_MAX_KIMAGES, DEFAULT_DATASET_N_MAX_KIMAGES))
     if dataset_n_max_images > 0:
         logging.info(f'Dataset n max images: {dataset_n_max_images}')
         if len(images_paths) > dataset_n_max_images:
@@ -498,8 +504,16 @@ def get_start_fp16_resolution(num_fp16_resolutions, start_resolution_log2, targe
         return target_resolution_log2 - num_fp16_resolutions + 1
 
 
+def should_use_fp16(res, start_fp16_resolution_log2, use_mixed_precision):
+    return res >= start_fp16_resolution_log2 and use_mixed_precision
+
+
 #----------------------------------------------------------------------------
 # Tf utils.
+
+def generate_latents(batch_size: int, z_dim: tuple, dtype=tf.float32):
+    return tf.random.normal(shape=(batch_size,) + z_dim, mean=0., stddev=1., dtype=dtype)
+
 
 def fp32(*values):
     if len(values) == 1:

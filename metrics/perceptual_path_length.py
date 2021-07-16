@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow as tf
 
 from .lpips_models.lpips_tensorflow import learned_perceptual_metric_model
-from utils import toNHWC_AXIS, toNCHW_AXIS
+from utils import generate_latents, toNHWC_AXIS, toNCHW_AXIS
 
 
 #----------------------------------------------------------------------------
@@ -55,7 +55,9 @@ class PPL:
 
         # Min size for the network is 32x32.
         # TODO: think to which resolution should images be upsampled if size is smaller than that?
-        self.min_size = 32
+        # self.min_size = 32
+        # Always upscale to 256
+        self.min_size = 256
         self.input_image_size = image_size if image_size > self.min_size else self.min_size
         print('Input image size for PPL metric:', self.input_image_size)
         # Tf 2.x port of vgg16_zhang_perceptual
@@ -103,7 +105,7 @@ class PPL:
         # Generate random latents and interpolation t-values.
         # TODO: looks like it doesn't help
         dtype = G_mapping.compute_dtype
-        lat_t01 = tf.random.normal([batch_size * 2] + list(G_mapping.input_shape[1:]), dtype=dtype)
+        lat_t01 = generate_latents(batch_size * 2, tuple(G_mapping.input_shape[1:]),  dtype)
         lerp_t = tf.random.uniform([batch_size], 0.0, 1.0 if self.sampling == 'full' else 0.0, dtype=dtype)
 
         # Interpolate in W or Z.
@@ -131,11 +133,13 @@ class PPL:
         batch_distance = self.lpips_model([img_e0, img_e1]) * self.norm_constant
         return batch_distance
 
-    def run_metric(self, batch_size, G_synthesis: tf.keras.Model, G_mapping: tf.keras.Model):
+    def run_metric(self, input_batch_size, G_synthesis: tf.keras.Model, G_mapping: tf.keras.Model):
         # Sampling loop.
         all_distances = []
-        #for _ in tqdm(range(0, self.num_samples, batch_size), desc='PPL metric steps'):
-        for _ in range(0, self.num_samples, batch_size):
+        # Max batch size for 256 resolution is 32
+        batch_size = min(input_batch_size, 32) if self.min_size == 256 else input_batch_size
+        for _ in tqdm(range(0, self.num_samples, batch_size), desc='PPL metric steps'):
+        #for _ in range(0, self.num_samples, batch_size):
             all_distances += self.evaluate_distance_for_batch(batch_size, G_synthesis, G_mapping).numpy().tolist()
 
         all_distances = np.array(all_distances)

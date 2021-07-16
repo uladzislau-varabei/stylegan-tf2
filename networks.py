@@ -8,7 +8,8 @@ from custom_layers import WeightedSum, LRMUL, clip_by_value_preserve_gradient, l
     pixel_norm_layer, instance_norm_layer, style_mod_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer
 from utils import TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME,\
     GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT,\
-    level_of_details, validate_data_format, create_model_type_key, to_int_dict, get_start_fp16_resolution
+    level_of_details, validate_data_format, create_model_type_key, to_int_dict,\
+    get_start_fp16_resolution, should_use_fp16
 
 from utils import TARGET_RESOLUTION, START_RESOLUTION,\
     LATENT_SIZE, DLATENT_SIZE, NORMALIZE_LATENTS,\
@@ -124,7 +125,7 @@ class Generator:
         if self.data_format == NCHW_FORMAT:
             self.z_dim = (self.latent_size, 1, 1)
             self.projecting_target_shape = (-1, self.G_n_filters(1), self.projecting_mult, self.projecting_mult)
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.z_dim = (1, 1, self.latent_size)
             self.projecting_target_shape = (-1, self.projecting_mult, self.projecting_mult, self.G_n_filters(1))
         self.projecting_units = np.prod(self.projecting_target_shape)
@@ -143,12 +144,13 @@ class Generator:
         nf = self.G_n_filters(res - 1)
         if self.data_format == NCHW_FORMAT:
             return [nf, 2 ** res, 2 ** res]
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             return [2 ** res, 2 ** res, nf]
 
     def create_model_layers(self):
+        # TODO: change start resolution (problems with graphs tracing)
         self.toRGB_layers = {
-            res: self.to_rgb_layer(res) for res in range(self.start_resolution_log2, self.resolution_log2 + 1)
+            res: self.to_rgb_layer(res) for res in range(self.start_resolution_log2 - 1, self.resolution_log2 + 1)
         }
         self.latents = Input(self.z_dim, dtype=self.compute_dtype, name='Latents')
         self.create_G_mapping()
@@ -156,7 +158,7 @@ class Generator:
     def to_rgb_layer(self, res):
         lod = level_of_details(res, self.resolution_log2)
         block_name = f'ToRGB_lod{lod}'
-        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+        use_fp16 = should_use_fp16(res, self.start_fp16_resolution_log2, self.use_mixed_precision)
 
         with tf.name_scope(block_name) as scope:
             x = Input(self.G_output_shape(res))
@@ -254,13 +256,11 @@ class Generator:
             #  (e.g. in metrics calculation)
 
         self.G_mapping = tf.keras.Model(self.latents, tf.identity(x, name='dlatents'), name='G_mapping')
-        # Old
-        # self.dlatents = self.G_mapping(self.latents)
         # Use mapping network to get shape of dlatents
         self.dlatents = Input(self.G_mapping.output_shape[1:], dtype=self.compute_dtype, name='Dlatents')
 
     def input_block(self):
-        use_fp16 = 2 >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+        use_fp16 = should_use_fp16(2, self.start_fp16_resolution_log2, self.use_mixed_precision)
         with tf.name_scope('4x4'):
             if self.const_input_layer:
                 with tf.name_scope('Const') as scope:
@@ -280,7 +280,7 @@ class Generator:
 
     def G_block(self, x, res):
         # res = 3 ... resolution_log2
-        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+        use_fp16 = should_use_fp16(res, self.start_fp16_resolution_log2, self.use_mixed_precision)
         with tf.name_scope(f'{2**res}x{2**res}'):
             with tf.name_scope('Conv0_up') as scope:
                 x = self.blur(self.upscale2d_conv2d(x, fmaps=self.G_n_filters(res - 1), use_fp16=use_fp16, scope=scope), use_fp16, scope)
@@ -309,7 +309,7 @@ class Generator:
                     images_out = self.to_rgb(x, model_res)
                 else:
                     # Last output layers
-                    use_fp16 = model_res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+                    use_fp16 = should_use_fp16(model_res, self.start_fp16_resolution_log2, self.use_mixed_precision)
                     images1 = self.to_rgb(x, model_res - 1)
                     images1 = self.upscale2d(images1, use_fp16=use_fp16)
                     # Introduce new layers
@@ -337,17 +337,13 @@ class Generator:
     def initialize_G_model(self, model_res=None, mode=None):
         if model_res is not None:
             batch_size = self.batch_sizes[2 ** model_res]
-            latents = tf.zeros(
-                shape=(batch_size,) + self.z_dim, dtype=self.compute_dtype
-            )
+            latents = tf.zeros(shape=(batch_size,) + self.z_dim, dtype=self.compute_dtype)
             G_model = self.create_G_model(model_res, mode=mode)
             _ = G_model(latents)
         else:
             for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
                 batch_size = self.batch_sizes[2 ** res]
-                latents = tf.zeros(
-                    shape=(batch_size,) + self.z_dim, dtype=self.compute_dtype
-                )
+                latents = tf.zeros(shape=(batch_size,) + self.z_dim, dtype=self.compute_dtype)
                 G_model = self.create_G_model(res, mode=TRANSITION_MODE)
                 _ = G_model(latents)
 
@@ -463,7 +459,7 @@ class Discriminator:
     def D_input_shape(self, res):
         if self.data_format == NCHW_FORMAT:
             return (3, 2 ** res, 2 ** res)
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             return (2 ** res, 2 ** res, 3)
 
     def create_model_layers(self):
@@ -472,14 +468,15 @@ class Discriminator:
                 shape=self.D_input_shape(res), dtype=self.compute_dtype, name=f'Images_{2**res}x{2**res}'
             ) for res in range(2, self.resolution_log2 + 1)
         }
+        # TODO: change start resolution (problems with graphs tracing)
         self.fromRGB_layers = {
-            res: self.from_rgb_layer(res) for res in range(self.start_resolution_log2, self.resolution_log2 + 1)
+            res: self.from_rgb_layer(res) for res in range(self.start_resolution_log2 - 1, self.resolution_log2 + 1)
         }
 
     def from_rgb_layer(self, res):
         lod = level_of_details(res, self.resolution_log2)
         block_name = f'FromRGB_lod{lod}'
-        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+        use_fp16 = should_use_fp16(res, self.start_fp16_resolution_log2, self.use_mixed_precision)
 
         with tf.name_scope(block_name) as scope:
             x = Input(self.D_input_shape(res))
@@ -541,7 +538,7 @@ class Discriminator:
             return x
 
     def D_block(self, x, res):
-        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+        use_fp16 = should_use_fp16(res, self.start_fp16_resolution_log2, self.use_mixed_precision)
         with tf.name_scope(f'{2**res}x{2**res}') as top_scope:
             if res >= 3: # 8x8 and up
                 with tf.name_scope('Conv') as scope:
@@ -579,7 +576,7 @@ class Discriminator:
                 elif mode == TRANSITION_MODE:
                     # TODO: fix dtypes for images and wsum
                     # Last input layers
-                    use_fp16 = (model_res - 1) >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+                    use_fp16 = should_use_fp16(model_res - 1, self.start_fp16_resolution_log2, self.use_mixed_precision)
                     x1 = self.downscale2d(inputs, use_fp16=use_fp16)
                     x1 = self.from_rgb(x1, model_res - 1)
                     # Introduce new layers
@@ -607,17 +604,13 @@ class Discriminator:
     def initialize_D_model(self, model_res=None, mode=None):
         if model_res is not None:
             batch_size = self.batch_sizes[2 ** model_res]
-            images = tf.zeros(
-                shape=(batch_size,) + self.D_input_shape(model_res), dtype=self.compute_dtype
-            )
+            images = tf.zeros(shape=(batch_size,) + self.D_input_shape(model_res), dtype=self.compute_dtype)
             D_model = self.create_D_model(model_res, mode=mode)
             _ = D_model(images)
         else:
             for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
                 batch_size = self.batch_sizes[2 ** res]
-                images = tf.zeros(
-                    shape=(batch_size,) + self.D_input_shape(res), dtype=self.compute_dtype
-                )
+                images = tf.zeros(shape=(batch_size,) + self.D_input_shape(res), dtype=self.compute_dtype)
                 D_model = self.create_D_model(res, mode=TRANSITION_MODE)
                 _ = D_model(images)
 
@@ -636,11 +629,10 @@ class Discriminator:
             # TODO: Change it later!
             profiler_dir = writers_dirs[res]
             trace_D_input = tf.zeros((1,) + self.D_input_shape(res), dtype=self.compute_dtype)
-
             if res == self.start_resolution_log2:
                 trace_D_model = tf.function(self.create_D_model(res, mode=STABILIZATION_MODE))
                 with writer.as_default():
-                    # Transition model
+                    # Stabilization model
                     tf.summary.trace_on(graph=True, profiler=True)
                     trace_D_model(trace_D_input)
                     tf.summary.trace_export(
@@ -654,7 +646,7 @@ class Discriminator:
                 trace_D_model1 = tf.function(self.create_D_model(res, mode=TRANSITION_MODE))
                 trace_D_model2 = tf.function(self.create_D_model(res, mode=STABILIZATION_MODE))
                 with writer.as_default():
-                    # Fade-in model
+                    # Transition model
                     tf.summary.trace_on(graph=True, profiler=True)
                     trace_D_model1(trace_D_input)
                     tf.summary.trace_export(

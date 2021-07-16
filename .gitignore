@@ -9,6 +9,7 @@ weights
 *.ipynb
 
 # Other
+results
 .idea
 __pycache__
 *.png

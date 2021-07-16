@@ -92,7 +92,7 @@ def _blur2d(x, f=None, normalize=True, flip=False, stride=1, data_format=DEFAULT
     if data_format == NCHW_FORMAT:
         f = np.tile(f, [1, 1, int(x.shape[1]), 1])
         strides = [1, 1, stride, stride]
-    elif data_format == NHWC_FORMAT:
+    else: # data_format == NHWC_FORMAT:
         f = np.tile(f, [1, 1, int(x.shape[3]), 1])
         strides = [1, stride, stride, 1]
 
@@ -121,7 +121,7 @@ def _upscale2d(x, factor, gain=1, data_format=DEFAULT_DATA_FORMAT):
         pretile_shape = [-1, c, h, 1, w, 1]
         tile_mults = [1, 1, 1, factor, 1, factor]
         output_shape = [-1, c, h * factor, w * factor]
-    elif data_format == NHWC_FORMAT:
+    else: # data_format == NHWC_FORMAT:
         _, h, w, c = x.shape
         pretile_shape = [-1, h, 1, w, 1, c]
         tile_mults = [1, 1, factor, 1, factor, 1]
@@ -152,7 +152,7 @@ def _downscale2d(x, factor, gain=1, data_format=DEFAULT_DATA_FORMAT):
 
     if data_format == NCHW_FORMAT:
         ksize = [1, 1, factor, factor]
-    elif data_format == NHWC_FORMAT:
+    else: # data_format == NHWC_FORMAT:
         ksize = [1, factor, factor, 1]
 
     # Note: soft ops placements should be enabled
@@ -230,7 +230,7 @@ class ScaledConv2d(Layer):
         if self.data_format == NCHW_FORMAT:
             self.channels_in = input_shape[1]
             self.strides = [1, 1, self.stride, self.stride]
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.channels_in = input_shape[-1]
             self.strides = [1, self.stride, self.stride, 1]
 
@@ -317,7 +317,7 @@ class Bias(Layer):
             if self.data_format == NCHW_FORMAT:
                 self.bias_target_shape = [1, -1, 1, 1]
                 self.units = input_shape[1]
-            elif self.data_format == NHWC_FORMAT:
+            else: # self.data_format == NHWC_FORMAT:
                 self.bias_target_shape = [1, 1, 1, -1]
                 self.units = input_shape[-1]
 
@@ -331,11 +331,8 @@ class Bias(Layer):
 
     @tf.function
     def call(self, x, *args, **kwargs):
-        if self.is_linear_bias:
-            return x + self.lrmul * self.b
-        else:
-            # Note: keep reshaping to allow easy weights decay between cpu and gpu models
-            return x + self.lrmul * tf.reshape(self.b, self.bias_target_shape)
+        # Note: keep reshaping to allow easy weights decay between cpu and gpu models
+        return x + self.lrmul * (self.b if self.is_linear_bias else tf.reshape(self.b, self.bias_target_shape))
 
 
 class Blur2d(Layer):
@@ -376,7 +373,7 @@ class Downscale2d(Layer):
         self.data_format = data_format
         if self.data_format == NCHW_FORMAT:
             self.ksize = [1, 1, factor, factor]
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.ksize = [1, factor, factor, 1]
         self.factor = factor
         self.use_xla = use_xla
@@ -396,7 +393,7 @@ class PixelNorm(Layer):
         self.data_format = data_format
         if self.data_format == NCHW_FORMAT:
             self.channel_axis = 1
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.channel_axis = 3
         self.epsilon = 1e-8 if self._dtype_policy.compute_dtype == 'float32' else 1e-4
         self.use_xla = use_xla
@@ -418,9 +415,8 @@ class InstanceNorm(Layer):
         self.data_format = data_format
         if self.data_format == NCHW_FORMAT:
             self.hw_axes = [2, 3]
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.hw_axes = [1, 2]
-        # self.epsilon = 1e-8 if self._dtype_policy.compute_dtype == 'float32' else 1e-4
         # Epsilon can be constant as call inputs are casted to fp32
         self.epsilon = 1e-8
         self.use_xla = use_xla
@@ -456,7 +452,7 @@ class StyleMod(Layer):
         if self.data_format == NCHW_FORMAT:
             self.fc_units = x_shape[1] * 2
             self.style_target_shape = [-1, 2, x_shape[1]] + [1] * (len(x_shape) - 2)
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.fc_units = x_shape[3] * 2
             self.style_target_shape = [-1, 2] + [1] * (len(x_shape) - 2) + [x_shape[3]]
 
@@ -502,7 +498,7 @@ class Noise(Layer):
             self.channels_in = input_shape[1]
             self.w_target_shape = [1, -1, 1, 1]
             self.noise_tail_shape = [1, input_shape[2], input_shape[3]]
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.channels_in = input_shape[-1]
             self.w_target_shape = [1, 1, 1, -1]
             self.noise_tail_shape = [input_shape[1], input_shape[2], 1]
@@ -553,7 +549,7 @@ class Const(Layer):
     def build(self, input_shape):
         if self.data_format == NCHW_FORMAT:
             self.shape = [1, self.channel_size, self.hw_size, self.hw_size]
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.shape = [1, self.hw_size, self.hw_size, self.channel_size]
 
         with tf.name_scope(self.scope):
@@ -598,7 +594,7 @@ class MinibatchStdDev(Layer):
             y = tf.cast(y, x.dtype)                              # [Mn11] Cast back to original dtype
             y = tf.tile(y, [group_size, 1, h, w])                # [NnHW] Replicate over group and pixels
             return tf.concat([x, y], axis=1)
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             _, h, w, c = x.shape
             n = tf.shape(x)[0]
             group_size = tf.math.minimum(self.group_size, n)     # Minibatch must be divisible or smaller than batch size
@@ -661,7 +657,7 @@ class Fused_Upscale2d_ScaledConv2d(Layer):
             self.channels_in = input_shape[1]
             self.strides = [1, 1, 2, 2]
             self.os_tail = [self.fmaps, input_shape[2] * 2, input_shape[3] * 2]
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.channels_in = input_shape[-1]
             self.strides = [1, 2, 2, 1]
             self.os_tail = [input_shape[1] * 2, input_shape[2] * 2, self.fmaps]
@@ -722,7 +718,7 @@ class Fused_ScaledConv2d_Downscale2d(Layer):
         if self.data_format == NCHW_FORMAT:
             self.channels_in = input_shape[1]
             self.strides = [1, 1, 2, 2]
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.channels_in = input_shape[-1]
             self.strides = [1, 2, 2, 1]
 
@@ -795,7 +791,7 @@ class Fused_Bias_Act(Layer):
             if self.data_format == NCHW_FORMAT:
                 self.bias_target_shape = [1, -1, 1, 1]
                 self.units = input_shape[1]
-            elif self.data_format == NHWC_FORMAT:
+            else: # self.data_format == NHWC_FORMAT:
                 self.bias_target_shape = [1, 1, 1, -1]
                 self.units = input_shape[-1]
 

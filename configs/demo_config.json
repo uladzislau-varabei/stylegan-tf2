@@ -16,23 +16,15 @@
     "data_format": "NCHW",
     "use_GPU_for_Gs": true,
     "use_mixed_precision": true,
-    "num_fp16_resolutions": "auto",
+    "num_fp16_resolutions": 4,
     "use_XLA": false,
     "conv_clamp": 256,
     "fused_bias_act": true,
-    "total_kimages": null,
-    "transition_kimages": 3,
-    "stabilization_kimages": 3,
-    "transition_kimages_dict": {
-        "8": 3,
-        "16": 3,
-        "32": 3
-    },
-    "stabilization_kimages_dict": {
-        "8": 3,
-        "16": 3,
-        "32": 3
-    },
+    "total_kimages": 20000,
+    "transition_kimages": 600,
+    "stabilization_kimages": 600,
+    "transition_kimages_dict": {},
+    "stabilization_kimages_dict": {},
     "batch_sizes": {
         "4": 128,
         "8": 128,
@@ -59,15 +51,15 @@
         "256": 0.002
     },
     "reset_opt_state_for_new_lod": true,
-    "max_models_to_keep": 3,
-    "summary_scalars_every_kimages": 1,
-    "summary_hists_every_kimages": 2,
-    "save_model_every_kimages": 2,
-    "save_images_every_kimages": 0.5,
-    "run_metrics_every_kimages": 2,
+    "max_models_to_keep": 5,
+    "summary_scalars_every_kimages": 2.5,
+    "summary_hists_every_kimages": 25,
+    "save_model_every_kimages": 100,
+    "save_images_every_kimages": 2.5,
+    "run_metrics_every_kimages": 50,
     "metrics": {
         "PPL": {
-            "num_samples": 3000,
+            "num_samples": 20000,
             "space": "w",
             "sampling": "full",
             "crop_face": false
@@ -101,7 +93,7 @@
     "D_fmap_max": 512,
     "mbstd_group_size": 4,
     "mbstd_num_features": 1,
-    "dataset_n_parallel_calls": 4,
+    "dataset_n_parallel_calls": 6,
     "dataset_n_prefetched_batches": 4,
     "dataset_max_kimages": 100,
     "shuffle_dataset": true,

@@ -9,7 +9,7 @@ from tensorflow.keras import mixed_precision
 
 from metrics.metrics_utils import setup_metrics
 from losses import select_G_loss_fn, select_D_loss_fn
-from utils import compute_alpha, update_wsum_alpha, get_start_fp16_resolution,\
+from utils import generate_latents, compute_alpha, update_wsum_alpha, get_start_fp16_resolution, should_use_fp16,\
     save_model, load_model, save_optimizer_loss_scale, load_optimizer_loss_scale, is_finite_grad,\
     TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
     create_images_dir_name, create_images_grid_title, remove_old_models,\
@@ -18,7 +18,8 @@ from utils import compute_alpha, update_wsum_alpha, get_start_fp16_resolution,\
     maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, load_images_paths, set_tf_logging
 from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, USE_MIXED_PRECISION, NUM_FP16_RESOLUTIONS,\
     DATA_FORMAT, MODEL_NAME, MAX_MODELS_TO_KEEP, \
-    SUMMARY_SCALARS_EVERY_KIMAGES, SUMMARY_HISTS_EVERY_KIMAGES, SAVE_MODEL_EVERY_KIMAGES, SAVE_IMAGES_EVERY_KIMAGES, METRICS_DICT, RUN_METRICS_EVERY_KIMAGES,\
+    SUMMARY_SCALARS_EVERY_KIMAGES, SUMMARY_HISTS_EVERY_KIMAGES, SAVE_MODEL_EVERY_KIMAGES, SAVE_IMAGES_EVERY_KIMAGES, \
+    METRICS_DICT, RUN_METRICS_EVERY_KIMAGES,\
     G_LOSS_FN, D_LOSS_FN, G_LOSS_FN_PARAMS, D_LOSS_FN_PARAMS,\
     G_LEARNING_RATE, D_LEARNING_RATE, \
     G_LEARNING_RATE_DICT, D_LEARNING_RATE_DICT,\
@@ -34,7 +35,8 @@ from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, USE_MIXED_PR
     VALID_GRID_NROWS, VALID_GRID_NCOLS, VALID_MIN_TARGET_SINGLE_IMAGE_SIZE, VALID_MAX_PNG_RES,\
     TRAIN_MODE, INFERENCE_MODE, DEFAULT_MODE
 from utils import DEFAULT_STORAGE_PATH, DEFAULT_MAX_MODELS_TO_KEEP,\
-    DEFAULT_SUMMARY_SCALARS_EVERY_KIMAGES, DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES, DEFAULT_SAVE_MODEL_EVERY_KIMAGES, DEFAULT_SAVE_IMAGES_EVERY_KIMAGES, \
+    DEFAULT_SUMMARY_SCALARS_EVERY_KIMAGES, DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES,\
+    DEFAULT_SAVE_MODEL_EVERY_KIMAGES, DEFAULT_SAVE_IMAGES_EVERY_KIMAGES, \
     DEFAULT_METRICS_DICT, DEFAULT_RUN_METRICS_EVERY_KIMAGES,\
     DEFAULT_BATCH_REPEATS, DEFAULT_G_LOSS_FN, DEFAULT_D_LOSS_FN, DEFAULT_G_LOSS_FN_PARAMS, DEFAULT_D_LOSS_FN_PARAMS,\
     DEFAULT_G_LEARNING_RATE, DEFAULT_D_LEARNING_RATE,\
@@ -70,6 +72,7 @@ How to load model:
 3) Load weights
 """
 
+
 def show_vars_stats(vars):
     for idx, var in enumerate(vars):
         mean = tf.math.reduce_mean(var).numpy()
@@ -101,7 +104,7 @@ class StyleGAN:
         self.latent_size = config[LATENT_SIZE]
         if self.data_format == NCHW_FORMAT:
             self.z_dim = (self.latent_size, 1, 1)
-        elif self.data_format == NHWC_FORMAT:
+        else: # self.data_format == NHWC_FORMAT:
             self.z_dim = (1, 1, self.latent_size)
 
         self.model_name = config[MODEL_NAME]
@@ -202,7 +205,7 @@ class StyleGAN:
             self.Gs_object = Generator(Gs_config)
 
         if mode == INFERENCE_MODE:
-            self.initialize_models()
+            self.initialize_models(res, stage)
         elif mode == TRAIN_MODE:
             if single_process_training:
                 self.setup_Gs_betas()
@@ -468,8 +471,7 @@ class StyleGAN:
             print(f'{idx}: {var}')
 
     def get_optimizer_initial_loss_scale(self, model_type, res, stage):
-        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
-        print('Get optimizer use_fp16:', use_fp16)
+        use_fp16 = should_use_fp16(res, self.start_fp16_resolution_log2, self.use_mixed_precision)
         if not use_fp16:
             logging.info(f"Res {res} doesn't use fp16, so constant loss scale for {model_type} optimizer is set to 1")
             return 1., False
@@ -605,7 +607,7 @@ class StyleGAN:
                 if r < res or (r == res and stage == STABILIZATION_MODE):
                     n_steps += self.get_n_steps(r, STABILIZATION_MODE)
         # TODO: for debugging, remove later
-        print(f'Opt steps for res={res} and stage={stage}: {n_steps}')
+        # print(f'Opt steps for res={res} and stage={stage}: {n_steps}')
         return np.array(n_steps)
 
     def create_images_generators(self, config):
@@ -708,9 +710,16 @@ class StyleGAN:
         for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
             if res > self.start_resolution_log2:
                 n_kimages += self.transition_kimages_dict.get(2 ** res, self.transition_kimages)
+                # TODO: for debugging, remove later
+                # print(f'After res={res}, mode={TRANSITION_MODE}', n_kimages)
             if res < self.resolution_log2:
                 n_kimages += self.stabilization_kimages_dict.get(2 ** res, self.stabilization_kimages)
-        logging.info('n_kimages for the last stage:', n_kimages)
+                # TODO: for debugging, remove later
+                # print(f'After res={res}, mode={STABILIZATION_MODE}', n_kimages)
+        n_kimages = self.total_kimages - n_kimages
+        # TODO: for debugging, remove later
+        # print(f'n_kimages for the last stage: {n_kimages}')
+        logging.info(f'n_kimages for the last stage: {n_kimages}')
         assert n_kimages > 0, 'Total number of images is greater than total number of images for all stages'
         return int(np.ceil(1000 * n_kimages / batch_size))
 
@@ -869,7 +878,7 @@ class StyleGAN:
         save_model(**D_optimizer_kwargs)
         save_model(**G_optimizer_kwargs)
 
-        use_fp16 = res >= self.start_fp16_resolution_log2 and self.use_mixed_precision
+        use_fp16 = should_use_fp16(res, self.start_fp16_resolution_log2, self.use_mixed_precision)
         if use_fp16:
             OPTIMIZER_ARG = 'optimizer'
             save_optimizer_loss_scale(**{OPTIMIZER_ARG: self.D_optimizer, MODEL_TYPE_ARG: D_model_type, **shared_kwargs})
@@ -918,10 +927,7 @@ class StyleGAN:
 
     @tf.function
     def generate_latents(self, batch_size):
-        latents = tf.random.normal(
-            shape=(batch_size,) + self.z_dim, mean=0., stddev=1., dtype=self.compute_dtype
-        )
-        return latents
+        return generate_latents(batch_size, self.z_dim, self.compute_dtype)
 
     @tf.function
     def smooth_net_weights(self, Gs_model, G_model, beta):
@@ -954,9 +960,10 @@ class StyleGAN:
         G_grads = maybe_unscale_grads(G_grads, self.G_optimizer)
         self.G_optimizer.apply_gradients(zip(G_grads, G_vars))
 
-        for grad, var in zip(G_grads, G_vars):
-            nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
-            nums = tf.math.count_nonzero(tf.math.is_finite(grad))
+        # TODO: for debugging, remove later
+        #for grad, var in zip(G_grads, G_vars):
+            #nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
+            #nums = tf.math.count_nonzero(tf.math.is_finite(grad))
             # tf.print('G, step =', step, f'{var.name}: nans =', nans, ',', tf.math.round(100 * nans / (nans + nums)), '%')
 
         # Write gradients
@@ -992,9 +999,10 @@ class StyleGAN:
         D_grads = maybe_unscale_grads(D_grads, self.D_optimizer)
         self.D_optimizer.apply_gradients(zip(D_grads, D_vars))
 
-        for grad, var in zip(D_grads, D_vars):
-            nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
-            nums = tf.math.count_nonzero(tf.math.is_finite(grad))
+        # TODO: for debugging, remove later
+        #for grad, var in zip(D_grads, D_vars):
+            #nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
+            #nums = tf.math.count_nonzero(tf.math.is_finite(grad))
             # tf.print('D, step =', step, f'{var.name}: nans =', nans, ',', tf.math.round(100 * nans / (nans + nums)), '%')
 
         # Write gradients
@@ -1246,11 +1254,6 @@ class StyleGAN:
                     G_latents=G_latents, D_latents=D_latents, images=batch_images,
                     write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                 )
-                # TODO: for debugging, remove later
-                if self.use_mixed_precision:
-                    print('\nD loss scale: ', self.D_optimizer.loss_scale)
-                    print('G loss scale: ', self.G_optimizer.loss_scale)
-                    1
                 if step == 0:
                     if not self.reset_opt_state_for_new_lod:
                         self.restore_optimizers_state(res - 1, STABILIZATION_MODE)
@@ -1317,11 +1320,6 @@ class StyleGAN:
                     G_latents=G_latents, D_latents=D_latents, images=batch_images,
                     write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                 )
-                # TODO: for debugging, remove later
-                if self.use_mixed_precision:
-                    print('\nD loss scale: ', self.D_optimizer.loss_scale)
-                    print('G loss scale: ', self.G_optimizer.loss_scale)
-                    1
                 if step == 0:
                     if res > self.start_resolution_log2:
                         self.restore_optimizers_state(res, stage=TRANSITION_MODE)

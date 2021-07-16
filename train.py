@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-import json
 import logging
 import time
 from multiprocessing import Process
@@ -10,10 +9,9 @@ import numpy as np
 # Note: do not import tensorflow here or you won't be able to train each stage
 # in a new process
 
-from utils import LOGS_DIR, TRAIN_MODE, INFERENCE_MODE,\
-    TRANSITION_MODE, STABILIZATION_MODE,\
+from utils import LOGS_DIR, TRAIN_MODE, INFERENCE_MODE, TRANSITION_MODE, STABILIZATION_MODE,\
     TARGET_RESOLUTION, START_RESOLUTION, DEFAULT_START_RESOLUTION
-from utils import prepare_gpu, load_images_paths, format_time, DEBUG_MODE
+from utils import load_config, prepare_gpu, load_images_paths, format_time, DEBUG_MODE
 from model import StyleGAN
 
 
@@ -24,6 +22,7 @@ def parse_args():
         help='Path to a config of a model to train (json format)',
         #default=os.path.join('configs', 'demo_config.json'),
         default=os.path.join('configs', 'debug_config.json'),
+        #default=os.path.join('configs', 'lsun_living_room.json'),
         #required=True
     )
     args = parser.parse_args()
@@ -55,16 +54,6 @@ def prepare_logger(config_path):
     root_logger.addHandler(fh)
 
     print('Logging initialized!')
-
-
-def load_config(config_path):
-    with open(config_path, 'r') as fp:
-        config = json.load(fp)
-
-    logging.info('Training with the following config:')
-    logging.info(config)
-
-    return config
 
 
 def run_process(target, args):
@@ -155,6 +144,8 @@ if __name__ == '__main__':
 
     prepare_logger(args.config_path)
     config = load_config(args.config_path)
+    logging.info('Training with the following config:')
+    logging.info(config)
 
     # Training model of each stage in a separate process can be much faster
     # as all GPU resources are released after process is finished. This mode is strongly recommended
