@@ -3,8 +3,8 @@ import tensorflow as tf
 from tensorflow.keras.layers import Input
 from tensorflow.keras import mixed_precision
 
-from custom_layers import WeightedSum, LRMUL, clip_by_value_preserve_gradient, layer_dtype,\
-    dense_layer, conv2d_layer, bias_layer, act_layer, fused_bias_act_layer, const_layer, noise_layer, blur_layer,\
+from custom_layers import WeightedSum, LRMUL, layer_dtype,\
+    dense_layer, conv2d_layer, fused_bias_act_layer, bias_act_layer, const_layer, noise_layer, blur_layer,\
     pixel_norm_layer, instance_norm_layer, style_mod_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer
 from utils import TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME,\
     GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT,\
@@ -19,14 +19,14 @@ from utils import TARGET_RESOLUTION, START_RESOLUTION,\
     G_FUSED_SCALE, G_WEIGHTS_INIT_MODE, G_ACTIVATION, G_KERNEL_SIZE,\
     D_FUSED_SCALE, D_WEIGHTS_INIT_MODE, D_ACTIVATION, D_KERNEL_SIZE,\
     MBSTD_GROUP_SIZE, OVERRIDE_G_PROJECTING_GAIN, D_PROJECTING_NF,\
-    MAPPING_LAYERS, MAPPING_UNITS, MAPPING_LRMUL, MAPPING_ACTIVATION,\
+    MAPPING_LAYERS, MAPPING_UNITS, MAPPING_LRMUL, MAPPING_ACTIVATION, MAPPING_USE_BIAS,\
     G_FMAP_BASE, G_FMAP_DECAY, G_FMAP_MAX,\
     D_FMAP_BASE, D_FMAP_DECAY, D_FMAP_MAX,\
     BATCH_SIZES
 from utils import NCHW_FORMAT, NHWC_FORMAT, DEFAULT_DATA_FORMAT,\
     DEFAULT_FUSED_BIAS_ACT, DEFAULT_USE_MIXED_PRECISION, DEFAULT_NUM_FP16_RESOLUTIONS,\
     DEFAULT_CONV_CLAMP, DEFAULT_START_RESOLUTION,\
-    DEFAULT_MAPPING_LAYERS, DEFAULT_MAPPING_UNITS, DEFAULT_MAPPING_LRMUL, DEFAULT_MAPPING_ACTIVATION,\
+    DEFAULT_MAPPING_LAYERS, DEFAULT_MAPPING_UNITS, DEFAULT_MAPPING_LRMUL, DEFAULT_MAPPING_ACTIVATION, DEFAULT_MAPPING_USE_BIAS,\
     DEFAULT_OVERRIDE_G_PROJECTING_GAIN, \
     DEFAULT_NORMALIZE_LATENTS, DEFAULT_CONST_INPUT_LAYER,\
     DEFAULT_USE_NOISE, DEFAULT_RANDOMIZE_NOISE,\
@@ -49,12 +49,90 @@ def n_filters(stage, fmap_base, fmap_decay, fmap_max):
     return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
 
 
-def get_act_name(act_name, default_act_name):
-    if act_name is None:
-        act_name = default_act_name
-    elif act_name == 'linear':
-        act_name = None
-    return act_name
+class GeneratorMapping:
+
+    def __init__(self, config):
+        self.config = config
+
+        self.target_resolution = config[TARGET_RESOLUTION]
+        self.resolution_log2 = int(np.log2(self.target_resolution))
+        assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
+
+        self.start_resolution = config.get(START_RESOLUTION, DEFAULT_START_RESOLUTION)
+        self.start_resolution_log2 = int(np.log2(self.start_resolution))
+        assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
+
+        self.data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+        validate_data_format(self.data_format)
+
+        self.latent_size = config[LATENT_SIZE]
+        self.dlatent_size = config[DLATENT_SIZE]
+        self.normalize_latents = config.get(NORMALIZE_LATENTS, DEFAULT_NORMALIZE_LATENTS)
+        self.use_styles = config.get(USE_STYLES, DEFAULT_USE_STYLES)
+
+        self.mapping_layers = config.get(MAPPING_LAYERS, DEFAULT_MAPPING_LAYERS)
+        self.mapping_units = config.get(MAPPING_UNITS, DEFAULT_MAPPING_UNITS)
+        self.mapping_lrmul = config.get(MAPPING_LRMUL, DEFAULT_MAPPING_LRMUL)
+        self.mapping_act_name = config.get(MAPPING_ACTIVATION, DEFAULT_MAPPING_ACTIVATION)
+        self.mapping_gain = GAIN_ACTIVATION_FUNS_DICT[self.mapping_act_name]
+        self.mapping_use_bias = config.get(MAPPING_USE_BIAS, DEFAULT_MAPPING_USE_BIAS)
+
+        self.fused_bias_act = config.get(FUSED_BIAS_ACT, DEFAULT_FUSED_BIAS_ACT)
+        self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
+        self.num_fp16_resolutions = config.get(NUM_FP16_RESOLUTIONS, DEFAULT_NUM_FP16_RESOLUTIONS)
+        self.start_fp16_resolution_log2 =\
+            get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
+        self.policy = mixed_precision.Policy('mixed_float16') if self.use_mixed_precision else 'float32'
+        self.compute_dtype = self.policy.compute_dtype if self.use_mixed_precision else 'float32'
+        self.conv_clamp = config.get(CONV_CLAMP, DEFAULT_CONV_CLAMP)
+
+        if self.data_format == NCHW_FORMAT:
+            self.z_dim = (self.latent_size, 1, 1)
+        else: # self.data_format == NHWC_FORMAT:
+            self.z_dim = (1, 1, self.latent_size)
+
+        self.num_layers = self.resolution_log2 * 2 - 2
+        self.num_styles = self.num_layers if self.use_styles else 1
+
+    def dense(self, x, units, use_fp16=None, scope=''):
+        return dense_layer(x, units, lrmul=self.mapping_lrmul, gain=self.mapping_gain, use_fp16=use_fp16, scope=scope, config=self.config)
+
+    def bias_act(self, x, use_fp16=None, scope=''):
+        kwargs = {
+            'x': x,
+            'act_name': self.mapping_act_name,
+            'use_bias': self.mapping_use_bias,
+            'lrmul': self.mapping_lrmul,
+            'use_fp16': use_fp16,
+            'scope': scope,
+            'config': self.config
+        }
+        return fused_bias_act_layer(**kwargs) if self.fused_bias_act else bias_act_layer(**kwargs)
+
+    def create_G_mapping(self):
+        # TODO: think about fp16 for this network
+        use_fp16 = self.use_mixed_precision
+
+        self.latents = Input(self.z_dim, dtype=self.compute_dtype, name='Latents')
+        x = self.latents
+        if self.normalize_latents:
+            #with tf.name_scope('Latents_normalizer') as scope:
+            x = pixel_norm_layer(x, use_fp16=use_fp16, config=self.config)
+
+        with tf.name_scope('G_mapping'):
+            for layer_idx in range(self.mapping_layers):
+                with tf.name_scope(f'Dense{layer_idx}') as scope:
+                    units = self.dlatent_size if layer_idx == self.mapping_layers - 1 else self.mapping_units
+                    x = self.dense(x, units, use_fp16=use_fp16, scope=scope)
+                    x = self.bias_act(x, use_fp16=use_fp16, scope=scope)
+
+            with tf.name_scope('Broadcast'):
+                x = tf.cast(x, tf.float32)
+                x = tf.tile(x[:, tf.newaxis], [1, self.num_styles, 1])
+            # TODO: should x be casted to fp32? Can be important if model starts using mixed precision starting from some resolution
+            #  (e.g. in metrics calculation)
+
+        self.G_mapping = tf.keras.Model(self.latents, tf.identity(x, name='dlatents'), name='G_mapping')
 
 
 class Generator:
@@ -80,11 +158,9 @@ class Generator:
         self.use_noise = config.get(USE_NOISE, DEFAULT_USE_NOISE)
         self.randomize_noise = config.get(RANDOMIZE_NOISE, DEFAULT_RANDOMIZE_NOISE)
         self.use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
-        self.use_wscale = config.get(USE_WSCALE, DEFAULT_USE_WSCALE)
         self.use_pixel_norm = config.get(USE_PIXEL_NORM, DEFAULT_USE_PIXEL_NORM)
         self.use_instance_norm = config.get(USE_INSTANCE_NORM, DEFAULT_USE_INSTANCE_NORM)
         self.use_styles = config.get(USE_STYLES, DEFAULT_USE_STYLES)
-        self.truncate_weights = config.get(TRUNCATE_WEIGHTS, DEFAULT_TRUNCATE_WEIGHTS)
         self.G_fused_scale = config.get(G_FUSED_SCALE, DEFAULT_G_FUSED_SCALE)
         self.G_kernel_size = config.get(G_KERNEL_SIZE, DEFAULT_G_KERNEL_SIZE)
         self.G_fmap_base = config.get(G_FMAP_BASE, DEFAULT_FMAP_BASE)
@@ -92,12 +168,6 @@ class Generator:
         self.G_fmap_max = config.get(G_FMAP_MAX, DEFAULT_FMAP_MAX)
         self.G_act_name = config.get(G_ACTIVATION, DEFAULT_G_ACTIVATION)
         self.blur_filter = config.get(BLUR_FILTER, DEFAULT_BLUR_FILTER)
-
-        self.mapping_layers = config.get(MAPPING_LAYERS, DEFAULT_MAPPING_LAYERS)
-        self.mapping_units = config.get(MAPPING_UNITS, DEFAULT_MAPPING_UNITS)
-        self.mapping_lrmul = config.get(MAPPING_LRMUL, DEFAULT_MAPPING_LRMUL)
-        self.mapping_act_name = config.get(MAPPING_ACTIVATION, DEFAULT_MAPPING_ACTIVATION)
-        self.mapping_gain = GAIN_ACTIVATION_FUNS_DICT[self.mapping_act_name]
 
         self.fused_bias_act = config.get(FUSED_BIAS_ACT, DEFAULT_FUSED_BIAS_ACT)
         self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
@@ -131,7 +201,6 @@ class Generator:
         self.projecting_units = np.prod(self.projecting_target_shape)
 
         self.num_layers = self.resolution_log2 * 2 - 2
-        self.num_styles = self.num_layers if self.use_styles else 1
         self.batch_sizes = to_int_dict(config[BATCH_SIZES])
 
         self.create_model_layers()
@@ -152,8 +221,12 @@ class Generator:
         self.toRGB_layers = {
             res: self.to_rgb_layer(res) for res in range(self.start_resolution_log2 - 1, self.resolution_log2 + 1)
         }
-        self.latents = Input(self.z_dim, dtype=self.compute_dtype, name='Latents')
-        self.create_G_mapping()
+        self.G_mapping_object = GeneratorMapping(self.config)
+        self.G_mapping_object.create_G_mapping()
+        self.latents = self.G_mapping_object.latents
+        self.G_mapping = self.G_mapping_object.G_mapping
+        # Use mapping network to get shape of dlatents
+        self.dlatents = Input(self.G_mapping.output_shape[1:], dtype=self.compute_dtype, name='Dlatents')
 
     def to_rgb_layer(self, res):
         lod = level_of_details(res, self.resolution_log2)
@@ -197,30 +270,18 @@ class Generator:
             x = self.conv2d(x, fmaps=fmaps, use_fp16=use_fp16, scope=scope)
         return x
 
-    def act(self, x, act_name=None, use_fp16=None, scope=''):
+    def bias_act(self, x, act_name=None, clamp=None, use_fp16=None, scope=''):
         if act_name is None: act_name = self.G_act_name
-        return act_layer(x, act_name, use_fp16=use_fp16, scope=scope, config=self.config)
-
-    def apply_bias(self, x, lrmul=None, use_fp16=None, scope=''):
-        if lrmul is None: lrmul=LRMUL
-        return bias_layer(x, lrmul, use_fp16=use_fp16, scope=scope, config=self.config) if self.use_bias else x
-
-    def bias_act(self, x, act_name=None, lrmul=None, clamp=None, use_fp16=None, scope=''):
-        act_name = get_act_name(act_name, self.G_act_name)
-        if lrmul is None: lrmul = LRMUL
-
-        if self.fused_bias_act:
-            return fused_bias_act_layer(x, act_name, lrmul=lrmul, clamp=clamp, use_fp16=use_fp16, scope=scope, config=self.config)
-        else:
-            x = self.apply_bias(x, use_fp16=use_fp16,scope=scope)
-            # Linear activation for rgb layer
-            if act_name is not None:
-                x = self.act(x, use_fp16=use_fp16, scope=scope)
-            if clamp is not None:
-                assert clamp > 0, 'Clamp should be greater than 0'
-                # See Fused_bias_Act layer for details
-                x = clip_by_value_preserve_gradient(x, -clamp, clamp)
-            return x
+        kwargs = {
+            'x': x,
+            'act_name': act_name,
+            'use_bias': self.use_bias,
+            'clamp': clamp,
+            'use_fp16': use_fp16,
+            'scope': scope,
+            'config': self.config
+        }
+        return fused_bias_act_layer(**kwargs) if self.fused_bias_act else bias_act_layer(**kwargs)
 
     def layer_epilogue(self, x, layer_idx, use_fp16=None, scope=''):
         if self.use_noise:
@@ -233,31 +294,6 @@ class Generator:
         if self.use_styles:
             x = style_mod_layer(x, self.dlatents[:, layer_idx], use_fp16=use_fp16, scope=scope, config=self.config)
         return x
-
-    def create_G_mapping(self):
-        # TODO: think about fp16 for this network
-        use_fp16 = self.use_mixed_precision
-        x = self.latents
-        if self.normalize_latents:
-            #with tf.name_scope('Latents_normalizer') as scope:
-            x = pixel_norm_layer(x, use_fp16=use_fp16, config=self.config)
-
-        with tf.name_scope('G_mapping'):
-            for layer_idx in range(self.mapping_layers):
-                with tf.name_scope(f'Dense{layer_idx}') as scope:
-                    units = self.dlatent_size if layer_idx == self.mapping_layers - 1 else self.mapping_units
-                    x = self.dense(x, units, gain=self.mapping_gain, lrmul=self.mapping_lrmul, use_fp16=use_fp16, scope=scope)
-                    x = self.bias_act(x, act_name=self.mapping_act_name, lrmul=self.mapping_lrmul, use_fp16=use_fp16, scope=scope)
-
-            with tf.name_scope('Broadcast'):
-                x = tf.cast(x, tf.float32)
-                x = tf.tile(x[:, np.newaxis], [1, self.num_styles, 1])
-            # TODO: should x be casted to fp32? Can be important if model starts using mixed precision starting from some resolution
-            #  (e.g. in metrics calculation)
-
-        self.G_mapping = tf.keras.Model(self.latents, tf.identity(x, name='dlatents'), name='G_mapping')
-        # Use mapping network to get shape of dlatents
-        self.dlatents = Input(self.G_mapping.output_shape[1:], dtype=self.compute_dtype, name='Dlatents')
 
     def input_block(self):
         use_fp16 = should_use_fp16(2, self.start_fp16_resolution_log2, self.use_mixed_precision)
@@ -331,6 +367,8 @@ class Generator:
             self.G_models[model_type_key] = tf.keras.Model(
                 self.latents, tf.identity(images_out, name='images_out'), name='G_style'
             )
+        else:
+            print('Taking model from cache')
 
         return self.G_models[model_type_key]
 
@@ -417,8 +455,6 @@ class Discriminator:
         validate_data_format(self.data_format)
 
         self.use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
-        self.use_wscale = config.get(USE_WSCALE, DEFAULT_USE_WSCALE)
-        self.truncate_weights = config.get(TRUNCATE_WEIGHTS, DEFAULT_TRUNCATE_WEIGHTS)
         self.mbstd_group_size = config[MBSTD_GROUP_SIZE]
         self.D_fused_scale = config.get(D_FUSED_SCALE, DEFAULT_D_FUSED_SCALE)
         self.D_kernel_size = config.get(D_KERNEL_SIZE, DEFAULT_D_KERNEL_SIZE)
@@ -514,28 +550,18 @@ class Discriminator:
             x = self.downscale2d(x, use_fp16=use_fp16)
         return x
 
-    def act(self, x, use_fp16=None, scope=''):
-        return act_layer(x, self.D_act_name, use_fp16=use_fp16, scope=scope, config=self.config)
-
-    def apply_bias(self, x, use_fp16=None, scope=''):
-        return bias_layer(x, use_fp16=use_fp16, scope=scope, config=self.config) if self.use_bias else x
-
-    def bias_act(self, x, act_name=None, lrmul=None, clamp=None, use_fp16=None, scope=''):
-        act_name = get_act_name(act_name, self.D_act_name)
-        if lrmul is None: lrmul = LRMUL
-
-        if self.fused_bias_act:
-            return fused_bias_act_layer(x, act_name, lrmul=lrmul, clamp=clamp, use_fp16=use_fp16, scope=scope, config=self.config)
-        else:
-            x = self.apply_bias(x, use_fp16=use_fp16, scope=scope)
-            # Linear activation for rgb layer
-            if act_name is not None:
-                x = self.act(x, use_fp16=use_fp16, scope=scope)
-            if clamp is not None:
-                assert clamp > 0, 'Clamp should be greater than 0'
-                # See Fused_bias_Act layer for details
-                x = clip_by_value_preserve_gradient(x, -clamp, clamp)
-            return x
+    def bias_act(self, x, act_name=None, clamp=None, use_fp16=None, scope=''):
+        if act_name is None: act_name = self.D_act_name
+        kwargs = {
+            'x': x,
+            'act_name': act_name,
+            'use_bias': self.use_bias,
+            'clamp': clamp,
+            'use_fp16': use_fp16,
+            'scope': scope,
+            'config': self.config
+        }
+        return fused_bias_act_layer(**kwargs) if self.fused_bias_act else bias_act_layer(**kwargs)
 
     def D_block(self, x, res):
         use_fp16 = should_use_fp16(res, self.start_fp16_resolution_log2, self.use_mixed_precision)
@@ -598,6 +624,8 @@ class Discriminator:
             self.D_models[model_type_key] = tf.keras.Model(
                 inputs, tf.identity(x, name='scores_out'), name='D_style'
             )
+        else:
+            print('Taking model from cache')
 
         return self.D_models[model_type_key]
 

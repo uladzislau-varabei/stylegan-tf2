@@ -95,7 +95,7 @@ def extract_res_and_stage(p):
 
 if __name__ == '__main__':
     # Example call:
-    # python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --image_fname images --grid_cols 12 --grid_rows 9
+    #
     args = parse_args()
 
     config = load_config(args.config_path)

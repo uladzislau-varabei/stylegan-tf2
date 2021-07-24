@@ -127,7 +127,6 @@ Supported metrics are:
 - Implement FID (Frechet Inception Distance) metric
 - Implement Style mixing
 - Implement Truncation trick
-- Add XLA support  
 - Add multi GPU support
 - Fix problems with name scopes inside `tf.function()`. 
   The current solution relies on the answer by `demmerichs`: https://github.com/tensorflow/tensorflow/issues/36464 

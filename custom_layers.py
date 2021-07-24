@@ -225,6 +225,7 @@ class ScaledConv2d(Layer):
         self.truncate_weights = truncate_weights
         self.use_xla = use_xla
         self.scope = scope
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         if self.data_format == NCHW_FORMAT:
@@ -249,7 +250,6 @@ class ScaledConv2d(Layer):
                 trainable=True
             )
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         return tf.nn.conv2d(
             x, self.runtime_coef * self.w, strides=self.strides, padding='SAME', data_format=self.data_format
@@ -273,6 +273,7 @@ class ScaledLinear(Layer):
         self.truncate_weights = truncate_weights
         self.use_xla = use_xla
         self.scope = scope
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         self.fan_in = np.prod(input_shape[1:])
@@ -289,11 +290,12 @@ class ScaledLinear(Layer):
                 trainable=True
             )
 
-    @tf.function
     def call(self, x, *args, **kwargs):
-        if len(x.shape) > 2:
-            x = tf.reshape(x, [-1, self.fan_in])
-        return tf.linalg.matmul(x, self.runtime_coef * self.w)
+        # Use inplace ops
+        return tf.linalg.matmul(
+            tf.reshape(x, [-1, self.fan_in]) if len(x.shape) > 2 else x,
+            self.runtime_coef * self.w
+        )
 
 
 class Bias(Layer):
@@ -307,6 +309,7 @@ class Bias(Layer):
         self.lrmul = lrmul
         self.use_xla = use_xla
         self.scope = scope
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         self.is_linear_bias = len(input_shape) == 2
@@ -329,7 +332,6 @@ class Bias(Layer):
                 trainable=True
             )
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         # Note: keep reshaping to allow easy weights decay between cpu and gpu models
         return x + self.lrmul * (self.b if self.is_linear_bias else tf.reshape(self.b, self.bias_target_shape))
@@ -337,14 +339,16 @@ class Bias(Layer):
 
 class Blur2d(Layer):
 
-    def __init__(self, filter, dtype=DEFAULT_DTYPE, data_format=DEFAULT_DATA_FORMAT, scope='', name=None):
+    def __init__(self, filter, dtype=DEFAULT_DTYPE, use_xla=DEFAULT_USE_XLA,
+                 data_format=DEFAULT_DATA_FORMAT, scope='', name=None):
         layer_name = make_layer_name(name, scope, 'Blur2d')
         super(Blur2d, self).__init__(dtype=dtype, name=layer_name)
         validate_data_format(data_format)
         self.data_format = data_format
         self.filter = filter
+        self.use_xla = use_xla
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         return blur2d(x, filter=self.filter, data_format=self.data_format)
 
@@ -358,8 +362,8 @@ class Upscale2d(Layer):
         self.data_format = data_format
         self.factor = factor
         self.use_xla = use_xla
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         return upscale2d(x, factor=self.factor, data_format=self.data_format)
 
@@ -377,8 +381,8 @@ class Downscale2d(Layer):
             self.ksize = [1, factor, factor, 1]
         self.factor = factor
         self.use_xla = use_xla
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         return downscale2d(x, factor=self.factor, data_format=self.data_format)
 
@@ -397,8 +401,8 @@ class PixelNorm(Layer):
             self.channel_axis = 3
         self.epsilon = 1e-8 if self._dtype_policy.compute_dtype == 'float32' else 1e-4
         self.use_xla = use_xla
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         return x * tf.math.rsqrt(
             tf.reduce_mean(tf.square(x), axis=self.channel_axis, keepdims=True) + self.epsilon
@@ -420,8 +424,8 @@ class InstanceNorm(Layer):
         # Epsilon can be constant as call inputs are casted to fp32
         self.epsilon = 1e-8
         self.use_xla = use_xla
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         x = tf.cast(x, tf.float32)
         x -= tf.reduce_mean(x, axis=self.hw_axes, keepdims=True)
@@ -445,6 +449,7 @@ class StyleMod(Layer):
         self.truncate_weights = truncate_weights
         self.use_xla = use_xla
         self.scope = scope + 'StyleMod/'
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         x_shape, style_shape = input_shape
@@ -470,7 +475,6 @@ class StyleMod(Layer):
     def apply_bias(self, x):
         return self.bias(x) if self.use_bias else x
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         # x: [inputs, dlatents]
         style = self.apply_bias(self.fc(x[1]))
@@ -492,6 +496,9 @@ class Noise(Layer):
         self.tf_randomize_noise = tf.constant(1. if randomize_noise else -1., dtype=self._dtype_policy.compute_dtype)
         self.use_xla = use_xla
         self.scope = scope #+ 'Noise'
+        # XLA doesn't seem to work.
+        # self.call = tf.function(self.call, jit_compile=self.use_xla)
+        self.call = tf.function(self.call, jit_compile=False)
 
     def build(self, input_shape):
         if self.data_format == NCHW_FORMAT:
@@ -522,7 +529,6 @@ class Noise(Layer):
                 trainable=False
             )
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         # One can change layer weights (tf_randomize_noise) to switch between random and non random noise
         noise = tf.cond(
@@ -576,8 +582,8 @@ class MinibatchStdDev(Layer):
         self.group_size = group_size
         self.num_new_features = num_new_features
         self.use_xla = use_xla
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         if self.data_format == NCHW_FORMAT:
             _, c, h, w = x.shape
@@ -651,6 +657,7 @@ class Fused_Upscale2d_ScaledConv2d(Layer):
         self.truncate_weights = truncate_weights
         self.use_xla = use_xla
         self.scope = scope
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         if self.data_format == NCHW_FORMAT:
@@ -678,7 +685,6 @@ class Fused_Upscale2d_ScaledConv2d(Layer):
                 trainable=True
             )
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         w = self.runtime_coef * self.w
 
@@ -713,6 +719,7 @@ class Fused_ScaledConv2d_Downscale2d(Layer):
         self.truncate_weights = truncate_weights
         self.use_xla = use_xla
         self.scope = scope
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         if self.data_format == NCHW_FORMAT:
@@ -737,7 +744,6 @@ class Fused_ScaledConv2d_Downscale2d(Layer):
                 trainable=True
             )
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         w = self.runtime_coef * self.w
 
@@ -753,6 +759,21 @@ def clip_by_value_preserve_gradient(t, clip_value_min, clip_value_max, name=None
         return t + tf.stop_gradient(tf.clip_by_value(t, clip_value_min, clip_value_max) - t)
 
 
+class Clip(Layer):
+
+    def __init__(self, clamp, use_xla=DEFAULT_USE_XLA, scope='', name=None):
+        layer_name = make_layer_name(name, scope, 'Clip')
+        super(Clip, self).__init__(name=layer_name)
+        assert clamp > 0, 'Clamp should be greater than 0'
+        self.clamp = clamp
+        self.use_xla = use_xla
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
+
+    def call(self, x, *args, **kwargs):
+        # See Fused_bias_Act layer for details
+        return clip_by_value_preserve_gradient(x, -self.clamp, self.clamp)
+
+
 # Fused bias + activation.
 # Custom cuda implementation is faster and uses less memory than performing the operations separately.
 # Maybe XLA helps at least a bit to achieve a similar effect.
@@ -766,10 +787,7 @@ class Fused_Bias_Act(Layer):
         validate_data_format(data_format)
         self.data_format = data_format
         self.use_bias = use_bias
-        if act_name is None:
-            # No activation
-            self.act = None
-        elif act_name in ACTIVATION_FUNS_DICT.keys():
+        if act_name in ACTIVATION_FUNS_DICT.keys():
             self.act = ACTIVATION_FUNS_DICT[act_name]
         else:
             assert False, f"Activation '{act_name}' is not supported. See ACTIVATION_FUNS_DICT"
@@ -781,6 +799,7 @@ class Fused_Bias_Act(Layer):
         self.clamp = clamp
         self.use_xla = use_xla
         self.scope = scope
+        self.call = tf.function(self.call, jit_compile=self.use_xla)
 
     def build(self, input_shape):
         self.is_linear_bias = len(input_shape) == 2
@@ -804,16 +823,12 @@ class Fused_Bias_Act(Layer):
                     trainable=True
                 )
 
-    @tf.function
     def call(self, x, *args, **kwargs):
         if self.use_bias:
             # Note: keep reshaping to allow easy weights decay between cpu and gpu models
             x += self.lrmul * (self.b if self.is_linear_bias else tf.reshape(self.b, self.bias_target_shape))
 
-        if self.act is not None:
-            x = self.act(
-                tf.cast(x, tf.float32) if self.fp32_act else x
-            )
+        x = self.act(tf.cast(x, tf.float32) if self.fp32_act else x)
 
         if self.clamp is not None:
             # Note: for some reasons when training with mixed precision (all fine for fp32)
@@ -866,12 +881,13 @@ def layer_dtype(layer_type, use_fp16=None, act_name=None, config=None):
 def dense_layer(x, units, gain, lrmul=LRMUL, use_fp16=None, scope='', config=None):
     use_wscale = config.get(USE_WSCALE, DEFAULT_USE_WSCALE)
     truncate_weights = config.get(TRUNCATE_WEIGHTS, DEFAULT_TRUNCATE_WEIGHTS)
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('dense', use_fp16=use_fp16)
     return ScaledLinear(
         units=units, gain=gain,
         use_wscale=use_wscale, lrmul=lrmul, truncate_weights=truncate_weights,
-        dtype=policy, data_format=data_format, scope=scope
+        dtype=policy, use_xla=use_xla, data_format=data_format, scope=scope
     )(x)
 
 
@@ -914,6 +930,9 @@ def bias_layer(x, lrmul=LRMUL, use_fp16=None, scope='', config=None):
 
 
 def act_layer(x, act_name, use_fp16=None, scope='', config=None):
+    # No activation
+    if act_name.lower() == 'linear':
+        return x
     if act_name in ACTIVATION_FUNS_DICT.keys():
         act = ACTIVATION_FUNS_DICT[act_name]
     else:
@@ -922,8 +941,7 @@ def act_layer(x, act_name, use_fp16=None, scope='', config=None):
     return Activation(act, dtype=dtype, name=scope + act_name)(x)
 
 
-def fused_bias_act_layer(x, act_name, lrmul=LRMUL, clamp=None, use_fp16=None, scope='', config=None):
-    use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
+def fused_bias_act_layer(x, act_name, use_bias, lrmul=LRMUL, clamp=None, use_fp16=None, scope='', config=None):
     use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('bias', use_fp16=use_fp16)
@@ -931,6 +949,25 @@ def fused_bias_act_layer(x, act_name, lrmul=LRMUL, clamp=None, use_fp16=None, sc
         use_bias=use_bias, act_name=act_name, lrmul=lrmul, clamp=clamp,
         dtype=policy, use_xla=use_xla, data_format=data_format, scope=scope
     )(x)
+
+
+def clip_layer(x, clamp, scope='', config=None):
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
+    return Clip(clamp, use_xla=use_xla, scope=scope)(x)
+
+
+def bias_act_layer(x, act_name, lrmul=LRMUL, use_bias=None, clamp=None, use_fp16=None, scope='', config=None):
+    if use_bias is None: use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
+    # 1. Apply bias
+    if use_bias:
+        x = bias_layer(x, lrmul, use_fp16=use_fp16, scope=scope, config=config)
+    # 2. Apply activation
+    if act_name is not None:
+        x = act_layer(x, act_name, use_fp16=use_fp16, scope=scope, config=config)
+    # 3. Clamp outputs
+    if clamp is not None:
+        x = clip_layer(x, clamp, scope=scope, config=config)
+    return x
 
 
 def const_layer(x, channel_size, use_fp16=None, scope='', config=None):
@@ -949,9 +986,10 @@ def noise_layer(x, use_fp16=None, scope='', config=None):
 
 def blur_layer(x, use_fp16=None, scope='', config=None):
     blur_filter = config.get(BLUR_FILTER, DEFAULT_BLUR_FILTER)
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('blur2d', use_fp16=use_fp16)
-    return Blur2d(filter=blur_filter, dtype=dtype, scope=scope, data_format=data_format)(x)
+    return Blur2d(filter=blur_filter, dtype=dtype, scope=scope, use_xla=use_xla, data_format=data_format)(x)
 
 
 def pixel_norm_layer(x, use_fp16=None, scope='', config=None):
@@ -977,7 +1015,7 @@ def style_mod_layer(x, dlatents, use_fp16=None, scope='', config=None):
     policy = layer_dtype('style_mod', use_fp16=use_fp16)
     return StyleMod(
         use_bias=use_bias, use_wscale=use_wscale, truncate_weights=truncate_weights,
-        use_xla=use_xla, dtype=policy, data_format=data_format, scope=scope
+        dtype=policy, use_xla=use_xla, data_format=data_format, scope=scope
     )([x, dlatents])
 
 
@@ -988,9 +1026,10 @@ def downscale2d_layer(x, factor, use_fp16=None, config=None):
 
 
 def upscale2d_layer(x, factor, use_fp16=None, config=None):
+    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('upscale2d', use_fp16=use_fp16)
-    return Upscale2d(factor=factor, dtype=dtype, data_format=data_format)(x)
+    return Upscale2d(factor=factor, dtype=dtype, use_xla=use_xla, data_format=data_format)(x)
 
 
 def minibatch_stddev_layer(x, use_fp16=None, scope='', config=None):

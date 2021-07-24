@@ -7,7 +7,6 @@
     "dlatent_size": 512,
     "use_bias": true,
     "use_wscale": true,
-    "truncate_weights": false,
     "blur_filter": [
         1,
         2,
@@ -77,16 +76,13 @@
     "use_instance_norm": true,
     "use_styles": true,
     "G_fused_scale": true,
-    "G_weights_init_mode": null,
     "G_activation": "leaky_relu",
     "G_kernel_size": 3,
     "G_fmap_base": 8192,
     "G_fmap_max": 512,
     "use_G_smoothing": true,
     "G_smoothed_beta": null,
-    "override_G_projecting_gain": true,
     "D_fused_scale": true,
-    "D_weights_init_mode": null,
     "D_activation": "leaky_relu",
     "D_kernel_size": 3,
     "D_fmap_base": 8192,
@@ -97,6 +93,5 @@
     "dataset_n_prefetched_batches": 4,
     "dataset_max_kimages": 100,
     "shuffle_dataset": true,
-    "mirror_augment": false,
-    "dataset_max_cache_res": null
+    "mirror_augment": false
 }

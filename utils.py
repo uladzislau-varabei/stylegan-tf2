@@ -163,6 +163,8 @@ MAPPING_UNITS = 'mapping_units'
 MAPPING_LRMUL = 'mapping_lrmul'
 # Activation function for Mapping network
 MAPPING_ACTIVATION = 'mapping_activation'
+# Use bias layers for Mapping network?
+MAPPING_USE_BIAS = 'mapping_use_bias'
 
 
 ### ---------- Generator Synthesis network ---------- ###
@@ -299,6 +301,7 @@ DEFAULT_MAPPING_LAYERS = 8
 DEFAULT_MAPPING_UNITS = 512
 DEFAULT_MAPPING_LRMUL = 0.01
 DEFAULT_MAPPING_ACTIVATION = 'leaky_relu'
+DEFAULT_MAPPING_USE_BIAS = True
 DEFAULT_OVERRIDE_G_PROJECTING_GAIN = True
 DEFAULT_G_FUSED_SCALE = True
 DEFAULT_D_FUSED_SCALE = True
@@ -357,17 +360,28 @@ GAIN_INIT_MODE_DICT = {
 
 GAIN_ACTIVATION_FUNS_DICT = {
     'relu': HE_GAIN,
+    # The same 2 functions
     'leaky_relu': HE_GAIN,
+    'lrelu': HE_GAIN,
+    # The same 2 functions
     'swish': HE_GAIN,
+    'silu': HE_GAIN,
+    'gelu': HE_GAIN,
     # A special gain is to be used by default
     'selu': LECUN_GAIN
 }
 
 ACTIVATION_FUNS_DICT = {
-    'relu': tf.nn.relu,
-    'leaky_relu': tf.nn.leaky_relu,
-    'selu': tf.nn.selu,
-    'swish': tf.nn.swish
+    'linear':     lambda x: x,
+    'relu':       lambda x: tf.nn.relu(x),
+    # The same 2 functions
+    'leaky_relu': lambda x: tf.nn.leaky_relu(x, alpha=0.2),
+    'lrelu':      lambda x: tf.nn.leaky_relu(x, alpha=0.2),
+    'selu':       lambda x: tf.nn.selu(x),
+    # The same 2 functions
+    'swish':      lambda x: tf.nn.swish(x),
+    'silu':       lambda x: tf.nn.swish(x),
+    'gelu':       lambda x: tf.nn.gelu(x, approximate=False),
 }
 
 # Activation function which (might?) need to use float32 dtype

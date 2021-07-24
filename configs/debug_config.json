@@ -17,7 +17,7 @@
     "use_GPU_for_Gs": true,
     "use_mixed_precision": true,
     "num_fp16_resolutions": 3,
-    "use_XLA": false,
+    "use_XLA": true,
     "conv_clamp": 256,
     "fused_bias_act": true,
     "total_kimages": null,
