@@ -787,8 +787,8 @@ class Fused_Bias_Act(Layer):
         validate_data_format(data_format)
         self.data_format = data_format
         self.use_bias = use_bias
-        if act_name in ACTIVATION_FUNS_DICT.keys():
-            self.act = ACTIVATION_FUNS_DICT[act_name]
+        if act_name.lower() in ACTIVATION_FUNS_DICT.keys():
+            self.act = ACTIVATION_FUNS_DICT[act_name.lower()]
         else:
             assert False, f"Activation '{act_name}' is not supported. See ACTIVATION_FUNS_DICT"
         self.act_name = act_name
@@ -933,8 +933,8 @@ def act_layer(x, act_name, use_fp16=None, scope='', config=None):
     # No activation
     if act_name.lower() == 'linear':
         return x
-    if act_name in ACTIVATION_FUNS_DICT.keys():
-        act = ACTIVATION_FUNS_DICT[act_name]
+    if act_name.lower() in ACTIVATION_FUNS_DICT.keys():
+        act = ACTIVATION_FUNS_DICT[act_name.lower()]
     else:
         assert False, f"Activation '{act_name}' is not supported. See ACTIVATION_FUNS_DICT"
     dtype = layer_dtype('act', use_fp16=use_fp16, act_name=act_name)

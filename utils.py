@@ -24,13 +24,14 @@ OPTIMIZER_POSTFIX = '_optimizer'
 RGB_NAME = 'RGB'
 LOD_NAME = 'lod'
 WSUM_NAME = 'WSum'
-WEIGHTS_FOLDER = 'weights'
 GENERATOR_NAME = 'G_model'
 DISCRIMINATOR_NAME = 'D_model'
+WEIGHTS_DIR = 'weights'
 LOGS_DIR = 'logs'
 TF_LOGS_DIR = 'tf_logs'
 IMAGES_DIR = 'images'
-DATASET_CACHE_FOLDER = 'tf_ds_cache'
+DATASET_CACHE_DIR = 'tf_ds_cache'
+CACHE_DIR = 'cache'
 OS_LINUX = 'Linux'
 OS_WIN = 'Windows'
 HE_INIT = 'He'
@@ -773,7 +774,7 @@ def load_weights(model, filename, optimizer_call=False):
     return model
 
 
-def create_model_folder_path(model_name, res, stage, step=None, storage_path=DEFAULT_STORAGE_PATH):
+def create_model_dir_path(model_name, res, stage, step=None, storage_path=DEFAULT_STORAGE_PATH):
     """
     model_name - name of configuration model
     res - current resolution
@@ -781,15 +782,15 @@ def create_model_folder_path(model_name, res, stage, step=None, storage_path=DEF
     step - number of steps (or processed images) for given resolution and stage
     storage_path - optional prefix path
     """
-    res_folder = f'{2**res}x{2**res}'
-    stage_folder = stage
-    step_folder = 'step' + str(step) if step is not None else ''
-    model_folder_path = os.path.join(WEIGHTS_FOLDER, model_name, res_folder, stage_folder, step_folder)
+    res_dir = f'{2**res}x{2**res}'
+    stage_dir = stage
+    step_dir = 'step' + str(step) if step is not None else ''
+    model_dir_path = os.path.join(WEIGHTS_DIR, model_name, res_dir, stage_dir, step_dir)
 
     if storage_path is not None:
-        model_folder_path = os.path.join(storage_path, model_folder_path)
+        model_dir_path = os.path.join(storage_path, model_dir_path)
 
-    return model_folder_path
+    return model_dir_path
 
 
 def save_model(model, model_name, model_type, res,
@@ -807,7 +808,7 @@ def save_model(model, model_name, model_type, res,
     """
     optimizer_call = OPTIMIZER_POSTFIX in model_type
 
-    model_folder_path = create_model_folder_path(
+    model_dir_path = create_model_dir_path(
         model_name=model_name,
         res=res,
         stage=stage,
@@ -815,11 +816,11 @@ def save_model(model, model_name, model_type, res,
         storage_path=storage_path
     )
     if optimizer_call:
-        model_folder_path += OPTIMIZER_POSTFIX
-    if not os.path.exists(model_folder_path):
-        os.makedirs(model_folder_path)
+        model_dir_path += OPTIMIZER_POSTFIX
+    if not os.path.exists(model_dir_path):
+        os.makedirs(model_dir_path)
 
-    filepath = os.path.join(model_folder_path, model_type + '.h5')
+    filepath = os.path.join(model_dir_path, model_type + '.h5')
     weights_dict = weights_to_dict(model, optimizer_call=optimizer_call)
 
     save_weights(weights_dict, filepath)
@@ -839,23 +840,23 @@ def save_optimizer_loss_scale(optimizer: tf.keras.mixed_precision.LossScaleOptim
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of saving model
     """
-    model_folder_path = create_model_folder_path(
+    model_dir_path = create_model_dir_path(
         model_name=model_name,
         res=res,
         stage=stage,
         step=step,
         storage_path=storage_path
     )
-    model_folder_path += OPTIMIZER_POSTFIX
-    if not os.path.exists(model_folder_path):
-        os.makedirs(model_folder_path)
+    model_dir_path += OPTIMIZER_POSTFIX
+    if not os.path.exists(model_dir_path):
+        os.makedirs(model_dir_path)
 
     # This function is only called when loss scale is dynamic
     loss_scale = float(optimizer._loss_scale().numpy())
     if should_log_debug_info():
         print(f'Saved loss scale for {model_type}: {loss_scale}')
 
-    filepath = os.path.join(model_folder_path, model_type + '.json')
+    filepath = os.path.join(model_dir_path, model_type + '.json')
     with open(filepath, 'w') as fp:
         json.dump({LOSS_SCALE_KEY: loss_scale}, fp)
 
@@ -874,7 +875,7 @@ def load_model(model, model_name, model_type, res,
     """
     optimizer_call = OPTIMIZER_POSTFIX in model_type
 
-    model_folder_path = create_model_folder_path(
+    model_dir_path = create_model_dir_path(
         model_name=model_name,
         res=res,
         stage=stage,
@@ -882,11 +883,11 @@ def load_model(model, model_name, model_type, res,
         storage_path=storage_path
     )
     if optimizer_call:
-        model_folder_path += OPTIMIZER_POSTFIX
-    assert os.path.exists(model_folder_path),\
-        f"Can't load weights: folder {model_folder_path} does not exist"
+        model_dir_path += OPTIMIZER_POSTFIX
+    assert os.path.exists(model_dir_path),\
+        f"Can't load weights: directory {model_dir_path} does not exist"
 
-    filepath = os.path.join(model_folder_path, model_type + '.h5')
+    filepath = os.path.join(model_dir_path, model_type + '.h5')
     model = load_weights(model, filepath, optimizer_call=optimizer_call)
     return model
 
@@ -904,18 +905,18 @@ def load_optimizer_loss_scale(model_name: str, model_type: str, res: int, stage:
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of saving model
     """
-    model_folder_path = create_model_folder_path(
+    model_dir_path = create_model_dir_path(
         model_name=model_name,
         res=res,
         stage=stage,
         step=step,
         storage_path=storage_path
     )
-    model_folder_path += OPTIMIZER_POSTFIX
-    if not os.path.exists(model_folder_path):
-        os.makedirs(model_folder_path)
+    model_dir_path += OPTIMIZER_POSTFIX
+    if not os.path.exists(model_dir_path):
+        os.makedirs(model_dir_path)
 
-    filepath = os.path.join(model_folder_path, model_type +  OPTIMIZER_POSTFIX + '.json')
+    filepath = os.path.join(model_dir_path, model_type +  OPTIMIZER_POSTFIX + '.json')
     with open(filepath, 'r') as fp:
         loss_scale = json.load(fp)[LOSS_SCALE_KEY]
 
@@ -938,7 +939,7 @@ def remove_old_models(model_name, res, stage, max_models_to_keep, storage_path=D
     log_debug_info = should_log_debug_info()
     if log_debug_info:
         logging.info('\nRemoving weights...')
-    weights_path = create_model_folder_path(
+    weights_path = create_model_dir_path(
         model_name=model_name,
         res=res,
         stage=stage,

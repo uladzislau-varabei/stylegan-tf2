@@ -9,7 +9,7 @@ from dataloader_utils import convert_outputs_to_images
 from image_utils import fast_save_grid
 from utils import INFERENCE_MODE, \
     LATENT_SIZE, DEFAULT_VALID_GRID_NROWS, DEFAULT_VALID_GRID_NCOLS,\
-    DATA_FORMAT, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WEIGHTS_FOLDER
+    DATA_FORMAT, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WEIGHTS_DIR
 from utils import load_config, prepare_gpu, load_weights, generate_latents
 from model import StyleGAN
 
@@ -86,7 +86,7 @@ def generate_images(model: tf.keras.Model, config: dict):
 
 
 def extract_res_and_stage(p):
-    s1 = p.split(WEIGHTS_FOLDER)[1]
+    s1 = p.split(WEIGHTS_DIR)[1]
     splits = s1.split(os.path.sep)
     res = int(np.log2(int(splits[2].split('x')[0])))
     stage = splits[3]

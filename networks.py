@@ -3,7 +3,7 @@ import tensorflow as tf
 from tensorflow.keras.layers import Input
 from tensorflow.keras import mixed_precision
 
-from custom_layers import WeightedSum, LRMUL, layer_dtype,\
+from custom_layers import WeightedSum, layer_dtype,\
     dense_layer, conv2d_layer, fused_bias_act_layer, bias_act_layer, const_layer, noise_layer, blur_layer,\
     pixel_norm_layer, instance_norm_layer, style_mod_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer
 from utils import TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME,\
@@ -14,8 +14,8 @@ from utils import TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME,\
 from utils import TARGET_RESOLUTION, START_RESOLUTION,\
     LATENT_SIZE, DLATENT_SIZE, NORMALIZE_LATENTS,\
     USE_NOISE, RANDOMIZE_NOISE,\
-    DATA_FORMAT, FUSED_BIAS_ACT, USE_MIXED_PRECISION, NUM_FP16_RESOLUTIONS, CONV_CLAMP, USE_BIAS, USE_WSCALE,\
-    USE_PIXEL_NORM, USE_INSTANCE_NORM, USE_STYLES, CONST_INPUT_LAYER, TRUNCATE_WEIGHTS, BLUR_FILTER,\
+    DATA_FORMAT, FUSED_BIAS_ACT, USE_MIXED_PRECISION, NUM_FP16_RESOLUTIONS, CONV_CLAMP, USE_BIAS,\
+    USE_PIXEL_NORM, USE_INSTANCE_NORM, USE_STYLES, CONST_INPUT_LAYER, BLUR_FILTER,\
     G_FUSED_SCALE, G_WEIGHTS_INIT_MODE, G_ACTIVATION, G_KERNEL_SIZE,\
     D_FUSED_SCALE, D_WEIGHTS_INIT_MODE, D_ACTIVATION, D_KERNEL_SIZE,\
     MBSTD_GROUP_SIZE, OVERRIDE_G_PROJECTING_GAIN, D_PROJECTING_NF,\
@@ -23,7 +23,7 @@ from utils import TARGET_RESOLUTION, START_RESOLUTION,\
     G_FMAP_BASE, G_FMAP_DECAY, G_FMAP_MAX,\
     D_FMAP_BASE, D_FMAP_DECAY, D_FMAP_MAX,\
     BATCH_SIZES
-from utils import NCHW_FORMAT, NHWC_FORMAT, DEFAULT_DATA_FORMAT,\
+from utils import NCHW_FORMAT, DEFAULT_DATA_FORMAT,\
     DEFAULT_FUSED_BIAS_ACT, DEFAULT_USE_MIXED_PRECISION, DEFAULT_NUM_FP16_RESOLUTIONS,\
     DEFAULT_CONV_CLAMP, DEFAULT_START_RESOLUTION,\
     DEFAULT_MAPPING_LAYERS, DEFAULT_MAPPING_UNITS, DEFAULT_MAPPING_LRMUL, DEFAULT_MAPPING_ACTIVATION, DEFAULT_MAPPING_USE_BIAS,\
@@ -34,7 +34,7 @@ from utils import NCHW_FORMAT, NHWC_FORMAT, DEFAULT_DATA_FORMAT,\
     DEFAULT_G_FUSED_SCALE, DEFAULT_D_FUSED_SCALE,\
     DEFAULT_G_KERNEL_SIZE, DEFAULT_D_KERNEL_SIZE, DEFAULT_USE_BIAS,\
     DEFAULT_USE_PIXEL_NORM, DEFAULT_USE_INSTANCE_NORM, DEFAULT_USE_STYLES,\
-    DEFAULT_TRUNCATE_WEIGHTS, DEFAULT_BLUR_FILTER, DEFAULT_USE_WSCALE,\
+    DEFAULT_BLUR_FILTER,\
     DEFAULT_FMAP_BASE, DEFAULT_FMAP_DECAY, DEFAULT_FMAP_MAX
 
 from utils import weights_to_dict, load_model_weights_from_dict
@@ -246,10 +246,9 @@ class Generator:
     def blur(self, x, use_fp16=None, scope=''):
         return blur_layer(x, use_fp16=use_fp16, scope=scope, config=self.config) if self.blur_filter is not None else x
 
-    def dense(self, x, units, gain=None, lrmul=None, use_fp16=None, scope=''):
+    def dense(self, x, units, gain=None, use_fp16=None, scope=''):
         if gain is None: gain = self.gain
-        if lrmul is None: lrmul = LRMUL
-        return dense_layer(x, units, lrmul=lrmul, gain=gain, use_fp16=use_fp16, scope=scope, config=self.config)
+        return dense_layer(x, units, gain=gain, use_fp16=use_fp16, scope=scope, config=self.config)
 
     def conv2d(self, x, fmaps, kernel_size=None, gain=None, fused_up=False, use_fp16=None, scope=''):
         if kernel_size is None: kernel_size = self.G_kernel_size

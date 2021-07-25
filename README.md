@@ -119,8 +119,6 @@ Supported metrics are:
 
 ## Further improvements
 
-- Implement the same noise for valid images across all train stages 
-  (currently the noise is reset at every stage)
 - Add config similar to the one used in the original implementation
 - Tune settings for *mixed precision* training stabilization tricks
 - Fix implementation of PPL metric, so that non-random noise is used for the entire batch 

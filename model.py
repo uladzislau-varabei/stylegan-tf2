@@ -27,7 +27,7 @@ from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, USE_MIXED_PR
     USE_G_SMOOTHING, G_SMOOTHING_BETA, G_SMOOTHING_BETA_KIMAGES, USE_GPU_FOR_GS,\
     GENERATOR_NAME, DISCRIMINATOR_NAME,\
     NCHW_FORMAT, NHWC_FORMAT,\
-    TF_LOGS_DIR, STORAGE_PATH, DATASET_CACHE_FOLDER,\
+    TF_LOGS_DIR, STORAGE_PATH, DATASET_CACHE_DIR, CACHE_DIR,\
     BATCH_SIZES, BATCH_REPEATS, DATASET_MAX_CACHE_RES,\
     TOTAL_KIMAGES, TRANSITION_KIMAGES, TRANSITION_KIMAGES_DICT, STABILIZATION_KIMAGES, STABILIZATION_KIMAGES_DICT,\
     DATASET_N_PARALLEL_CALLS, DATASET_N_PREFETCHED_BATCHES, DATASET_N_MAX_KIMAGES,\
@@ -165,7 +165,7 @@ class StyleGAN:
            self.min_target_single_image_size = max(2 ** (self.resolution_log2 - 1), 2 ** 7)
         self.max_png_res = config.get(VALID_MAX_PNG_RES, DEFAULT_VALID_MAX_PNG_RES)
 
-        self.valid_latents = self.generate_latents(self.valid_grid_nrows * self.valid_grid_ncols)
+        self.valid_latents = self.initialize_valid_latents()
 
         # Summaries
         self.metrics = config.get(METRICS_DICT, DEFAULT_METRICS_DICT)
@@ -218,6 +218,19 @@ class StyleGAN:
                 self.initialize_models(res, stage)
                 self.create_images_generator(res, images_paths)
                 self.initialize_optimizers(create_all_variables=False, res=res, stage=stage)
+
+    def initialize_valid_latents(self):
+        latents_dir  = os.path.join(CACHE_DIR, self.model_name)
+        latents_path = os.path.join(latents_dir, 'latents.npy')
+        if os.path.exists(latents_path):
+            latents = tf.constant(np.load(latents_path, allow_pickle=False))
+            logging.info('Loaded valid latents from file')
+        else:
+            os.makedirs(latents_dir, exist_ok=True)
+            latents = self.generate_latents(self.valid_grid_nrows * self.valid_grid_ncols)
+            np.save(latents_path, latents.numpy(), allow_pickle=False)
+            logging.info('Valid latents not found. Created and saved new samples')
+        return latents
 
     def initialize_models(self, model_res=None, stage=None):
         if self.use_mixed_precision:
@@ -636,7 +649,7 @@ class StyleGAN:
         cache = False
         if self.dataset_max_cache_res is not None:
             if res <= self.dataset_max_cache_res:
-                cache = os.path.join(DATASET_CACHE_FOLDER, self.model_name, str(res))
+                cache = os.path.join(DATASET_CACHE_DIR, self.model_name, str(res))
                 if STORAGE_PATH is not None:
                     cache = os.path.join(STORAGE_PATH, cache)
                 if not os.path.exists(cache):
