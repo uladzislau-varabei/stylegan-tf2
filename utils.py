@@ -207,6 +207,14 @@ G_SMOOTHING_BETA = 'G_smoothed_beta'
 G_SMOOTHING_BETA_KIMAGES = 'G_smoothed_beta_kimages'
 # Override gain in projecting layer of generator to match the original paper implementation?
 OVERRIDE_G_PROJECTING_GAIN = 'override_G_projecting_gain'
+# Style strength multiplier for the truncation trick. None = disable
+TRUNCATION_PSI = 'truncation_psi'
+# Number of layers for which to apply the truncation trick. None = disable
+TRUNCATION_CUTOFF = 'truncation_cutoff'
+# Decay for tracking the moving average of W during training. None = disable
+DLATENT_AVG_BETA = 'dlatent_avg_beta'
+# Probability of mixing styles during training. None = disable
+STYLE_MIXING_PROB = 'style_mixing prob'
 
 
 ### ---------- Discriminator network ---------- ###
@@ -304,6 +312,10 @@ DEFAULT_MAPPING_LRMUL = 0.01
 DEFAULT_MAPPING_ACTIVATION = 'leaky_relu'
 DEFAULT_MAPPING_USE_BIAS = True
 DEFAULT_OVERRIDE_G_PROJECTING_GAIN = True
+DEFAULT_TRUNCATION_PSI = 0.7
+DEFAULT_TRUNCATION_CUTOFF = 8
+DEFAULT_DLATENT_AVG_BETA = 0.995
+DEFAULT_STYLE_MIXING_PROB = 0.9
 DEFAULT_G_FUSED_SCALE = True
 DEFAULT_D_FUSED_SCALE = True
 DEFAULT_FUSED_BIAS_ACT = True
@@ -368,6 +380,7 @@ GAIN_ACTIVATION_FUNS_DICT = {
     'swish': HE_GAIN,
     'silu': HE_GAIN,
     'gelu': HE_GAIN,
+    'mish': HE_GAIN,
     # A special gain is to be used by default
     'selu': LECUN_GAIN
 }
@@ -383,6 +396,7 @@ ACTIVATION_FUNS_DICT = {
     'swish':      lambda x: tf.nn.swish(x),
     'silu':       lambda x: tf.nn.swish(x),
     'gelu':       lambda x: tf.nn.gelu(x, approximate=False),
+    'mish':       lambda x: x * tf.nn.tanh(tf.nn.softplus(x))
 }
 
 # Activation function which (might?) need to use float32 dtype
@@ -399,6 +413,7 @@ toNHWC_AXIS = [0, 2, 3, 1]
 toNCHW_AXIS = [0, 3, 1, 2]
 
 LOSS_SCALE_KEY = 'loss_scale'
+RANDOMIZE_NOISE_VAR_NAME = 'is_random_noise'
 
 DEBUG_MODE = 'debug_mode'
 DEFAULT_DEBUG_MODE = '0'
@@ -435,6 +450,15 @@ def validate_data_format(data_format):
     assert data_format in [NCHW_FORMAT, NHWC_FORMAT]
 
 
+def to_z_dim(latent_size, data_format):
+    validate_data_format(data_format)
+    if data_format == NCHW_FORMAT:
+        z_dim = [latent_size, 1, 1]
+    else:  # data_format == NHWC_FORMAT:
+        z_dim = [1, 1, latent_size]
+    return z_dim
+
+
 def create_images_dir_name(model_name, res, mode):
     return os.path.join(IMAGES_DIR, model_name, f'{2**res}x{2**res}', mode)
 
@@ -451,8 +475,9 @@ def load_images_paths(config):
 
     dataset_n_max_images = int(1000 * config.get(DATASET_N_MAX_KIMAGES, DEFAULT_DATASET_N_MAX_KIMAGES))
     if dataset_n_max_images > 0:
-        logging.info(f'Dataset n max images: {dataset_n_max_images}')
+        logging.info(f'Dataset number of images: {len(images_paths)}, max number of images: {dataset_n_max_images}')
         if len(images_paths) > dataset_n_max_images:
+            logging.info(f'Reduced dataset to {dataset_n_max_images} images')
             images_paths = images_paths[:dataset_n_max_images]
 
     logging.info(f'Total number of images: {len(images_paths)}')
@@ -486,6 +511,18 @@ def update_wsum_alpha(model, alpha):
         return model
 
     return recursive_update_wsum_alpha(model, alpha)
+
+
+def enable_random_noise(model):
+    for var in model.variables:
+        if RANDOMIZE_NOISE_VAR_NAME in var.name:
+            var.assign(1.)
+
+
+def disable_random_noise(model):
+    for var in model.variables:
+        if RANDOMIZE_NOISE_VAR_NAME in var.name:
+            var.assign(-1.)
 
 
 def mult_by_zero(weights):
@@ -523,11 +560,29 @@ def should_use_fp16(res, start_fp16_resolution_log2, use_mixed_precision):
     return res >= start_fp16_resolution_log2 and use_mixed_precision
 
 
+def adjust_clamp(clamp, use_fp16):
+    # If layer doesn't use fp16 then values shouldn't be clamped
+    return clamp if use_fp16 is True else None
+
+
 #----------------------------------------------------------------------------
 # Tf utils.
 
-def generate_latents(batch_size: int, z_dim: tuple, dtype=tf.float32):
-    return tf.random.normal(shape=(batch_size,) + z_dim, mean=0., stddev=1., dtype=dtype)
+def generate_latents(batch_size: int, z_dim: list, dtype=tf.float32):
+    return tf.random.normal(shape=[batch_size] + z_dim, mean=0., stddev=1., dtype=dtype)
+
+
+# Linear interpolation
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def enable_mixed_precision_policy():
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+
+def disable_mixed_precision_policy():
+    tf.keras.mixed_precision.set_global_policy('float32')
 
 
 def fp32(*values):

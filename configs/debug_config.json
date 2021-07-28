@@ -62,6 +62,9 @@
     "save_images_every_kimages": 0.1,
     "run_metrics_every_kimages": 2,
     "metrics": {
+        "FID": {
+            "num_samples": 500
+        },
         "PPL": {
             "num_samples": 500,
             "space": "w",

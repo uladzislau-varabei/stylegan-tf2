@@ -5,22 +5,19 @@ import numpy as np
 import tensorflow as tf
 
 from .lpips_models.lpips_tensorflow import learned_perceptual_metric_model
-from utils import generate_latents, toNHWC_AXIS, toNCHW_AXIS
+from custom_layers import naive_downsample, naive_upsample
+from utils import lerp, generate_latents, toNHWC_AXIS, toNCHW_AXIS, NCHW_FORMAT, enable_random_noise, disable_random_noise, \
+    DATA_FORMAT, validate_data_format, enable_mixed_precision_policy, disable_mixed_precision_policy
 
 
 #----------------------------------------------------------------------------
 
 # Normalize batch of vectors.
 def normalize(v):
-    # Note: the original implementation doesn't seem to work at least for me in Tf2.5.
-    # If the function should normalize each vector in a batch separately, then it should be fixed in the given way
+    # Note: this function differs from the original implementation, because input vector tensor is assumed to have 4 dimensions.
+    # If it has 2 dimensions, then axis arg should be changed to -1 (value from the official implementation).
+    # Changes are needed because latents are 4 dimensional. For NCHW format their shape is: [N, latent_size, 1, 1].
     return v / tf.sqrt(tf.reduce_sum(tf.square(v), axis=[1, 2, 3], keepdims=True))
-
-
-# Linear interpolation
-def lerp(a, b, t):
-    # TODO: think how to remove tf.cast
-    return a + (b - a) * tf.cast(t, a.dtype)
 
 
 # Spherical interpolation of a batch of vectors.
@@ -40,7 +37,7 @@ def slerp(a, b, t):
 
 class PPL:
 
-    def __init__(self, image_size, num_samples, epsilon, space, sampling, crop_face=False, **kwargs):
+    def __init__(self, image_size, num_samples, epsilon, space, sampling, crop_face, dataset_params, use_fp16, use_xla, **kwargs):
         assert space in ['w', 'z']
         assert sampling in ['full', 'end']
         assert isinstance(num_samples, int)
@@ -50,6 +47,10 @@ class PPL:
         self.space = space
         self.sampling = sampling
         self.crop_face = crop_face
+        self.data_format = dataset_params[DATA_FORMAT]
+        validate_data_format(self.data_format)
+        self.use_fp16 = use_fp16
+        self.use_xla = use_xla
         # Required field for each metric class (used in tensorboard)
         self.name = f'PPL_{space}_{sampling}_{num_samples // 1000}k'
 
@@ -63,8 +64,16 @@ class PPL:
         # Tf 2.x port of vgg16_zhang_perceptual
         vgg_ckpt_fn = os.path.join('metrics', 'lpips_models' ,'vgg', 'exported')
         lin_ckpt_fn = os.path.join('metrics', 'lpips_models', 'lin', 'exported')
+        # TODO: fix fp16 implementation
+        if self.use_fp16:
+            enable_mixed_precision_policy()
         # Note: input images should be in NHWC format in range (0, 255)
-        self.lpips_model = tf.function(learned_perceptual_metric_model(self.input_image_size, vgg_ckpt_fn, lin_ckpt_fn))
+        self.lpips_model = tf.function(
+            learned_perceptual_metric_model(self.input_image_size, vgg_ckpt_fn, lin_ckpt_fn),
+            jit_compile=self.use_xla
+        )
+        if self.use_fp16:
+            disable_mixed_precision_policy()
 
     @tf.function
     def process_images(self, images):
@@ -74,38 +83,36 @@ class PPL:
             images = images[:, :, c * 3: c * 7, c * 2: c * 6]
 
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
-        if images.shape[2] > 256:
-            factor = images.shape[2] // 256
-            images_target_shape = [-1, images.shape[1], images.shape[2] // factor, factor, images.shape[3] // factor, factor]
-            images = tf.reshape(images, images_target_shape)
-            images = tf.reduce_mean(images, axis=[3, 5])
-        elif images.shape[2] < self.min_size:
-            s = images.shape
-            factor = self.min_size // images.shape[2]
-            # TODO: think about usage of upscale fun and data format (now works only with NCHW)
-            images = tf.reshape(images, [-1, s[1], s[2], 1, s[3], 1])
-            images = tf.tile(images, [1, 1, 1, factor, 1, factor])
-            images = tf.reshape(images, [-1, s[1], s[2] * factor, s[3] * factor])
+        if self.data_format == NCHW_FORMAT:
+            shape_idx = 2
+        else: # data_format == NHWC_FORMAT:
+            shape_idx = 1
+        if images.shape[shape_idx] > 256:
+            factor = images.shape[shape_idx] // 256
+            images = naive_downsample(images, factor, data_format=self.data_format)
+        elif images.shape[shape_idx] < self.min_size:
+            factor = self.min_size // images.shape[shape_idx]
+            images = naive_upsample(images, factor, data_format=self.data_format)
 
         # Scale dynamic range from [-1,1] to [0,255] for VGG.
         images = (images + 1) * (255 / 2)
 
         # Convert images to network format (NHWC).
-        images = tf.transpose(images, toNHWC_AXIS)
+        if self.data_format == NCHW_FORMAT:
+            images = tf.transpose(images, toNHWC_AXIS)
 
         # TODO: check if this is necessary
         # Cast to fp32.
-        images = tf.cast(images, tf.float32)
+        if not self.use_fp16:
+            images = tf.cast(images, tf.float32)
 
         return images
 
-    def evaluate_distance_for_batch(self, batch_size, G_synthesis: tf.keras.Model, G_mapping: tf.keras.Model):
-        # TODO: implement non-random noise (the same noise for the whole batch)
-
+    def evaluate_distance_for_batch(self, batch_size, G_mapping, G_synthesis):
+        # Outputs of mapping network are casted to fp32. In mixed precision latents will be automatically be casted.
+        dtype = tf.float32
         # Generate random latents and interpolation t-values.
-        # TODO: looks like it doesn't help
-        dtype = G_mapping.compute_dtype
-        lat_t01 = generate_latents(batch_size * 2, tuple(G_mapping.input_shape[1:]),  dtype)
+        lat_t01 = generate_latents(batch_size * 2, list(G_mapping.input_shape[1:]),  dtype)
         lerp_t = tf.random.uniform([batch_size], 0.0, 1.0 if self.sampling == 'full' else 0.0, dtype=dtype)
 
         # Interpolate in W or Z.
@@ -117,8 +124,8 @@ class PPL:
             dlat_e01 = tf.reshape(tf.stack([dlat_e0, dlat_e1], axis=1), dlat_t01.shape)
         else:  # space == 'z'
             lat_t0, lat_t1 = lat_t01[0::2], lat_t01[1::2]
-            # Note: lerp_t shape is different from that in the original implementation
-            # (otherwise error due to incompatible shape is raised)
+            # Note: lerp_t shape is different from that in the original implementation due to latents shape
+            # (2 additional fake dimensions for H and W).
             lat_e0 = slerp(lat_t0, lat_t1, lerp_t[:, tf.newaxis, tf.newaxis, tf.newaxis])
             lat_e1 = slerp(lat_t0, lat_t1, lerp_t[:, tf.newaxis, tf.newaxis, tf.newaxis] + self.epsilon)
             lat_e01 = tf.reshape(tf.stack([lat_e0, lat_e1], axis=1), lat_t01.shape)
@@ -130,22 +137,34 @@ class PPL:
 
         # Evaluate perceptual distance.
         img_e0, img_e1 = images[0::2], images[1::2]
-        batch_distance = self.lpips_model([img_e0, img_e1]) * self.norm_constant
+        # Normalize after rejecting outliers to avoid overflows. Final result doesn't change.
+        batch_distance = self.lpips_model([img_e0, img_e1])
         return batch_distance
 
-    def run_metric(self, input_batch_size, G_synthesis: tf.keras.Model, G_mapping: tf.keras.Model):
+    def run_metric(self, input_batch_size, G_model):
+        G_mapping = G_model.G_mapping
+        G_synthesis = G_model.G_synthesis
+        randomize_noise = G_model.randomize_noise
+
+        if randomize_noise:
+            disable_random_noise(G_synthesis)
+
         # Sampling loop.
         all_distances = []
-        # Max batch size for 256 resolution is 32
-        batch_size = min(input_batch_size, 32) if self.min_size == 256 else input_batch_size
+        # TODO: determine max batch size. For now just always use 32
+        batch_size = min(max(input_batch_size, 32), 32)
         for _ in tqdm(range(0, self.num_samples, batch_size), desc='PPL metric steps'):
-        #for _ in range(0, self.num_samples, batch_size):
-            all_distances += self.evaluate_distance_for_batch(batch_size, G_synthesis, G_mapping).numpy().tolist()
+            all_distances.append(self.evaluate_distance_for_batch(batch_size, G_mapping, G_synthesis).numpy())
+        all_distances = np.concatenate(all_distances, axis=0)
 
-        all_distances = np.array(all_distances)
+        if randomize_noise:
+            enable_random_noise(G_synthesis)
 
         # Reject outliers.
         lo = np.percentile(all_distances, 1, interpolation='lower')
         hi = np.percentile(all_distances, 99, interpolation='higher')
         filtered_distances = np.extract(np.logical_and(lo <= all_distances, all_distances <= hi), all_distances)
-        return np.mean(filtered_distances)
+
+        # Normalize distance.
+        dist = self.norm_constant * np.mean(filtered_distances)
+        return dist

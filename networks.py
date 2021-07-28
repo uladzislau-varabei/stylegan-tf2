@@ -8,8 +8,8 @@ from custom_layers import WeightedSum, layer_dtype,\
     pixel_norm_layer, instance_norm_layer, style_mod_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer
 from utils import TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME,\
     GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT,\
-    level_of_details, validate_data_format, create_model_type_key, to_int_dict,\
-    get_start_fp16_resolution, should_use_fp16
+    generate_latents, level_of_details, validate_data_format, create_model_type_key, to_int_dict, to_z_dim,\
+    get_start_fp16_resolution, should_use_fp16, adjust_clamp, lerp
 
 from utils import TARGET_RESOLUTION, START_RESOLUTION,\
     LATENT_SIZE, DLATENT_SIZE, NORMALIZE_LATENTS,\
@@ -22,6 +22,7 @@ from utils import TARGET_RESOLUTION, START_RESOLUTION,\
     MAPPING_LAYERS, MAPPING_UNITS, MAPPING_LRMUL, MAPPING_ACTIVATION, MAPPING_USE_BIAS,\
     G_FMAP_BASE, G_FMAP_DECAY, G_FMAP_MAX,\
     D_FMAP_BASE, D_FMAP_DECAY, D_FMAP_MAX,\
+    TRUNCATION_PSI, TRUNCATION_CUTOFF, DLATENT_AVG_BETA, STYLE_MIXING_PROB,\
     BATCH_SIZES
 from utils import NCHW_FORMAT, DEFAULT_DATA_FORMAT,\
     DEFAULT_FUSED_BIAS_ACT, DEFAULT_USE_MIXED_PRECISION, DEFAULT_NUM_FP16_RESOLUTIONS,\
@@ -35,7 +36,8 @@ from utils import NCHW_FORMAT, DEFAULT_DATA_FORMAT,\
     DEFAULT_G_KERNEL_SIZE, DEFAULT_D_KERNEL_SIZE, DEFAULT_USE_BIAS,\
     DEFAULT_USE_PIXEL_NORM, DEFAULT_USE_INSTANCE_NORM, DEFAULT_USE_STYLES,\
     DEFAULT_BLUR_FILTER,\
-    DEFAULT_FMAP_BASE, DEFAULT_FMAP_DECAY, DEFAULT_FMAP_MAX
+    DEFAULT_FMAP_BASE, DEFAULT_FMAP_DECAY, DEFAULT_FMAP_MAX,\
+    DEFAULT_TRUNCATION_PSI, DEFAULT_TRUNCATION_CUTOFF, DEFAULT_DLATENT_AVG_BETA, DEFAULT_STYLE_MIXING_PROB
 
 from utils import weights_to_dict, load_model_weights_from_dict
 
@@ -66,6 +68,7 @@ class GeneratorMapping:
         validate_data_format(self.data_format)
 
         self.latent_size = config[LATENT_SIZE]
+        self.z_dim = to_z_dim(self.latent_size, self.data_format)
         self.dlatent_size = config[DLATENT_SIZE]
         self.normalize_latents = config.get(NORMALIZE_LATENTS, DEFAULT_NORMALIZE_LATENTS)
         self.use_styles = config.get(USE_STYLES, DEFAULT_USE_STYLES)
@@ -86,12 +89,10 @@ class GeneratorMapping:
         self.compute_dtype = self.policy.compute_dtype if self.use_mixed_precision else 'float32'
         self.conv_clamp = config.get(CONV_CLAMP, DEFAULT_CONV_CLAMP)
 
-        if self.data_format == NCHW_FORMAT:
-            self.z_dim = (self.latent_size, 1, 1)
-        else: # self.data_format == NHWC_FORMAT:
-            self.z_dim = (1, 1, self.latent_size)
-
+        # Note: now mapping network is built for target resolution, so when current resolution is lower that that,
+        # some broadcast outputs aren't connected to any part of the graph. It's fine, but may look strange.
         self.num_layers = self.resolution_log2 * 2 - 2
+        # self.num_layers = self.model_res * 2 - 2
         self.num_styles = self.num_layers if self.use_styles else 1
 
     def dense(self, x, units, use_fp16=None, scope=''):
@@ -135,6 +136,132 @@ class GeneratorMapping:
         self.G_mapping = tf.keras.Model(self.latents, tf.identity(x, name='dlatents'), name='G_mapping')
 
 
+class GeneratorStyle(tf.keras.Model):
+
+    def __init__(self, G_mapping, G_synthesis, model_res, config):
+        super(GeneratorStyle, self).__init__(name='G_style')
+        self.G_mapping = G_mapping
+        self.G_synthesis = G_synthesis
+        self.model_res = model_res
+        self.config = config
+
+        self.target_resolution = config[TARGET_RESOLUTION]
+        self.resolution_log2 = int(np.log2(self.target_resolution))
+        assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
+
+        self.data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+        validate_data_format(self.data_format)
+
+        self.latent_size = config[LATENT_SIZE]
+        self.z_dim = to_z_dim(self.latent_size, self.data_format)
+        self.dlatent_size = config[DLATENT_SIZE]
+        self.randomize_noise = config.get(RANDOMIZE_NOISE, DEFAULT_RANDOMIZE_NOISE)
+
+        self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
+        self.latents_dtype = 'float16' if self.use_mixed_precision else 'float32'
+
+        self.truncation_psi = config.get(TRUNCATION_PSI, DEFAULT_TRUNCATION_PSI)
+        self.truncation_cutoff = config.get(TRUNCATION_CUTOFF, DEFAULT_TRUNCATION_CUTOFF)
+        self.dlatent_avg_beta = config.get(DLATENT_AVG_BETA, DEFAULT_DLATENT_AVG_BETA)
+        self.style_mixing_prob = config.get(STYLE_MIXING_PROB, DEFAULT_STYLE_MIXING_PROB)
+
+        self.num_layers = self.resolution_log2 * 2 - 2
+        self.res_num_layers = self.model_res * 2 - 2
+
+        self.validate_call_params()
+        self.initialize_variables()
+
+    def validate_call_params(self):
+        def validate_range(value, min_val, max_val):
+            if value is not None:
+                assert min_val <= value <= max_val
+        validate_range(self.truncation_psi, 0.0, 1.0)
+        # validate_range(self.truncation_cutoff, 0, self.num_layers)
+        validate_range(self.dlatent_avg_beta, 0.0, 1.0)
+        validate_range(self.style_mixing_prob, 0.0, 1.0)
+
+    def initialize_variables(self):
+        # Outputs of mapping network are casted to fp32
+        self.dlatent_avg = self.add_weight(
+            name='dlatent_avg',
+            shape=[self.dlatent_size],
+            dtype=tf.float32,
+            initializer=tf.zeros_initializer(),
+            trainable=False
+        )
+
+        # Prepare value for style mixing and truncation
+        self.layer_idx = tf.range(self.num_layers)[tf.newaxis, :, tf.newaxis]
+
+        if self.style_mixing_prob is not None:
+            self.mixing_cur_layers = self.res_num_layers
+
+        if (self.truncation_psi is not None) and (self.truncation_cutoff is not None):
+            ones = tf.ones(self.layer_idx.shape, dtype=tf.float32)
+            self.truncation_coefs = tf.where(self.layer_idx < self.truncation_cutoff, self.truncation_psi * ones, ones)
+
+    def update_dlatent_avg(self, dlatents):
+        batch_avg = tf.reduce_mean(dlatents[:, 0], axis=0)
+        self.dlatent_avg.assign(
+            lerp(batch_avg, self.dlatent_avg, self.dlatent_avg_beta)
+        )
+
+    def generate_latents(self, batch_size):
+        return generate_latents(batch_size, self.z_dim, self.latents_dtype)
+
+    def apply_style_mixing(self, dlatents):
+        latents2 = self.generate_latents(tf.shape(dlatents)[0])
+        # Styles can only be mixed during training
+        dlatents2 = self.G_mapping(latents2, training=True)
+        mixing_cutoff = tf.cond(
+            tf.random.uniform([], 0.0, 1.0) < self.style_mixing_prob,
+            lambda: tf.random.uniform([], 1, self.mixing_cur_layers, dtype=tf.int32),
+            lambda: self.mixing_cur_layers
+        )
+        dlatents = tf.where(tf.broadcast_to(self.layer_idx < mixing_cutoff, tf.shape(dlatents)), dlatents, dlatents2)
+        return dlatents
+
+    def apply_truncation_trick(self, dlatents):
+        return lerp(self.dlatent_avg, dlatents, self.truncation_coefs)
+
+    def call(self, latents, training=True, validation=False, truncation_psi=None, *args, **kwargs):
+        # 1. Decide which actions to perform based on training/testing/validation.
+        # Validation is used for metrics evaluation. Testing for generation of images
+        assert not (training and validation), "Model can't use training and validation modes at the same time"
+        if training or validation:
+            truncation_psi = None
+            truncation_cutoff = None
+        else:
+            truncation_psi = self.truncation_psi if truncation_psi is None else truncation_psi
+            truncation_cutoff = self.truncation_cutoff
+
+        should_update_dlatent_avg = (self.dlatent_avg_beta is not None) and training
+        should_apply_style_mixing = (self.style_mixing_prob is not None) and training
+        should_apply_truncation_trick = (truncation_psi is not None) and (truncation_cutoff is not None)
+
+        # 2. Evaluate dlatents, output shape: (batch, num_layers, dlatent_size)
+        dlatents = self.G_mapping(latents, training=training)
+
+        # 3. Update moving average of W
+        with tf.name_scope('DlatentAvg'):
+            if should_update_dlatent_avg:
+                self.update_dlatent_avg(dlatents)
+
+        # 4. Perform mixing style regularization
+        with tf.name_scope('StyleMixing'):
+            if should_apply_style_mixing:
+                dlatents = self.apply_style_mixing(dlatents)
+
+        # 5. Apply truncation trick
+        with tf.name_scope('Truncation'):
+            if should_apply_truncation_trick:
+                dlatents = self.apply_truncation_trick(dlatents)
+
+        # 6. Evaluate synthesis network
+        images_out = self.G_synthesis(dlatents, training=training)
+        return images_out
+
+
 class Generator:
 
     def __init__(self, config):
@@ -152,6 +279,7 @@ class Generator:
         validate_data_format(self.data_format)
 
         self.latent_size = config[LATENT_SIZE]
+        self.z_dim = to_z_dim(self.latent_size, self.data_format)
         self.dlatent_size = config[DLATENT_SIZE]
         self.normalize_latents = config.get(NORMALIZE_LATENTS, DEFAULT_NORMALIZE_LATENTS)
         self.const_input_layer = config.get(CONST_INPUT_LAYER, DEFAULT_CONST_INPUT_LAYER)
@@ -193,11 +321,9 @@ class Generator:
         # This constant is taken from the original implementation
         self.projecting_mult = 4
         if self.data_format == NCHW_FORMAT:
-            self.z_dim = (self.latent_size, 1, 1)
-            self.projecting_target_shape = (-1, self.G_n_filters(1), self.projecting_mult, self.projecting_mult)
+            self.projecting_target_shape = [-1, self.G_n_filters(1), self.projecting_mult, self.projecting_mult]
         else: # self.data_format == NHWC_FORMAT:
-            self.z_dim = (1, 1, self.latent_size)
-            self.projecting_target_shape = (-1, self.projecting_mult, self.projecting_mult, self.G_n_filters(1))
+            self.projecting_target_shape = [-1, self.projecting_mult, self.projecting_mult, self.G_n_filters(1)]
         self.projecting_units = np.prod(self.projecting_target_shape)
 
         self.num_layers = self.resolution_log2 * 2 - 2
@@ -271,6 +397,7 @@ class Generator:
 
     def bias_act(self, x, act_name=None, clamp=None, use_fp16=None, scope=''):
         if act_name is None: act_name = self.G_act_name
+        clamp = adjust_clamp(clamp, use_fp16)
         kwargs = {
             'x': x,
             'act_name': act_name,
@@ -299,7 +426,8 @@ class Generator:
         with tf.name_scope('4x4'):
             if self.const_input_layer:
                 with tf.name_scope('Const') as scope:
-                    # TODO: changes the first argument from self.latents to self.dlatents
+                    # Note: input to layer should be dlatents to allow having separate mapping and synthesis networks,
+                    # though number of channels is taken according to latents
                     x = const_layer(self.dlatents, self.latent_size, use_fp16=use_fp16, scope=scope, config=self.config)
                     x = self.layer_epilogue(x, 0, use_fp16=use_fp16, scope=scope)
             else:
@@ -361,11 +489,7 @@ class Generator:
                 self.dlatents, tf.identity(images_out, name='images_out'), name='G_synthesis'
             )
             # Create full G model
-            dlatents = self.G_mapping(self.latents)
-            images_out = self.G_synthesis(dlatents)
-            self.G_models[model_type_key] = tf.keras.Model(
-                self.latents, tf.identity(images_out, name='images_out'), name='G_style'
-            )
+            self.G_models[model_type_key] = GeneratorStyle(self.G_mapping, self.G_synthesis, model_res, self.config)
         else:
             print('Taking model from cache')
 
@@ -374,15 +498,15 @@ class Generator:
     def initialize_G_model(self, model_res=None, mode=None):
         if model_res is not None:
             batch_size = self.batch_sizes[2 ** model_res]
-            latents = tf.zeros(shape=(batch_size,) + self.z_dim, dtype=self.compute_dtype)
+            latents = tf.zeros(shape=[batch_size] + self.z_dim, dtype=self.compute_dtype)
             G_model = self.create_G_model(model_res, mode=mode)
-            _ = G_model(latents)
+            _ = G_model(latents, training=False)
         else:
             for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
                 batch_size = self.batch_sizes[2 ** res]
-                latents = tf.zeros(shape=(batch_size,) + self.z_dim, dtype=self.compute_dtype)
+                latents = tf.zeros(shape=[batch_size] + self.z_dim, dtype=self.compute_dtype)
                 G_model = self.create_G_model(res, mode=TRANSITION_MODE)
-                _ = G_model(latents)
+                _ = G_model(latents, training=False)
 
         print('G model built')
 
@@ -394,7 +518,7 @@ class Generator:
 
     def trace_G_graphs(self, summary_writers, writers_dirs):
         G_prefix = 'Generator_'
-        trace_G_input = tf.zeros(shape=(1,) + self.z_dim, dtype=self.compute_dtype)
+        trace_G_input = tf.zeros(shape=[1] + self.z_dim, dtype=self.compute_dtype)
         for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
             writer = summary_writers[res]
             profiler_dir = writers_dirs[res]
@@ -493,9 +617,9 @@ class Discriminator:
 
     def D_input_shape(self, res):
         if self.data_format == NCHW_FORMAT:
-            return (3, 2 ** res, 2 ** res)
+            return [3, 2 ** res, 2 ** res]
         else: # self.data_format == NHWC_FORMAT:
-            return (2 ** res, 2 ** res, 3)
+            return [2 ** res, 2 ** res, 3]
 
     def create_model_layers(self):
         self.D_input_layers = {
@@ -551,6 +675,7 @@ class Discriminator:
 
     def bias_act(self, x, act_name=None, clamp=None, use_fp16=None, scope=''):
         if act_name is None: act_name = self.D_act_name
+        clamp = adjust_clamp(clamp, use_fp16)
         kwargs = {
             'x': x,
             'act_name': act_name,
@@ -631,15 +756,15 @@ class Discriminator:
     def initialize_D_model(self, model_res=None, mode=None):
         if model_res is not None:
             batch_size = self.batch_sizes[2 ** model_res]
-            images = tf.zeros(shape=(batch_size,) + self.D_input_shape(model_res), dtype=self.compute_dtype)
+            images = tf.zeros(shape=[batch_size] + self.D_input_shape(model_res), dtype=self.compute_dtype)
             D_model = self.create_D_model(model_res, mode=mode)
-            _ = D_model(images)
+            _ = D_model(images, training=False)
         else:
             for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
                 batch_size = self.batch_sizes[2 ** res]
-                images = tf.zeros(shape=(batch_size,) + self.D_input_shape(res), dtype=self.compute_dtype)
+                images = tf.zeros(shape=[batch_size] + self.D_input_shape(res), dtype=self.compute_dtype)
                 D_model = self.create_D_model(res, mode=TRANSITION_MODE)
-                _ = D_model(images)
+                _ = D_model(images, training=False)
 
         print('D model built')
 
@@ -655,7 +780,7 @@ class Discriminator:
             writer = summary_writers[res]
             # TODO: Change it later!
             profiler_dir = writers_dirs[res]
-            trace_D_input = tf.zeros((1,) + self.D_input_shape(res), dtype=self.compute_dtype)
+            trace_D_input = tf.zeros([1] + self.D_input_shape(res), dtype=self.compute_dtype)
             if res == self.start_resolution_log2:
                 trace_D_model = tf.function(self.create_D_model(res, mode=STABILIZATION_MODE))
                 with writer.as_default():

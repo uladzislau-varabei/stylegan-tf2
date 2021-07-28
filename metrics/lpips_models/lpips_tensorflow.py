@@ -3,8 +3,13 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Lambda, Dropout, Conv2D, Permute
 from tensorflow.keras.applications.vgg16 import VGG16
 
+from utils import disable_mixed_precision_policy
+
 
 def image_preprocess(image):
+    orig_dtype = image.dtype
+    image = tf.cast(image, tf.float32)
+
     factor = 255.0 / 2.0
     center = 1.0
     scale = tf.constant([0.458, 0.448, 0.450])[None, None, None, :]
@@ -12,19 +17,24 @@ def image_preprocess(image):
 
     image = image / factor - center  # [0.0 ~ 255.0] -> [-1.0 ~ 1.0]
     image = (image - shift) / scale
+
+    image = tf.cast(image, orig_dtype)
     return image
 
 
 def learned_perceptual_metric_model(image_size, vgg_model_ckpt_fn, lin_model_ckpt_fn):
     # initialize all models
     net = perceptual_model(image_size)
-    lin = linear_model(image_size)
     net.load_weights(vgg_model_ckpt_fn)
+    # Linear model uses lots of operations which should be executed in fp32, so disable mixed precision evaluation here
+    disable_mixed_precision_policy()
+    lin = linear_model(image_size)
     lin.load_weights(lin_model_ckpt_fn)
 
+    # Note: originally these 2 layers were built with dtype fp32
     # merge two model
-    input1 = Input(shape=(image_size, image_size, 3), dtype='float32', name='input1')
-    input2 = Input(shape=(image_size, image_size, 3), dtype='float32', name='input2')
+    input1 = Input(shape=(image_size, image_size, 3), name='input1')
+    input2 = Input(shape=(image_size, image_size, 3), name='input2')
 
     # preprocess input images
     net_out1 = Lambda(lambda x: image_preprocess(x))(input1)
@@ -34,15 +44,14 @@ def learned_perceptual_metric_model(image_size, vgg_model_ckpt_fn, lin_model_ckp
     net_out1 = net(net_out1)
     net_out2 = net(net_out2)
 
-    # nhwc -> nchw
+    # nhwc -> nchw (after these layers outputs have fp32 dtype, as mixed precision is disabled after perceptual model)
     net_out1 = [Permute(dims=(3, 1, 2))(t) for t in net_out1]
     net_out2 = [Permute(dims=(3, 1, 2))(t) for t in net_out2]
 
     # normalize
-    net_out1 = [Lambda(lambda x: x * tf.math.rsqrt(tf.reduce_sum(tf.square(x), axis=1, keepdims=True)))(t)
-                for t in net_out1]
-    net_out2 = [Lambda(lambda x: x * tf.math.rsqrt(tf.reduce_sum(tf.square(x), axis=1, keepdims=True)))(t)
-                for t in net_out2]
+    normalize_tensor = lambda x: x * tf.math.rsqrt(tf.reduce_sum(tf.square(x), axis=1, keepdims=True))
+    net_out1 = [Lambda(lambda x: normalize_tensor(x))(t) for t in net_out1]
+    net_out2 = [Lambda(lambda x: normalize_tensor(x))(t) for t in net_out2]
 
     # subtract
     diffs = [Lambda(lambda x: tf.square(x[0] - x[1]))([t1, t2]) for t1, t2 in zip(net_out1, net_out2)]
@@ -55,7 +64,7 @@ def learned_perceptual_metric_model(image_size, vgg_model_ckpt_fn, lin_model_ckp
 
     # take sum of all layers: [N, 1]
     lin_out = Lambda(lambda x: tf.add_n(x))(lin_out)
-    
+
     # squeeze: [N, ]
     lin_out = Lambda(lambda x: tf.squeeze(x, axis=-1))(lin_out)
 
@@ -170,10 +179,11 @@ def linear_model(input_image_size):
         name = 'lin{}'.format(ii)
         image_size = input_image_size // (2 ** ii)
 
+        # Note: keep fp32 dtype to avoid numerical later with upcoming operations
         model_input = Input(shape=(channel, image_size, image_size), dtype='float32')
         model_output = Dropout(rate=0.5, dtype='float32')(model_input)
-        model_output = Conv2D(filters=1, kernel_size=1, strides=1, use_bias=False, dtype='float32',
-                              data_format='channels_first', name=name)(model_output)
+        model_output = Conv2D(filters=1, kernel_size=1, strides=1, use_bias=False,
+                              data_format='channels_first', dtype='float32', name=name)(model_output)
         inputs.append(model_input)
         outputs.append(model_output)
 

@@ -3,7 +3,7 @@ import tensorflow as tf
 from tensorflow.keras.layers import Layer, Activation
 from tensorflow.keras import mixed_precision
 
-from utils import DEFAULT_DTYPE, DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT, WSUM_NAME,\
+from utils import DEFAULT_DTYPE, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WSUM_NAME, RANDOMIZE_NOISE_VAR_NAME,\
     validate_data_format, HE_GAIN, DEFAULT_USE_WSCALE, DEFAULT_TRUNCATE_WEIGHTS, DEFAULT_USE_XLA
 
 # Config constants
@@ -492,8 +492,6 @@ class Noise(Layer):
         validate_data_format(data_format)
         self.data_format = data_format
         self.randomize_noise = randomize_noise
-        self.tf_zero = tf.constant(0., dtype=self._dtype_policy.compute_dtype)
-        self.tf_randomize_noise = tf.constant(1. if randomize_noise else -1., dtype=self._dtype_policy.compute_dtype)
         self.use_xla = use_xla
         self.scope = scope #+ 'Noise'
         # XLA doesn't seem to work.
@@ -527,6 +525,19 @@ class Noise(Layer):
                 shape=[1] + self.noise_tail_shape,
                 initializer=tf.random_normal_initializer(),
                 trainable=False
+            )
+            # Add dummy non trainable variables to control randomness of noise
+            self.tf_zero = self.add_weight(
+                name='zero',
+                initializer=tf.constant_initializer(0.),
+                trainable=False,
+                dtype=self._dtype_policy.compute_dtype
+            )
+            self.tf_randomize_noise = self.add_weight(
+                name=RANDOMIZE_NOISE_VAR_NAME,
+                initializer=tf.constant_initializer(1. if self.randomize_noise else -1.),
+                trainable=False,
+                dtype=self._dtype_policy.compute_dtype
             )
 
     def call(self, x, *args, **kwargs):
@@ -956,14 +967,12 @@ def clip_layer(x, clamp, scope='', config=None):
     return Clip(clamp, use_xla=use_xla, scope=scope)(x)
 
 
-def bias_act_layer(x, act_name, lrmul=LRMUL, use_bias=None, clamp=None, use_fp16=None, scope='', config=None):
-    if use_bias is None: use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
+def bias_act_layer(x, act_name, use_bias, lrmul=LRMUL, clamp=None, use_fp16=None, scope='', config=None):
     # 1. Apply bias
     if use_bias:
         x = bias_layer(x, lrmul, use_fp16=use_fp16, scope=scope, config=config)
     # 2. Apply activation
-    if act_name is not None:
-        x = act_layer(x, act_name, use_fp16=use_fp16, scope=scope, config=config)
+    x = act_layer(x, act_name, use_fp16=use_fp16, scope=scope, config=config)
     # 3. Clamp outputs
     if clamp is not None:
         x = clip_layer(x, clamp, scope=scope, config=config)
@@ -1042,3 +1051,25 @@ def minibatch_stddev_layer(x, use_fp16=None, scope='', config=None):
         group_size=group_size, num_new_features=num_new_features,
         dtype=dtype, use_xla=use_xla, data_format=data_format, scope=scope
     )(x)
+
+
+def naive_upsample(x, factor, data_format=DEFAULT_DATA_FORMAT):
+    return _upscale2d(x, factor, gain=1, data_format=data_format)
+
+
+def naive_downsample(x, factor, data_format=DEFAULT_DATA_FORMAT):
+    assert isinstance(factor, int) and factor >= 1
+    validate_data_format(data_format)
+
+    if data_format == NCHW_FORMAT:
+        _, c, h, w = x.shape
+        target_shape = [-1, c, h // factor, factor, w // factor, factor]
+        axis = [3, 5]
+    else: # data_format == NHWC_FORMAT:
+        _, h, w, c = x.shape
+        target_shape = [-1, h // factor, factor, w // factor, factor, c]
+        axis = [2, 4]
+
+    x = tf.reshape(x, target_shape)
+    x = tf.reduce_mean(x, axis=axis)
+    return x

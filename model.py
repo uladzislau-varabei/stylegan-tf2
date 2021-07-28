@@ -9,14 +9,15 @@ from tensorflow.keras import mixed_precision
 
 from metrics.metrics_utils import setup_metrics
 from losses import select_G_loss_fn, select_D_loss_fn
-from utils import generate_latents, compute_alpha, update_wsum_alpha, get_start_fp16_resolution, should_use_fp16,\
+from utils import generate_latents, compute_alpha, update_wsum_alpha, lerp, get_start_fp16_resolution, should_use_fp16,\
     save_model, load_model, save_optimizer_loss_scale, load_optimizer_loss_scale, is_finite_grad,\
     TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
     create_images_dir_name, create_images_grid_title, remove_old_models,\
     trace_vars, trace_message,\
-    format_time, to_int_dict, validate_data_format, mult_by_zero, is_last_step, should_write_summary,\
+    format_time, to_int_dict, validate_data_format, to_z_dim, mult_by_zero, is_last_step, should_write_summary,\
     maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, load_images_paths, set_tf_logging
-from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, USE_MIXED_PRECISION, NUM_FP16_RESOLUTIONS,\
+from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, \
+    USE_MIXED_PRECISION, NUM_FP16_RESOLUTIONS, USE_XLA,\
     DATA_FORMAT, MODEL_NAME, MAX_MODELS_TO_KEEP, \
     SUMMARY_SCALARS_EVERY_KIMAGES, SUMMARY_HISTS_EVERY_KIMAGES, SAVE_MODEL_EVERY_KIMAGES, SAVE_IMAGES_EVERY_KIMAGES, \
     METRICS_DICT, RUN_METRICS_EVERY_KIMAGES,\
@@ -30,7 +31,7 @@ from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, USE_MIXED_PR
     TF_LOGS_DIR, STORAGE_PATH, DATASET_CACHE_DIR, CACHE_DIR,\
     BATCH_SIZES, BATCH_REPEATS, DATASET_MAX_CACHE_RES,\
     TOTAL_KIMAGES, TRANSITION_KIMAGES, TRANSITION_KIMAGES_DICT, STABILIZATION_KIMAGES, STABILIZATION_KIMAGES_DICT,\
-    DATASET_N_PARALLEL_CALLS, DATASET_N_PREFETCHED_BATCHES, DATASET_N_MAX_KIMAGES,\
+    DATASET_N_PARALLEL_CALLS, DATASET_N_PREFETCHED_BATCHES,\
     SHUFFLE_DATASET, MIRROR_AUGMENT,\
     VALID_GRID_NROWS, VALID_GRID_NCOLS, VALID_MIN_TARGET_SINGLE_IMAGE_SIZE, VALID_MAX_PNG_RES,\
     TRAIN_MODE, INFERENCE_MODE, DEFAULT_MODE
@@ -43,9 +44,9 @@ from utils import DEFAULT_STORAGE_PATH, DEFAULT_MAX_MODELS_TO_KEEP,\
     DEFAULT_G_LEARNING_RATE_DICT, DEFAULT_D_LEARNING_RATE_DICT,\
     DEFAULT_ADAM_BETA1, DEFAULT_ADAM_BETA2, DEFAULT_RESET_OPT_STATE_FOR_NEW_LOD,\
     DEFAULT_DATASET_MAX_CACHE_RES,\
-    DEFAULT_START_RESOLUTION, DEFAULT_USE_MIXED_PRECISION, DEFAULT_NUM_FP16_RESOLUTIONS,\
+    DEFAULT_START_RESOLUTION, DEFAULT_USE_MIXED_PRECISION, DEFAULT_NUM_FP16_RESOLUTIONS, DEFAULT_USE_XLA,\
     DEFAULT_DATASET_N_PARALLEL_CALLS,\
-    DEFAULT_DATASET_N_PREFETCHED_BATCHES, DEFAULT_DATASET_N_MAX_KIMAGES,\
+    DEFAULT_DATASET_N_PREFETCHED_BATCHES,\
     DEFAULT_SHUFFLE_DATASET, DEFAULT_MIRROR_AUGMENT,\
     DEFAULT_TOTAL_KIMAGES, DEFAULT_TRANSITION_KIMAGES, DEFAULT_STABILIZATION_KIMAGES, \
     DEFAULT_TRANSITION_KIMAGES_DICT, DEFAULT_STABILIZATION_KIMAGES_DICT,\
@@ -102,12 +103,7 @@ class StyleGAN:
         validate_data_format(self.data_format)
 
         self.latent_size = config[LATENT_SIZE]
-        if self.data_format == NCHW_FORMAT:
-            self.z_dim = (self.latent_size, 1, 1)
-        else: # self.data_format == NHWC_FORMAT:
-            self.z_dim = (1, 1, self.latent_size)
-
-        self.model_name = config[MODEL_NAME]
+        self.z_dim = to_z_dim(self.latent_size, self.data_format)
 
         # Training images and batches
         self.batch_sizes = to_int_dict(config[BATCH_SIZES])
@@ -124,20 +120,30 @@ class StyleGAN:
         self.start_fp16_resolution_log2 =\
             get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
         self.compute_dtype = 'float16' if self.use_mixed_precision else 'float32'
+        self.use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
         self.use_Gs = config.get(USE_G_SMOOTHING, DEFAULT_USE_G_SMOOTHING)
         self.use_gpu_for_Gs = config.get(USE_GPU_FOR_GS, DEFAULT_USE_GPU_FOR_GS)
         self.Gs_beta = config.get(G_SMOOTHING_BETA, DEFAULT_G_SMOOTHING_BETA)
         self.Gs_beta_kimgs = config.get(G_SMOOTHING_BETA_KIMAGES, DEFAULT_G_SMOOTHING_BETA_KIMAGES)
         # Resolution-specific betas for Gs
         self.Gs_betas = {}
+        # Used for training in a single process
+        self.clear_session_for_new_model = True
 
         # Dataset
-        self.shuffle_dataset = config.get(SHUFFLE_DATASET, DEFAULT_SHUFFLE_DATASET)
-        self.dataset_n_parallel_calls = config.get(DATASET_N_PARALLEL_CALLS, DEFAULT_DATASET_N_PARALLEL_CALLS)
-        self.dataset_n_prefetched_batches = config.get(DATASET_N_PREFETCHED_BATCHES, DEFAULT_DATASET_N_PREFETCHED_BATCHES)
-        self.dataset_n_max_kimages = config.get(DATASET_N_MAX_KIMAGES, DEFAULT_DATASET_N_MAX_KIMAGES)
         self.dataset_max_cache_res = config.get(DATASET_MAX_CACHE_RES, DEFAULT_DATASET_MAX_CACHE_RES)
-        self.mirror_augment = config.get(MIRROR_AUGMENT, DEFAULT_MIRROR_AUGMENT)
+        if images_paths is None:
+            images_paths = load_images_paths(config)
+        # These options are used for metrics
+        self.dataset_params = {
+            'fpaths':               images_paths,
+            'mirror_augment':       config.get(MIRROR_AUGMENT, DEFAULT_MIRROR_AUGMENT),
+            'shuffle_dataset':      config.get(SHUFFLE_DATASET, DEFAULT_SHUFFLE_DATASET),
+            'dtype':                self.compute_dtype,
+            'data_format':          self.data_format,
+            'n_parallel_calls':     config.get(DATASET_N_PARALLEL_CALLS, DEFAULT_DATASET_N_PARALLEL_CALLS),
+            'n_prefetched_batches': config.get(DATASET_N_PREFETCHED_BATCHES, DEFAULT_DATASET_N_PREFETCHED_BATCHES)
+        }
 
         # Losses
         self.G_loss_fn_name = config.get(G_LOSS_FN, DEFAULT_G_LOSS_FN)
@@ -165,9 +171,8 @@ class StyleGAN:
            self.min_target_single_image_size = max(2 ** (self.resolution_log2 - 1), 2 ** 7)
         self.max_png_res = config.get(VALID_MAX_PNG_RES, DEFAULT_VALID_MAX_PNG_RES)
 
-        self.valid_latents = self.initialize_valid_latents()
-
         # Summaries
+        self.model_name = config[MODEL_NAME]
         self.metrics = config.get(METRICS_DICT, DEFAULT_METRICS_DICT)
         self.storage_path = config.get(STORAGE_PATH, DEFAULT_STORAGE_PATH)
         self.max_models_to_keep = config.get(MAX_MODELS_TO_KEEP, DEFAULT_MAX_MODELS_TO_KEEP)
@@ -185,38 +190,38 @@ class StyleGAN:
             res: tf.summary.create_file_writer(self.writers_dirs[res])
             for res in range(self.start_resolution_log2, self.resolution_log2 + 1)
         }
+        self.valid_latents = self.initialize_valid_latents()
 
         self.validate_config()
 
-        self.clear_session_for_new_model = True
-
         self.G_object = Generator(config)
         self.D_object = Discriminator(config)
-
+        # Maybe create smoothed generator
         if self.use_Gs:
             Gs_config = config
             self.Gs_valid_latents = self.valid_latents
             self.Gs_device = '/GPU:0' if self.use_gpu_for_Gs else '/CPU:0'
-
             if not self.use_gpu_for_Gs:
                 Gs_config[DATA_FORMAT] = NHWC_FORMAT
                 self.Gs_valid_latents = tf.transpose(self.valid_latents, toNHWC_AXIS)
-
             self.Gs_object = Generator(Gs_config)
 
+        self.initialize_models(res, stage)
         if mode == INFERENCE_MODE:
-            self.initialize_models(res, stage)
+            print('Ready for inference')
         elif mode == TRAIN_MODE:
+            self.setup_Gs_betas(res)
+            self.create_images_datasets(res)
             if single_process_training:
-                self.setup_Gs_betas()
-                self.initialize_models()
-                self.create_images_generators(config)
+                # TODO: think about using metrics
                 self.initialize_optimizers(create_all_variables=True)
             else:
-                self.metrics_objects = setup_metrics(2 ** res, self.metrics)
-                self.setup_Gs_betas(res)
-                self.initialize_models(res, stage)
-                self.create_images_generator(res, images_paths)
+                self.metrics_objects = setup_metrics(2 ** res,
+                                                     model_name=self.model_name,
+                                                     dataset_params=self.dataset_params,
+                                                     use_fp16=self.use_mixed_precision,
+                                                     use_xla=self.use_xla,
+                                                     metrics=self.metrics)
                 self.initialize_optimizers(create_all_variables=False, res=res, stage=stage)
 
     def initialize_valid_latents(self):
@@ -248,7 +253,6 @@ class StyleGAN:
                     stage = STABILIZATION_MODE
                 G_model = self.G_object.create_G_model(model_res=model_res, mode=stage)
                 Gs_model = self.Gs_object.create_G_model(model_res=model_res, mode=stage)
-                # Not sure about this line
                 Gs_model.set_weights(G_model.get_weights())
 
     def setup_Gs_betas(self, res=None):
@@ -338,7 +342,7 @@ class StyleGAN:
             batch_size = self.batch_sizes[2 ** res]
             # toRGB layers
             to_layer = self.G_object.toRGB_layers[res]
-            to_input_shape = (batch_size,) + to_layer.input_shape[1:]
+            to_input_shape = [batch_size] + list(to_layer.input_shape[1:])
             to_inputs = tf.zeros(shape=to_input_shape, dtype=self.compute_dtype)
 
             with tf.GradientTape() as tape:
@@ -403,7 +407,7 @@ class StyleGAN:
             latents = self.generate_latents(batch_size)
             # It's probably better to use ranges which are similar to the ones in real images
             images = tf.random.uniform(
-                shape=(batch_size,) + D_input_shape, minval=-1.0, maxval=1.0, dtype=self.compute_dtype
+                shape=[batch_size] + D_input_shape, minval=-1.0, maxval=1.0, dtype=self.compute_dtype
             )
             with tf.GradientTape(watch_accessed_variables=False) as D_tape:
                 D_tape.watch(D_vars)
@@ -438,7 +442,7 @@ class StyleGAN:
             batch_size = self.batch_sizes[2 ** res]
             # fromRGB layers
             from_layer = self.D_object.fromRGB_layers[res]
-            from_input_shape = (batch_size,) + from_layer.input_shape[1:]
+            from_input_shape = [batch_size] + list(from_layer.input_shape[1:])
             from_inputs = tf.zeros(shape=from_input_shape, dtype=self.compute_dtype)
 
             with tf.GradientTape() as tape:
@@ -623,56 +627,46 @@ class StyleGAN:
         # print(f'Opt steps for res={res} and stage={stage}: {n_steps}')
         return np.array(n_steps)
 
-    def create_images_generators(self, config):
-        # This method is used in function train() which was used when training all models used the same process
+    def create_images_datasets(self, res=None):
         start_time = time.time()
-        logging.info('Initializing images generators...')
+        logging.info('Initializing images datasets...')
 
-        images_paths = load_images_paths(config)
+        if res is None:
+            start_res = self.start_resolution_log2
+            end_res = self.resolution_log2
+        else:
+            start_res = res
+            end_res = res
 
-        self.images_generators = {}
-        for res in tqdm(range(self.start_resolution_log2, self.resolution_log2 + 1), desc='Generator res'):
-            self.images_generators[res] = self.create_images_generator(
-                res, images_paths, messages=False, return_generator=True
-            )
+        self.images_datasets = {}
+        for ds_res in tqdm(range(start_res, end_res + 1), desc='Dataset res'):
+            self.images_datasets[ds_res] = self.create_images_dataset(ds_res, messages=True)
 
         total_time = time.time() - start_time
-        logging.info(f'Images generators initialized in {total_time:.3f} seconds!')
+        logging.info(f'Images datasets initialized in {total_time:.3f} seconds!')
 
-    def create_images_generator(self, res, images_paths, messages=True, return_generator=False):
+    def create_images_dataset(self, res, messages=True):
         # This method is used for training each model in a separate process
         if messages:
             start_time = time.time()
-            logging.info(f'Initializing images generator for {2**res}x{2**res} model...')
+            logging.info(f'Initializing images dataset for {2**res}x{2**res} model...')
 
         # No caching by default
         cache = False
         if self.dataset_max_cache_res is not None:
             if res <= self.dataset_max_cache_res:
-                cache = os.path.join(DATASET_CACHE_DIR, self.model_name, str(res))
-                if STORAGE_PATH is not None:
-                    cache = os.path.join(STORAGE_PATH, cache)
-                if not os.path.exists(cache):
-                    os.makedirs(cache)
+                cache = os.path.join(self.storage_path or '', DATASET_CACHE_DIR, self.model_name)
+                os.makedirs(cache, exist_ok=True)
 
         batch_size = self.batch_sizes[2 ** res]
-        images_generator = create_training_dataset(
-            images_paths, res, cache, batch_size,
-            mirror_augment=self.mirror_augment,
-            shuffle_dataset=self.shuffle_dataset,
-            dtype=self.compute_dtype, data_format=self.data_format,
-            n_parallel_calls=self.dataset_n_parallel_calls,
-            n_prefetched_batches=self.dataset_n_prefetched_batches
-        )
-
-        if return_generator:
-            return images_generator
-        else:
-            self.images_generator = images_generator
+        res_kwargs = {'res': res, 'batch_size': batch_size, 'cache': cache}
+        images_dataset = create_training_dataset(**{**res_kwargs, **self.dataset_params})
 
         if messages:
             total_time = time.time() - start_time
-            logging.info(f'Image generator initialized in {total_time:.3f} seconds!')
+            logging.info(f'Images dataset initialized in {total_time:.3f} seconds!')
+
+        return images_dataset
 
     def create_models(self, res, mode):
         # All models should be initialized before calling this function
@@ -689,6 +683,7 @@ class StyleGAN:
         # Log G model (mapping and synthesis networks)
         self.G_object.G_mapping.summary(print_fn=logging.info)
         self.G_object.G_synthesis.summary(print_fn=logging.info)
+        G_model.summary(print_fn=logging.info)
 
         return D_model, G_model, Gs_model
 
@@ -952,7 +947,7 @@ class StyleGAN:
 
         with tf.device(self.Gs_device):
             for a, b in zip(smoothed_net_vars, source_net_vars):
-                a.assign(b + (a - b) * beta)
+                a.assign(lerp(b, a, beta))
 
     @tf.function
     def G_train_step(self, G_model, D_model, latents, write_scalars_summary, write_hists_summary, step):
@@ -1087,7 +1082,7 @@ class StyleGAN:
                 self.reset_optimizers_state()
             self.adjust_optimizers_learning_rate(res)
 
-            images_generator = iter(self.images_generators[res])
+            images_dataset = iter(self.images_datasets[res])
             batch_size = self.batch_sizes[2 ** res]
             summary_writer = self.summary_writers[res]
 
@@ -1136,7 +1131,7 @@ class StyleGAN:
 
                         G_latents = self.generate_latents(batch_size)
                         D_latents = self.generate_latents(batch_size)
-                        batch_images = next(images_generator)
+                        batch_images = next(images_dataset)
 
                         self.train_step(
                             G_model=self.G_model, D_model=self.D_model,
@@ -1184,7 +1179,7 @@ class StyleGAN:
 
                     G_latents = self.generate_latents(batch_size)
                     D_latents = self.generate_latents(batch_size)
-                    batch_images = next(images_generator)
+                    batch_images = next(images_dataset)
 
                     self.train_step(
                         G_model=self.G_model, D_model=self.D_model,
@@ -1225,7 +1220,7 @@ class StyleGAN:
         )
         self.zero_optimizers_learning_rate()
 
-        images_generator = iter(self.images_generator)
+        images_dataset = iter(self.images_datasets[res])
         batch_size = self.batch_sizes[2 ** res]
         summary_writer = self.summary_writers[res]
 
@@ -1260,7 +1255,7 @@ class StyleGAN:
 
                 G_latents = self.generate_latents(batch_size)
                 D_latents = self.generate_latents(batch_size)
-                batch_images = next(images_generator)
+                batch_images = next(images_dataset)
 
                 self.train_step(
                     G_model=self.G_model, D_model=self.D_model,
@@ -1301,7 +1296,7 @@ class StyleGAN:
             )
         self.zero_optimizers_learning_rate()
 
-        images_generator = iter(self.images_generator)
+        images_dataset = iter(self.images_datasets[res])
         batch_size = self.batch_sizes[2 ** res]
         summary_writer = self.summary_writers[res]
 
@@ -1326,7 +1321,7 @@ class StyleGAN:
 
                 G_latents = self.generate_latents(batch_size)
                 D_latents = self.generate_latents(batch_size)
-                batch_images = next(images_generator)
+                batch_images = next(images_dataset)
 
                 self.train_step(
                     G_model=self.G_model, D_model=self.D_model,
@@ -1356,15 +1351,12 @@ class StyleGAN:
         logging.info(f'Stabilization stage took {format_time(stabilization_stage_total_time)}')
 
     def run_metrics(self, res, mode, n_images):
-        batch_size = self.batch_sizes[2 ** res]
-        # TODO: make sure that weights are shared between full G model and its components
         if self.use_Gs:
-            G_synthesis = self.Gs_object.G_synthesis
-            G_mapping = self.Gs_object.G_mapping
+            G_model = self.Gs_object.create_G_model(res, mode)
         else:
-            G_synthesis = self.G_object.G_synthesis
-            G_mapping = self.G_object.G_mapping
+            G_model = self.G_object.create_G_model(res, mode)
 
+        batch_size = self.batch_sizes[2 ** res]
         n_finished_images = self.get_n_processed_images(res, mode)
         step = n_finished_images + n_images
 
@@ -1375,7 +1367,7 @@ class StyleGAN:
                 metric_name = metric_object.name
 
                 start_time = time.time()
-                metric_value = metric_object.run_metric(batch_size, G_synthesis, G_mapping)
+                metric_value = metric_object.run_metric(batch_size, G_model)
                 total_time = time.time() - start_time
 
                 tf.summary.scalar(f'Metric/{metric_name}', metric_value, step=step)

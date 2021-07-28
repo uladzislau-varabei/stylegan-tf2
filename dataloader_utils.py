@@ -68,7 +68,7 @@ def preprocess_image(image, res, mirror_augment=DEFAULT_MIRROR_AUGMENT, dtype=DE
     image = tf.clip_by_value(image, 0.0, 1.0)
     if mirror_augment:
         # Augmentations
-        if tf.random.uniform(()) > 0.5:
+        if tf.random.uniform([], 0.0, 1.0) > 0.5:
             image = tf.image.flip_left_right(image)
     return image
 
@@ -86,7 +86,8 @@ def load_and_preprocess_image(file_path, res,
     return image
 
 
-def create_training_dataset(fpaths, res, cache, batch_size,
+def create_training_dataset(fpaths, res, batch_size,
+                            cache=None,
                             mirror_augment=DEFAULT_MIRROR_AUGMENT,
                             shuffle_dataset=DEFAULT_SHUFFLE_DATASET,
                             dtype=DEFAULT_DTYPE,
