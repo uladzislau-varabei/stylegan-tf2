@@ -24,13 +24,12 @@ etc.
 
 To train a model one needs to:
 
-1. Define a training config (example in `default_config.json`, all available options and their default values can be found in `utils.py`). 
-   <br>*Note 1:* some values in config are different from original implementation due to memory constraints.
-   <br>*Note 2:* Paths to images should be saved in a separate .txt file, 
+1. Define a training config (see `configs` section for details).<br>
+   *Note:* paths to images should be saved in a separate *.txt* file, 
    which is to be provided under key `images_paths_filename` in config.
 2. Optionally configure gpu memory options (consider **GPU memory usage** section).
 3. Optionally set training mode (consider **Training speed** section).
-4. Start training with command: <br>
+4. Start training with command:
 
 > python train.py --config path_to_config (e.g. --config default_config.json)
 
@@ -38,21 +37,42 @@ To train a model one needs to:
 ## Inference
 
 To run inference consider file `inference.py`. <br>
-Example call: <br>
+Example call:
+
 > python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --image_fname images --grid_cols 12 --grid_rows 9
+
+
+## Configs
+Examples of configs are available in `configs` folder.
+
+Paths to images should be saved in a separate *.txt* file, which is to be provided under key `images_paths_filename` in config.
+
+Configs which were used in the official implementation to train on FFHQ dataset:
+* `paper_config_ffhq_res1024_full.json` - all values, almost all keys have default values
+* `paper_config_ffhq_res1024_short.json` - similar to the previous config except that omitted keys automatically use default values
+* `paper_config_ffhq_res1024_short_fast.json` - similar to the previous config but with all available speed-ups (mixed precision, XLA, fused bias and activation layer) 
+
+*Note*: options related to summaries are not aligned with the values in the official implementation. Set them according to your needs.
+
+For debugging, it's convenient to use `debug_config.json`.
+
+All possible options and their default values can be found in file `utils.py`.
 
 
 ## Training speed
 
 To get maximum performance one should prefer training each model in a separate process (`single_process_training` in `train.py`), 
-as in this case all GPU resources are released after process is finished.  <br>
+as in this case all GPU resources are released after process is finished.
+
 Another way to increase performance is to use mixed precision training, which not just speeds operations up 
-(especially on Nvidia cards with compute capability 7.0 or higher, e.g., Turing or Ampere GPUs), but also allows to increase batch size. <br>
+(especially on Nvidia cards with compute capability 7.0 or higher, e.g., Turing or Ampere GPUs), but also allows to increase batch size.
 
 Some notes about the tricks to enable stable mixed precision training (inspired by one of next papers from the same authors):
 * Enable mixed precision only for the N (set to 4 in the official implementation) highest resolutions;
 * Clamp the output of every convolutional layer to 2^8, i.e., an order of magnitude wider range than is needed in practise;
 * No need to pre-normalize style vector (how to do it and why?) or inputs x (instance norm is used by default).
+
+Enabling XLA (Accelerated Linear Algebra, jit compilation) should improve training speed and memory usage.
 
 Note: when training with mixed precision on LSUN Living Room dataset loss scale became 1 for both (G and D) optimizers
 after about 8.5M images (around 3M for the last train stage). 
@@ -122,7 +142,6 @@ Supported metrics are:
 - Add benchmarks
 - Implement memory efficient `Mish` activation function
 - Change names for images and weights, so that total number of processed images is used
-- Add config similar to the one used in the original implementation
 - Tune settings for *mixed precision* training stabilization tricks
 - Add multi GPU support
 - Fix training in a single process

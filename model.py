@@ -646,7 +646,6 @@ class StyleGAN:
         logging.info(f'Images datasets initialized in {total_time:.3f} seconds!')
 
     def create_images_dataset(self, res, messages=True):
-        # This method is used for training each model in a separate process
         if messages:
             start_time = time.time()
             logging.info(f'Initializing images dataset for {2**res}x{2**res} model...')

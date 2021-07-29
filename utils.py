@@ -74,7 +74,7 @@ BLUR_FILTER = 'blur_filter'
 # Weights data format, NHWC and NCHW are supported
 DATA_FORMAT = 'data_format'
 # Use GPU for smoothed generator?
-# Note: setting this option to False saves GPU memory
+# Note: setting this option to False saves GPU memory (but how effective is this?)
 USE_GPU_FOR_GS = 'use_GPU_for_Gs'
 # Use mixed precision training?
 USE_MIXED_PRECISION = 'use_mixed_precision'
@@ -85,10 +85,9 @@ CONV_CLAMP = 'conv_clamp'
 # Fuse bias and activation?
 FUSED_BIAS_ACT = 'fused_bias_act'
 # Data type
-# Note: it is not recommended to change it to float16, just use float32 and mixed precision training if needed
+# Note: it is highly not recommended to change it to float16, just use float32 and mixed precision training if needed
 DTYPE = 'dtype'
 # Use XLA compiler?
-# Note: currently support is not implemented, so this option has no affect
 USE_XLA = 'use_XLA'
 
 
@@ -284,7 +283,7 @@ DEFAULT_STORAGE_PATH = None
 DEFAULT_MAX_MODELS_TO_KEEP = 3
 DEFAULT_SUMMARY_SCALARS_EVERY_KIMAGES = 5
 DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES = 25
-DEFAULT_SAVE_MODEL_EVERY_KIMAGES = 500
+DEFAULT_SAVE_MODEL_EVERY_KIMAGES = 100
 DEFAULT_SAVE_IMAGES_EVERY_KIMAGES = 5
 DEFAULT_RUN_METRICS_EVERY_KIMAGES = 50
 DEFAULT_METRICS_DICT = {}

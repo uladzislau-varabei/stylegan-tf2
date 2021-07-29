@@ -1,13 +1,12 @@
 {
-    "model_name": "demo_model",
-    "images_paths_filename": "local_living_room_100k.txt",
-    "target_resolution": 256,
+    "model_name": "paper_config_ffhq_res1024_full",
+    "images_paths_filename": "ffhq.txt",
+    "target_resolution": 1024,
     "start_resolution": 8,
     "latent_size": 512,
     "dlatent_size": 512,
     "use_bias": true,
     "use_wscale": true,
-    "truncate_weights": false,
     "blur_filter": [
         1,
         2,
@@ -15,12 +14,10 @@
     ],
     "data_format": "NCHW",
     "use_GPU_for_Gs": true,
-    "use_mixed_precision": true,
-    "num_fp16_resolutions": 4,
-    "conv_clamp": 256,
-    "fused_bias_act": true,
+    "use_mixed_precision": false,
+    "fused_bias_act": false,
     "use_XLA": false,
-    "total_kimages": 20000,
+    "total_kimages": 25000,
     "transition_kimages": 600,
     "stabilization_kimages": 600,
     "transition_kimages_dict": {},
@@ -32,7 +29,9 @@
         "32": 64,
         "64": 32,
         "128": 16,
-        "256": 8
+        "256": 8,
+        "512": 4,
+        "1024": 4
     },
     "batch_repeats": 4,
     "G_loss_fn": "G_logistic_nonsaturating",
@@ -44,12 +43,18 @@
     "D_learning_rate": 0.001,
     "G_learning_rate_dict": {
         "128": 0.0015,
-        "256": 0.002
+        "256": 0.002,
+        "512": 0.003,
+        "1024": 0.003
     },
     "D_learning_rate_dict": {
         "128": 0.0015,
-        "256": 0.002
+        "256": 0.002,
+        "512": 0.003,
+        "1024": 0.003
     },
+    "adam_beta1": 0.0,
+    "adam_beta2": 0.99,
     "reset_opt_state_for_new_lod": true,
     "max_models_to_keep": 5,
     "summary_scalars_every_kimages": 2.5,
@@ -58,11 +63,8 @@
     "save_images_every_kimages": 2.5,
     "run_metrics_every_kimages": 50,
     "metrics": {
-        "PPL": {
-            "num_samples": 20000,
-            "space": "w",
-            "sampling": "full",
-            "crop_face": false
+        "FID": {
+            "num_samples": 50000
         }
     },
     "normalize_latents": true,
@@ -70,6 +72,7 @@
     "mapping_units": 512,
     "mapping_lrmul": 0.01,
     "mapping_activation": "leaky_relu",
+    "mapping_use_bias": true,
     "const_input_layer": true,
     "use_noise": true,
     "randomize_noise": true,
@@ -77,16 +80,18 @@
     "use_instance_norm": true,
     "use_styles": true,
     "G_fused_scale": true,
-    "G_weights_init_mode": null,
     "G_activation": "leaky_relu",
     "G_kernel_size": 3,
     "G_fmap_base": 8192,
     "G_fmap_max": 512,
     "use_G_smoothing": true,
-    "G_smoothed_beta": null,
+    "G_smoothed_beta_kimages": 10.0,
     "override_G_projecting_gain": true,
+    "truncation_psi": 0.7,
+    "truncation_cutoff": 8,
+    "dlatent_avg_beta": 0.995,
+    "style_mixing prob": 0.9,
     "D_fused_scale": true,
-    "D_weights_init_mode": null,
     "D_activation": "leaky_relu",
     "D_kernel_size": 3,
     "D_fmap_base": 8192,
@@ -95,8 +100,7 @@
     "mbstd_num_features": 1,
     "dataset_n_parallel_calls": 6,
     "dataset_n_prefetched_batches": 4,
-    "dataset_max_kimages": 100,
+    "dataset_max_kimages": -1,
     "shuffle_dataset": true,
-    "mirror_augment": true,
-    "dataset_max_cache_res": null
+    "mirror_augment": true
 }
