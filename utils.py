@@ -39,6 +39,7 @@ LECUN_INIT = 'LeCun'
 
 TRAIN_MODE = 'training'
 INFERENCE_MODE = 'inference'
+BENCHMARK_MODE = 'benchmark'
 DEFAULT_MODE = INFERENCE_MODE
 
 
@@ -380,9 +381,31 @@ GAIN_ACTIVATION_FUNS_DICT = {
     'silu': HE_GAIN,
     'gelu': HE_GAIN,
     'mish': HE_GAIN,
+    # The same 2 functions
+    'hard_mish': HE_GAIN,
+    'hmish': HE_GAIN,
+    # The same 2 functions
+    'hard_swish': HE_GAIN,
+    'hswish': HE_GAIN,
     # A special gain is to be used by default
     'selu': LECUN_GAIN
 }
+
+
+def mish(features):
+    features = tf.convert_to_tensor(features, name="features")
+    return features * tf.nn.tanh(tf.nn.softplus(features))
+
+
+def hard_mish(features):
+    features = tf.convert_to_tensor(features, name="features")
+    return tf.minimum(2., tf.nn.relu(features + 2.)) * 0.5 * features
+
+
+def hard_swish(features):
+    features = tf.convert_to_tensor(features, name="features")
+    return features * tf.nn.relu6(features + 3.) * 0.16666667
+
 
 ACTIVATION_FUNS_DICT = {
     'linear':     lambda x: x,
@@ -395,7 +418,13 @@ ACTIVATION_FUNS_DICT = {
     'swish':      lambda x: tf.nn.swish(x),
     'silu':       lambda x: tf.nn.swish(x),
     'gelu':       lambda x: tf.nn.gelu(x, approximate=False),
-    'mish':       lambda x: x * tf.nn.tanh(tf.nn.softplus(x))
+    'mish':       lambda x: mish(x),
+    # The same 2 functions
+    'hard_mish':  lambda x: hard_mish(x),
+    'hmish':      lambda x: hard_mish(x),
+    # The same 2 functions
+    'hard_swish': lambda x: hard_swish(x),
+    'hswish':     lambda x: hard_swish(x)
 }
 
 # Activation function which (might?) need to use float32 dtype
@@ -615,7 +644,6 @@ def custom_unscale_grads(grads, vars, optimizer: tf.keras.mixed_precision.LossSc
     # Note: works inside tf.function
     # All grads are casted to fp32
     dtype = tf.float32
-    # TODO: check if it should be optimizer.loss_scale or optimizer._loss_scale()
     coef = fp32(1. / optimizer.loss_scale)
 
     def unscale_grad(g, v):
@@ -681,7 +709,7 @@ def prepare_gpu(mode='auto', memory_limit=None):
 
     # Note: change this number based on your GPU
     if memory_limit is None:
-        memory_limit = 7500
+        memory_limit = 7700
     set_memory_growth = False
     set_memory_limit = False
 
@@ -745,7 +773,7 @@ def prepare_gpu(mode='auto', memory_limit=None):
 h5_weights_key = 'weights'
 
 
-def weights_to_dict(model, optimizer_call=False):
+def weights_to_dict(model, optimizer_call: bool = False):
     vars = model.trainable_variables if not optimizer_call else model.weights
     if should_log_debug_info():
         print('\nSaving weights:')
@@ -768,7 +796,7 @@ def load_model_weights_from_dict(model, weights_dict):
     return model
 
 
-def save_weights(weights_dict, filename):
+def save_weights(weights_dict, filename: str):
     f = h5py.File(filename, 'w')
     g = f.create_group(h5_weights_key)
 
@@ -776,8 +804,6 @@ def save_weights(weights_dict, filename):
         value = weights_dict[var_name]
         shape = value.shape
         dset = g.create_dataset(name=var_name, shape=shape, dtype=value.dtype.name)
-        # TODO: for debugging, remove later
-        # print(f'{idx}) {var_name}: {value.mean():.4f}, std={value.std():.4f}')
         if not shape:
             # Scalar
             dset[()] = value
@@ -788,7 +814,7 @@ def save_weights(weights_dict, filename):
     f.close()
 
 
-def load_weights_into_dict(var_names, filename):
+def load_weights_into_dict(var_names, filename: str):
     f = h5py.File(filename, 'r')
     g = f[h5_weights_key]
 
@@ -805,7 +831,7 @@ def load_weights_into_dict(var_names, filename):
     return var_dict
 
 
-def load_weights(model, filename, optimizer_call=False):
+def load_weights(model, filename, optimizer_call: bool = False):
     vars = model.trainable_variables if not optimizer_call else model.weights
     var_names = [var.name for var in vars]
     var_dict = load_weights_into_dict(var_names, filename)
@@ -828,12 +854,12 @@ def load_weights(model, filename, optimizer_call=False):
     return model
 
 
-def create_model_dir_path(model_name, res, stage, step=None, storage_path=DEFAULT_STORAGE_PATH):
+def create_model_dir_path(model_name, res, stage, step=None, storage_path: str = DEFAULT_STORAGE_PATH):
     """
     model_name - name of configuration model
     res - current resolution
     stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of steps (or processed images) for given resolution and stage
+    step - number of all processed images for given resolution and stage
     storage_path - optional prefix path
     """
     res_dir = f'{2**res}x{2**res}'
@@ -848,7 +874,7 @@ def create_model_dir_path(model_name, res, stage, step=None, storage_path=DEFAUL
 
 
 def save_model(model, model_name, model_type, res,
-               stage, step, storage_path=DEFAULT_STORAGE_PATH):
+               stage, step, storage_path: str = DEFAULT_STORAGE_PATH):
     """
     model - a model to be saved
     model_name - name of configuration model
@@ -856,7 +882,7 @@ def save_model(model, model_name, model_type, res,
                  used as a separate dir level
     res - current log2 resolution
     stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of steps (or processed images) for given resolution and stage
+    step - number of all processed images for given resolution and stage
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of saving model
     """
@@ -890,7 +916,7 @@ def save_optimizer_loss_scale(optimizer: tf.keras.mixed_precision.LossScaleOptim
                  used as a separate dir level
     res - current log2 resolution
     stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of steps (or processed images) for given resolution and stage
+    step - number of all processed images for given resolution and stage
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of saving model
     """
@@ -916,14 +942,14 @@ def save_optimizer_loss_scale(optimizer: tf.keras.mixed_precision.LossScaleOptim
 
 
 def load_model(model, model_name, model_type, res,
-               stage, step, storage_path=DEFAULT_STORAGE_PATH):
+               stage, step, storage_path: str = DEFAULT_STORAGE_PATH):
     """
     model - a model to be loaded
     model_name - name of configuration model
     model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME], used as a separate dir level
     res - current log2 resolution
     stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of steps (or processed images) for given resolution and stage
+    step - number of all processed images for given resolution and stage
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of loading model
     """
@@ -955,7 +981,7 @@ def load_optimizer_loss_scale(model_name: str, model_type: str, res: int, stage:
                  used as a separate dir level
     res - current log2 resolution
     stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of steps (or processed images) for given resolution and stage
+    step - number of all processed images for given resolution and stage
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of saving model
     """
@@ -980,7 +1006,7 @@ def load_optimizer_loss_scale(model_name: str, model_type: str, res: int, stage:
     return loss_scale
 
 
-def remove_old_models(model_name, res, stage, max_models_to_keep, storage_path=DEFAULT_STORAGE_PATH):
+def remove_old_models(model_name, res, stage, max_models_to_keep: int, storage_path: str = DEFAULT_STORAGE_PATH):
     """
     model_name - name of configuration model
     model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME],

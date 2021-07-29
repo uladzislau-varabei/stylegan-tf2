@@ -48,9 +48,9 @@ Examples of configs are available in `configs` folder.
 Paths to images should be saved in a separate *.txt* file, which is to be provided under key `images_paths_filename` in config.
 
 Configs which were used in the official implementation to train on FFHQ dataset:
-* `paper_config_ffhq_res1024_full.json` - all values, almost all keys have default values
-* `paper_config_ffhq_res1024_short.json` - similar to the previous config except that omitted keys automatically use default values
-* `paper_config_ffhq_res1024_short_fast.json` - similar to the previous config but with all available speed-ups (mixed precision, XLA, fused bias and activation layer) 
+* `paper_config_ffhq_res1024_full.json` — all values, almost all keys have default values;
+* `paper_config_ffhq_res1024_short.json` — similar to the previous config except that omitted keys automatically use default values;
+* `paper_config_ffhq_res1024_short_fast.json` — similar to the previous config but with all available speed-ups (mixed precision, XLA, fused bias and activation layer). 
 
 *Note*: options related to summaries are not aligned with the values in the official implementation. Set them according to your needs.
 
@@ -92,7 +92,7 @@ By default, on Linux `memory_growth` option is used, while on Windows memory is 
 
 ## System requirements
 
-* The code was tested on Windows and Linux (will be later, I hope). 
+* The code was tested on Windows (and will be on Linux later, I hope). 
 * The following software should be installed on your machine:
 ```
 - NVIDIA driver 461.92 or newer
@@ -139,9 +139,7 @@ Supported metrics are:
 ## Further improvements
 
 - Add CUDA implementations for fused layers
-- Add benchmarks
 - Implement memory efficient `Mish` activation function
-- Change names for images and weights, so that total number of processed images is used
 - Tune settings for *mixed precision* training stabilization tricks
 - Add multi GPU support
 - Fix training in a single process

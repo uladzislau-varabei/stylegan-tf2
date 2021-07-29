@@ -484,7 +484,6 @@ class Generator:
                     wsum_dtype = layer_dtype(WSUM_NAME, use_fp16)
                     images_out = WeightedSum(dtype=wsum_dtype, name=wsum_name)([images1, images2])
 
-            # TODO: think about training models in the same process. Maybe save synthesis networks in a dict?
             self.G_synthesis = tf.keras.Model(
                 self.dlatents, tf.identity(images_out, name='images_out'), name='G_synthesis'
             )
@@ -724,7 +723,6 @@ class Discriminator:
                     x = self.from_rgb(inputs, model_res)
                     x = self.D_block(x, model_res)
                 elif mode == TRANSITION_MODE:
-                    # TODO: fix dtypes for images and wsum
                     # Last input layers
                     use_fp16 = should_use_fp16(model_res - 1, self.start_fp16_resolution_log2, self.use_mixed_precision)
                     x1 = self.downscale2d(inputs, use_fp16=use_fp16)
@@ -735,7 +733,8 @@ class Discriminator:
                     # Merge features
                     lod = level_of_details(model_res, self.resolution_log2)
                     wsum_name = f'D_{WSUM_NAME}_lod{lod}'
-                    wsum_dtype = layer_dtype(WSUM_NAME, use_fp16)
+                    wsum_use_fp16 = should_use_fp16(model_res, self.start_fp16_resolution_log2, self.use_mixed_precision)
+                    wsum_dtype = layer_dtype(WSUM_NAME, wsum_use_fp16)
                     x = WeightedSum(dtype=wsum_dtype, name=wsum_name)([x1, x2])
 
                 for res in range(model_res - 1, 2 - 1, -1):

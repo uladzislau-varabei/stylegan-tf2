@@ -10,12 +10,12 @@ from image_utils import fast_save_grid
 from utils import INFERENCE_MODE, \
     LATENT_SIZE, DEFAULT_VALID_GRID_NROWS, DEFAULT_VALID_GRID_NCOLS,\
     DATA_FORMAT, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WEIGHTS_DIR
-from utils import load_config, prepare_gpu, load_weights, generate_latents
+from utils import load_config, prepare_gpu, load_weights, generate_latents, to_z_dim
 from model import StyleGAN
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Script to train Progressive GAN model')
+    parser = argparse.ArgumentParser(description='Script to run inference for StyleGAN model')
     parser.add_argument(
         '--config_path',
         help='Path to a config of a model to train (json format)',
@@ -59,10 +59,7 @@ def generate_images(model: tf.keras.Model, config: dict):
 
     latent_size = config[LATENT_SIZE]
     data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    if data_format == NCHW_FORMAT:
-        z_dim = (latent_size, 1, 1)
-    else: # dat_format == NHWC
-        z_dim = (1, 1, latent_size)
+    z_dim = to_z_dim(latent_size, data_format)
 
     # Try dealing with a case when lots of images are to be generated
     if grid_cols * grid_rows < 32:
@@ -95,7 +92,7 @@ def extract_res_and_stage(p):
 
 if __name__ == '__main__':
     # Example call:
-    #
+    # python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --image_fname images --grid_cols 12 --grid_rows 9
     args = parse_args()
 
     config = load_config(args.config_path)

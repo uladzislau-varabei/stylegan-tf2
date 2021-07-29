@@ -603,7 +603,7 @@ class MinibatchStdDev(Layer):
             # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c
             y = tf.reshape(x, [group_size, -1, self.num_new_features, c // self.num_new_features, h, w])
             y = tf.cast(y, tf.float32)                           # [GMncHW] Cast to fp32
-            y -= tf.math.reduce_mean(y, axis=0, keepdims=True)   # [GMncHW] Subtract mean over group
+            y -= tf.reduce_mean(y, axis=0, keepdims=True)        # [GMncHW] Subtract mean over group
             y = tf.reduce_mean(tf.square(y), axis=0)             # [MncHW] Variance over group
             y = tf.sqrt(y + 1e-8)                                # [MncHW] Stddev over group
             y = tf.reduce_mean(y, axis=[2, 3, 4], keepdims=True) # [Mn111] Average over fmaps and pixels
@@ -618,7 +618,7 @@ class MinibatchStdDev(Layer):
             # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c
             y = tf.reshape(x, [group_size, -1, h, w, self.num_new_features, c // self.num_new_features])
             y = tf.cast(y, tf.float32)                           # [GMHWnc] Cast to fp32
-            y -= tf.math.reduce_mean(y, axis=0, keepdims=True)   # [GMHWnc] Subtract mean over group
+            y -= tf.reduce_mean(y, axis=0, keepdims=True)        # [GMHWnc] Subtract mean over group
             y = tf.reduce_mean(tf.square(y), axis=0)             # [MHWnc] Variance over group
             y = tf.sqrt(y + 1e-8)                                # [MHWnc] Stddev over group
             y = tf.reduce_mean(y, axis=[1, 2, 4], keepdims=True) # [M11n1] Average over fmaps and pixels
@@ -641,8 +641,8 @@ class WeightedSum(Layer):
             experimental_autocast=False
         )
         self.one = tf.constant(1., dtype=self._dtype_policy.compute_dtype, name='One')
+        self.call = tf.function(self.call)
 
-    # Avoid using tf.function or alpha will be compiled (if it not set as non trainable weight)
     def call(self, inputs, *args, **kwargs):
         return (self.one - self.alpha) * inputs[0] + self.alpha * inputs[1]
 
