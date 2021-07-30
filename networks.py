@@ -224,7 +224,7 @@ class GeneratorStyle(tf.keras.Model):
     def apply_truncation_trick(self, dlatents):
         return lerp(self.dlatent_avg, dlatents, self.truncation_coefs)
 
-    def call(self, latents, training=True, validation=False, truncation_psi=None, *args, **kwargs):
+    def call(self, latents, training=True, validation=False, truncation_psi=None, truncation_cutoff=None, *args, **kwargs):
         # 1. Decide which actions to perform based on training/testing/validation.
         # Validation is used for metrics evaluation. Testing for generation of images
         assert not (training and validation), "Model can't use training and validation modes at the same time"
@@ -233,7 +233,7 @@ class GeneratorStyle(tf.keras.Model):
             truncation_cutoff = None
         else:
             truncation_psi = self.truncation_psi if truncation_psi is None else truncation_psi
-            truncation_cutoff = self.truncation_cutoff
+            truncation_cutoff = self.truncation_cutoff if truncation_cutoff is None else truncation_cutoff
 
         should_update_dlatent_avg = (self.dlatent_avg_beta is not None) and training
         should_apply_style_mixing = (self.style_mixing_prob is not None) and training

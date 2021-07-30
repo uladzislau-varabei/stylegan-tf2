@@ -39,7 +39,7 @@ To train a model one needs to:
 To run inference consider file `inference.py`. <br>
 Example call:
 
-> python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --image_fname images --grid_cols 12 --grid_rows 9
+> python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --image_fname images --grid_cols 4 --grid_rows 3
 
 
 ## Configs
@@ -139,7 +139,7 @@ Supported metrics are:
 ## Further improvements
 
 - Add CUDA implementations for fused layers
-- Implement memory efficient `Mish` activation function
+- Add summaries with memory usage
 - Tune settings for *mixed precision* training stabilization tricks
 - Add multi GPU support
 - Fix training in a single process

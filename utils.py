@@ -392,19 +392,37 @@ GAIN_ACTIVATION_FUNS_DICT = {
 }
 
 
-def mish(features):
-    features = tf.convert_to_tensor(features, name="features")
-    return features * tf.nn.tanh(tf.nn.softplus(features))
+@tf.custom_gradient
+def mish(x):
+    x = tf.convert_to_tensor(x, name="features")
+
+    # Inspired by source code for tf.nn.swish
+    def grad(dy):
+        """ Gradient for the Mish activation function"""
+        # Naively, x * tf.nn.tanh(tf.nn.softplus(x)) requires keeping both
+        # x and tf.nn.tanh(tf.nn.softplus(x)) around for backprop,
+        # effectively doubling the tensor's memory consumption.
+        # We use a control dependency here so that tanh(softplus(x)) is re-computed
+        # during backprop (the control dep prevents it being de-duped with the
+        # forward pass) and we can free the tanh(softplus(x)) expression immediately
+        # after use during the forward pass.
+        with tf.control_dependencies([dy]):
+            x_tanh_sp = tf.nn.tanh(tf.nn.softplus(x))
+        x_sigmoid = tf.nn.sigmoid(x)
+        activation_grad = x_tanh_sp + x * x_sigmoid * (1.0 - x_tanh_sp * x_tanh_sp)
+        return dy * activation_grad
+
+    return x * tf.nn.tanh(tf.nn.softplus(x)), grad
 
 
-def hard_mish(features):
-    features = tf.convert_to_tensor(features, name="features")
-    return tf.minimum(2., tf.nn.relu(features + 2.)) * 0.5 * features
+def hard_mish(x):
+    x = tf.convert_to_tensor(x, name="features")
+    return tf.minimum(2.0, tf.nn.relu(x + 2.0)) * 0.5 * x
 
 
-def hard_swish(features):
-    features = tf.convert_to_tensor(features, name="features")
-    return features * tf.nn.relu6(features + 3.) * 0.16666667
+def hard_swish(x):
+    x = tf.convert_to_tensor(x, name="features")
+    return x * tf.nn.relu6(x + 3.0) * 0.16666667
 
 
 ACTIVATION_FUNS_DICT = {
@@ -595,6 +613,24 @@ def adjust_clamp(clamp, use_fp16):
 
 #----------------------------------------------------------------------------
 # Tf utils.
+
+
+def print_gpu_memory_usage():
+    import math
+    def convert_size(size_bytes):
+        if size_bytes == 0:
+            return "0B"
+        size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+        i = int(math.floor(math.log(size_bytes, 1024)))
+        p = math.pow(1024, i)
+        s = round(size_bytes / p, 2)
+        return "%s %s" % (s, size_name[i])
+
+    for device in tf.config.experimental.list_logical_devices('GPU'):
+        print(
+            {k: convert_size(v) for k, v in tf.config.experimental.get_memory_info(device.name).items()}
+        )
+
 
 def generate_latents(batch_size: int, z_dim: list, dtype=tf.float32):
     return tf.random.normal(shape=[batch_size] + z_dim, mean=0., stddev=1., dtype=dtype)

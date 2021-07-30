@@ -9,7 +9,8 @@ from dataloader_utils import convert_outputs_to_images
 from image_utils import fast_save_grid
 from utils import INFERENCE_MODE, \
     LATENT_SIZE, DEFAULT_VALID_GRID_NROWS, DEFAULT_VALID_GRID_NCOLS,\
-    DATA_FORMAT, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WEIGHTS_DIR
+    DATA_FORMAT, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WEIGHTS_DIR,\
+    TRUNCATION_PSI, DEFAULT_TRUNCATION_PSI, TRUNCATION_CUTOFF, DEFAULT_TRUNCATION_CUTOFF
 from utils import load_config, prepare_gpu, load_weights, generate_latents, to_z_dim
 from model import StyleGAN
 
@@ -27,7 +28,23 @@ def parse_args():
         help='Path to a model weights',
         required=True
     )
-    # Image options
+    # Network options
+    parser.add_argument(
+        '--truncation_psi',
+        help='Style strength multiplier for the truncation trick, if not provided, value from config is used',
+        default=None
+    )
+    parser.add_argument(
+        '--truncation_cutoff',
+        help='Number of layers for which to apply the truncation trick, if not provided, value from config is used',
+        default=None
+    )
+    parser.add_argument(
+        '--disable_truncation',
+        help='Save generated image in jpg? If not provided, png will be used',
+        action='store_true'
+    )
+    # Image grid options
     parser.add_argument(
         '--image_fname',
         help='Filename for generated image',
@@ -47,14 +64,15 @@ def parse_args():
     )
     parser.add_argument(
         '--save_in_jpg',
-        help='Save generated image in jpg? If not, png will be used',
-        default=True
+        help='Save generated image in jpg? If not provided, png will be used',
+        action='store_true'
     )
     args = parser.parse_args()
     return args
 
 
-def generate_images(model: tf.keras.Model, config: dict):
+
+def generate_images(model: tf.keras.Model, truncation_psi: float, truncation_cutoff: int, config: dict):
     start_time = time.time()
 
     latent_size = config[LATENT_SIZE]
@@ -71,7 +89,7 @@ def generate_images(model: tf.keras.Model, config: dict):
     for _ in range(iters):
         batch_latents = generate_latents(batch_size, z_dim)
         images.append(
-            model(batch_latents, training=False)
+            model(batch_latents, training=False, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
         )
     images = tf.concat(images, axis=0)
     images = convert_outputs_to_images(images, 2 ** res, data_format=data_format).numpy()
@@ -90,14 +108,37 @@ def extract_res_and_stage(p):
     return res, stage
 
 
+def get_truncation_values(args, config):
+    disable_truncation = args.disable_truncation
+    if disable_truncation:
+        truncation_psi = None
+        truncation_cutoff = None
+    else:
+        truncation_psi = args.truncation_psi
+        if truncation_psi is None:
+            truncation_psi = config.get(TRUNCATION_PSI, DEFAULT_TRUNCATION_PSI)
+        truncation_cutoff = args.truncation_cutoff
+        if truncation_cutoff is None:
+            truncation_cutoff = config.get(TRUNCATION_CUTOFF, DEFAULT_TRUNCATION_CUTOFF)
+    return truncation_psi, truncation_cutoff
+
+
 if __name__ == '__main__':
-    # Example call:
-    # python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --image_fname images --grid_cols 12 --grid_rows 9
+    """
+    ----- Example calls -----
+    
+    1) Disable truncation trick and save output image in jpg
+    python .\inference.py --config_path .\configs\lsun_living_room.json --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --disable_truncation --image_fname images --grid_cols 12 --grid_rows 9 --save_in_jpg
+    
+    2) Provide options values for truncation trick (skip to use default ones from config) and save output image in png
+    python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --truncation_psi 0.7 --truncation_cutoff 8  --image_fname images --grid_cols 4 --grid_rows 3
+    """
     args = parse_args()
 
     config = load_config(args.config_path)
     res, stage = extract_res_and_stage(args.weights_path)
     weights_path = args.weights_path
+    truncation_psi, truncation_cutoff = get_truncation_values(args, config)
 
     # Grid image options
     image_fname = args.image_fname
@@ -109,7 +150,7 @@ if __name__ == '__main__':
     StyleGAN_model = StyleGAN(config, mode=INFERENCE_MODE, res=res, stage=stage)
     Gs_model = StyleGAN_model.Gs_object.create_G_model(model_res=res, mode=stage)
     Gs_model = load_weights(Gs_model, weights_path, optimizer_call=False)
-    images = generate_images(Gs_model, config)
+    images = generate_images(Gs_model, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, config=config)
 
     out_dir = 'results'
     if not os.path.exists(out_dir):
