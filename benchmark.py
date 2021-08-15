@@ -3,8 +3,8 @@ import argparse
 
 import numpy as np
 
-from utils import BENCHMARK_MODE
-from utils import load_config, prepare_gpu, STABILIZATION_MODE, TRANSITION_MODE, TARGET_RESOLUTION
+from config import Config as cfg
+from utils import load_config, prepare_gpu, STABILIZATION_MODE, TRANSITION_MODE, BENCHMARK_MODE
 from model import StyleGAN
 
 
@@ -49,13 +49,13 @@ if __name__ == '__main__':
 
     # Determine res and stage of model
     if res == -1:
-        res = int(np.log2(config[TARGET_RESOLUTION]))
+        res = int(np.log2(config[cfg.TARGET_RESOLUTION]))
         stage = STABILIZATION_MODE
     else:
         res = int(np.log2(res))
         stage = TRANSITION_MODE if transition_stage else STABILIZATION_MODE
 
-    prepare_gpu()
+    prepare_gpu(mode='growth')
     StyleGAN_model = StyleGAN(config, mode=BENCHMARK_MODE, res=res, stage=stage)
     # Note: script benchmarks only model training time, metrics and other post train step actions are not run
     StyleGAN_model.run_benchmark_stage(res, stage, images)

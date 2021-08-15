@@ -3,21 +3,20 @@ import tensorflow as tf
 from tensorflow.keras.layers import Layer, Activation
 from tensorflow.keras import mixed_precision
 
-from utils import DEFAULT_DTYPE, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WSUM_NAME, RANDOMIZE_NOISE_VAR_NAME,\
-    validate_data_format, HE_GAIN, DEFAULT_USE_WSCALE, DEFAULT_TRUNCATE_WEIGHTS, DEFAULT_USE_XLA
-
-# Config constants
-from utils import ACTIVATION_FUNS_DICT, FP32_ACTIVATIONS, USE_MIXED_PRECISION, USE_WSCALE, TRUNCATE_WEIGHTS,\
-    DATA_FORMAT, RANDOMIZE_NOISE, BLUR_FILTER, USE_BIAS, USE_XLA, MBSTD_GROUP_SIZE, MBSTD_NUM_FEATURES, \
-    DEFAULT_USE_MIXED_PRECISION, DEFAULT_RANDOMIZE_NOISE, DEFAULT_BLUR_FILTER, DEFAULT_USE_BIAS,\
-    DEFAULT_MBSTD_NUM_FEATURES
-
+from config import Config as cfg
+from utils import ACTIVATION_FUNS_DICT, FP32_ACTIVATIONS,\
+    DEFAULT_DATA_FORMAT, NCHW_FORMAT, WSUM_NAME, RANDOMIZE_NOISE_VAR_NAME, HE_GAIN,\
+    validate_data_format
 
 LRMUL = 1.
 
 WEIGHTS_NAME = 'weights'
 BIASES_NAME = 'biases'
 
+DEFAULT_USE_WSCALE       = cfg.DEFAULT_USE_WSCALE
+DEFAULT_TRUNCATE_WEIGHTS = cfg.DEFAULT_TRUNCATE_WEIGHTS
+DEFAULT_DTYPE            = cfg.DEFAULT_DTYPE
+DEFAULT_USE_XLA          = cfg.DEFAULT_USE_XLA
 
 #----------------------------------------------------------------------------
 # Utils.
@@ -764,7 +763,7 @@ class Fused_ScaledConv2d_Downscale2d(Layer):
         return tf.nn.conv2d(x, w, strides=self.strides, padding='SAME', data_format=self.data_format)
 
 
-# See https://www.tensorflow.org/probability/api_docs/python/tfp/math/clip_by_value_preserve_gradient?hl=ru
+# See https://www.tensorflow.org/probability/api_docs/python/tfp/math/clip_by_value_preserve_gradient
 def clip_by_value_preserve_gradient(t, clip_value_min, clip_value_max, name=None):
     with tf.name_scope(name or 'clip_by_value_preserve_gradient'):
         return t + tf.stop_gradient(tf.clip_by_value(t, clip_value_min, clip_value_max) - t)
@@ -866,7 +865,7 @@ def layer_dtype(layer_type, use_fp16=None, act_name=None, config=None):
     if use_fp16 is not None:
         use_mixed_precision = use_fp16
     else:
-        use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
+        use_mixed_precision = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
 
     if use_mixed_precision:
         policy = mixed_precision.Policy('mixed_float16')
@@ -890,10 +889,10 @@ def layer_dtype(layer_type, use_fp16=None, act_name=None, config=None):
 
 
 def dense_layer(x, units, gain, lrmul=LRMUL, use_fp16=None, scope='', config=None):
-    use_wscale = config.get(USE_WSCALE, DEFAULT_USE_WSCALE)
-    truncate_weights = config.get(TRUNCATE_WEIGHTS, DEFAULT_TRUNCATE_WEIGHTS)
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    use_wscale = config.get(cfg.USE_WSCALE, cfg.DEFAULT_USE_WSCALE)
+    truncate_weights = config.get(cfg.TRUNCATE_WEIGHTS, cfg.DEFAULT_TRUNCATE_WEIGHTS)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('dense', use_fp16=use_fp16)
     return ScaledLinear(
         units=units, gain=gain,
@@ -906,10 +905,10 @@ def conv2d_layer(x, fmaps, kernel_size, gain, lrmul=LRMUL,
                  fused_up=False, fused_down=False, use_fp16=None, scope='', config=None):
     assert not (fused_up and fused_down)
 
-    use_wscale = config.get(USE_WSCALE, DEFAULT_USE_WSCALE)
-    truncate_weights = config.get(TRUNCATE_WEIGHTS, DEFAULT_TRUNCATE_WEIGHTS)
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    use_wscale = config.get(cfg.USE_WSCALE, cfg.DEFAULT_USE_WSCALE)
+    truncate_weights = config.get(cfg.TRUNCATE_WEIGHTS, cfg.DEFAULT_TRUNCATE_WEIGHTS)
+    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('conv2d', use_fp16=use_fp16)
 
     layer_kwargs = {
@@ -934,8 +933,8 @@ def conv2d_layer(x, fmaps, kernel_size, gain, lrmul=LRMUL,
 
 
 def bias_layer(x, lrmul=LRMUL, use_fp16=None, scope='', config=None):
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('bias', use_fp16=use_fp16)
     return Bias(lrmul=lrmul, dtype=policy, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
@@ -953,8 +952,8 @@ def act_layer(x, act_name, use_fp16=None, scope='', config=None):
 
 
 def fused_bias_act_layer(x, act_name, use_bias, lrmul=LRMUL, clamp=None, use_fp16=None, scope='', config=None):
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('bias', use_fp16=use_fp16)
     return Fused_Bias_Act(
         use_bias=use_bias, act_name=act_name, lrmul=lrmul, clamp=clamp,
@@ -963,7 +962,7 @@ def fused_bias_act_layer(x, act_name, use_bias, lrmul=LRMUL, clamp=None, use_fp1
 
 
 def clip_layer(x, clamp, scope='', config=None):
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     return Clip(clamp, use_xla=use_xla, scope=scope)(x)
 
 
@@ -980,47 +979,47 @@ def bias_act_layer(x, act_name, use_bias, lrmul=LRMUL, clamp=None, use_fp16=None
 
 
 def const_layer(x, channel_size, use_fp16=None, scope='', config=None):
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('const', use_fp16=use_fp16)
     return Const(channel_size=channel_size, dtype=policy, data_format=data_format, scope=scope)(x)
 
 
 def noise_layer(x, use_fp16=None, scope='', config=None):
-    randomize_noise = config.get(RANDOMIZE_NOISE, DEFAULT_RANDOMIZE_NOISE)
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    randomize_noise = config.get(cfg.RANDOMIZE_NOISE, cfg.DEFAULT_RANDOMIZE_NOISE)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('noise', use_fp16=use_fp16)
     return Noise(randomize_noise=randomize_noise, dtype=policy, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
 
 def blur_layer(x, use_fp16=None, scope='', config=None):
-    blur_filter = config.get(BLUR_FILTER, DEFAULT_BLUR_FILTER)
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    blur_filter = config.get(cfg.BLUR_FILTER, cfg.DEFAULT_BLUR_FILTER)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('blur2d', use_fp16=use_fp16)
     return Blur2d(filter=blur_filter, dtype=dtype, scope=scope, use_xla=use_xla, data_format=data_format)(x)
 
 
 def pixel_norm_layer(x, use_fp16=None, scope='', config=None):
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('pixel_norm', use_fp16=use_fp16)
     return PixelNorm(dtype=dtype, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
 
 def instance_norm_layer(x, use_fp16=None, scope='', config=None):
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('instance_norm', use_fp16=use_fp16)
     return InstanceNorm(dtype=dtype, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
 
 def style_mod_layer(x, dlatents, use_fp16=None, scope='', config=None):
-    use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
-    use_wscale = config.get(USE_WSCALE, DEFAULT_USE_WSCALE)
-    truncate_weights = config.get(TRUNCATE_WEIGHTS, DEFAULT_TRUNCATE_WEIGHTS)
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    use_bias = config.get(cfg.USE_BIAS, cfg.DEFAULT_USE_BIAS)
+    use_wscale = config.get(cfg.USE_WSCALE, cfg.DEFAULT_USE_WSCALE)
+    truncate_weights = config.get(cfg.TRUNCATE_WEIGHTS, cfg.DEFAULT_TRUNCATE_WEIGHTS)
+    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('style_mod', use_fp16=use_fp16)
     return StyleMod(
         use_bias=use_bias, use_wscale=use_wscale, truncate_weights=truncate_weights,
@@ -1029,23 +1028,23 @@ def style_mod_layer(x, dlatents, use_fp16=None, scope='', config=None):
 
 
 def downscale2d_layer(x, factor, use_fp16=None, config=None):
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('downscale2d', use_fp16=use_fp16)
     return Downscale2d(factor=factor, dtype=dtype, data_format=data_format)(x)
 
 
 def upscale2d_layer(x, factor, use_fp16=None, config=None):
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('upscale2d', use_fp16=use_fp16)
     return Upscale2d(factor=factor, dtype=dtype, use_xla=use_xla, data_format=data_format)(x)
 
 
 def minibatch_stddev_layer(x, use_fp16=None, scope='', config=None):
-    group_size = config.get(MBSTD_GROUP_SIZE, 4)
-    num_new_features = config.get(MBSTD_NUM_FEATURES, DEFAULT_MBSTD_NUM_FEATURES)
-    use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    group_size = config.get(cfg.MBSTD_GROUP_SIZE, 4)
+    num_new_features = config.get(cfg.MBSTD_NUM_FEATURES, cfg.DEFAULT_MBSTD_NUM_FEATURES)
+    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('minibatch_stddev', use_fp16=use_fp16)
     return MinibatchStdDev(
         group_size=group_size, num_new_features=num_new_features,

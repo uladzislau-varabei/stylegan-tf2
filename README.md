@@ -56,7 +56,7 @@ Configs which were used in the official implementation to train on FFHQ dataset:
 
 For debugging, it's convenient to use `debug_config.json`.
 
-All possible options and their default values can be found in file `utils.py`.
+All possible options and their default values can be found in file `config.py`.
 
 
 ## Training speed
@@ -139,10 +139,8 @@ Supported metrics are:
 ## Further improvements
 
 - Add CUDA implementations for fused layers
-- Add summaries with memory usage
 - Tune settings for *mixed precision* training stabilization tricks
 - Add multi GPU support
 - Fix training in a single process
 - Fix problems with name scopes inside `tf.function()`. 
-  The current solution relies on the answer by `demmerichs`: https://github.com/tensorflow/tensorflow/issues/36464 
-  
+  The current solution relies on the answer by `demmerichs`: https://github.com/tensorflow/tensorflow/issues/36464

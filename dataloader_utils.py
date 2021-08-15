@@ -3,11 +3,15 @@ import logging
 
 import tensorflow as tf
 
+from config import Config as cfg
 from utils import DEFAULT_DTYPE, DEFAULT_DATA_FORMAT, NCHW_FORMAT,\
-    DEFAULT_DATASET_N_PARALLEL_CALLS, DEFAULT_DATASET_N_PREFETCHED_BATCHES,\
-    DEFAULT_SHUFFLE_DATASET, DEFAULT_MIRROR_AUGMENT, validate_data_format
+    validate_data_format
 
-MAX_CACHE_RESOLUTION = 7
+DEFAULT_DATASET_N_PARALLEL_CALLS     = cfg.DEFAULT_DATASET_N_PARALLEL_CALLS
+DEFAULT_DATASET_N_PREFETCHED_BATCHES = cfg.DEFAULT_DATASET_N_PREFETCHED_BATCHES
+DEFAULT_SHUFFLE_DATASET              = cfg.DEFAULT_SHUFFLE_DATASET
+DEFAULT_MIRROR_AUGMENT               = cfg.DEFAULT_MIRROR_AUGMENT
+MAX_CACHE_RESOLUTION                 = 7
 
 
 def adjust_dynamic_range(data, drange_in, drange_out):
@@ -94,6 +98,13 @@ def create_training_dataset(fpaths, res, batch_size,
                             data_format=DEFAULT_DATA_FORMAT,
                             n_parallel_calls=DEFAULT_DATASET_N_PARALLEL_CALLS,
                             n_prefetched_batches=DEFAULT_DATASET_N_PREFETCHED_BATCHES):
+    def get_value(n):
+        value = tf.data.AUTOTUNE
+        if isinstance(n, int):
+            if n > 0:
+                value = n
+        return value
+
     ds = tf.data.Dataset.from_tensor_slices(fpaths)
 
     if shuffle_dataset:
@@ -107,7 +118,7 @@ def create_training_dataset(fpaths, res, batch_size,
         lambda x: load_and_preprocess_image(
             x, res=res, mirror_augment=mirror_augment, dtype=dtype, data_format=data_format
         ),
-        num_parallel_calls=n_parallel_calls
+        num_parallel_calls=get_value(n_parallel_calls)
     )
 
     # cache can be a path to folder where files should be created
@@ -124,5 +135,5 @@ def create_training_dataset(fpaths, res, batch_size,
     # Fetch batches in the background while model is training
     # If applied after ds.batch() then buffer_size is given in batches,
     # so total number of prefetched elements is batch_size * buffer_size
-    ds = ds.prefetch(buffer_size=n_prefetched_batches)
+    ds = ds.prefetch(buffer_size=get_value(n_prefetched_batches))
     return ds

@@ -5,12 +5,10 @@ import time
 import numpy as np
 import tensorflow as tf
 
+from config import Config as cfg
 from dataloader_utils import convert_outputs_to_images
 from image_utils import fast_save_grid
-from utils import INFERENCE_MODE, \
-    LATENT_SIZE, DEFAULT_VALID_GRID_NROWS, DEFAULT_VALID_GRID_NCOLS,\
-    DATA_FORMAT, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WEIGHTS_DIR,\
-    TRUNCATION_PSI, DEFAULT_TRUNCATION_PSI, TRUNCATION_CUTOFF, DEFAULT_TRUNCATION_CUTOFF
+from utils import INFERENCE_MODE, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WEIGHTS_DIR
 from utils import load_config, prepare_gpu, load_weights, generate_latents, to_z_dim
 from model import StyleGAN
 
@@ -54,13 +52,13 @@ def parse_args():
         '--grid_cols',
         help='Number of columns in image grid',
         type=int,
-        default=DEFAULT_VALID_GRID_NCOLS
+        default=cfg.DEFAULT_VALID_GRID_NCOLS
     )
     parser.add_argument(
         '--grid_rows',
         help='Number of rows in image grid',
         type=int,
-        default=DEFAULT_VALID_GRID_NROWS
+        default=cfg.DEFAULT_VALID_GRID_NROWS
     )
     parser.add_argument(
         '--save_in_jpg',
@@ -75,8 +73,8 @@ def parse_args():
 def generate_images(model: tf.keras.Model, truncation_psi: float, truncation_cutoff: int, config: dict):
     start_time = time.time()
 
-    latent_size = config[LATENT_SIZE]
-    data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+    latent_size = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
+    data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     z_dim = to_z_dim(latent_size, data_format)
 
     # Try dealing with a case when lots of images are to be generated
@@ -116,10 +114,10 @@ def get_truncation_values(args, config):
     else:
         truncation_psi = args.truncation_psi
         if truncation_psi is None:
-            truncation_psi = config.get(TRUNCATION_PSI, DEFAULT_TRUNCATION_PSI)
+            truncation_psi = config.get(cfg.TRUNCATION_PSI, cfg.DEFAULT_TRUNCATION_PSI)
         truncation_cutoff = args.truncation_cutoff
         if truncation_cutoff is None:
-            truncation_cutoff = config.get(TRUNCATION_CUTOFF, DEFAULT_TRUNCATION_CUTOFF)
+            truncation_cutoff = config.get(cfg.TRUNCATION_CUTOFF, cfg.DEFAULT_TRUNCATION_CUTOFF)
     return truncation_psi, truncation_cutoff
 
 
@@ -131,7 +129,7 @@ if __name__ == '__main__':
     python .\inference.py --config_path .\configs\lsun_living_room.json --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --disable_truncation --image_fname images --grid_cols 12 --grid_rows 9 --save_in_jpg
     
     2) Provide options values for truncation trick (skip to use default ones from config) and save output image in png
-    python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --truncation_psi 0.7 --truncation_cutoff 8  --image_fname images --grid_cols 4 --grid_rows 3
+    python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --truncation_psi 0.7 --truncation_cutoff 8  --image_fname temp_images --grid_cols 4 --grid_rows 3    
     """
     args = parse_args()
 

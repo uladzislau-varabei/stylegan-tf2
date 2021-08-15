@@ -1,45 +1,15 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import Input
-from tensorflow.keras import mixed_precision
 
+from config import Config as cfg
 from custom_layers import WeightedSum, layer_dtype,\
     dense_layer, conv2d_layer, fused_bias_act_layer, bias_act_layer, const_layer, noise_layer, blur_layer,\
     pixel_norm_layer, instance_norm_layer, style_mod_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer
-from utils import TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME,\
-    GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT,\
-    generate_latents, level_of_details, validate_data_format, create_model_type_key, to_int_dict, to_z_dim,\
-    get_start_fp16_resolution, should_use_fp16, adjust_clamp, lerp
-
-from utils import TARGET_RESOLUTION, START_RESOLUTION,\
-    LATENT_SIZE, DLATENT_SIZE, NORMALIZE_LATENTS,\
-    USE_NOISE, RANDOMIZE_NOISE,\
-    DATA_FORMAT, FUSED_BIAS_ACT, USE_MIXED_PRECISION, NUM_FP16_RESOLUTIONS, CONV_CLAMP, USE_BIAS,\
-    USE_PIXEL_NORM, USE_INSTANCE_NORM, USE_STYLES, CONST_INPUT_LAYER, BLUR_FILTER,\
-    G_FUSED_SCALE, G_WEIGHTS_INIT_MODE, G_ACTIVATION, G_KERNEL_SIZE,\
-    D_FUSED_SCALE, D_WEIGHTS_INIT_MODE, D_ACTIVATION, D_KERNEL_SIZE,\
-    MBSTD_GROUP_SIZE, OVERRIDE_G_PROJECTING_GAIN, D_PROJECTING_NF,\
-    MAPPING_LAYERS, MAPPING_UNITS, MAPPING_LRMUL, MAPPING_ACTIVATION, MAPPING_USE_BIAS,\
-    G_FMAP_BASE, G_FMAP_DECAY, G_FMAP_MAX,\
-    D_FMAP_BASE, D_FMAP_DECAY, D_FMAP_MAX,\
-    TRUNCATION_PSI, TRUNCATION_CUTOFF, DLATENT_AVG_BETA, STYLE_MIXING_PROB,\
-    BATCH_SIZES
-from utils import NCHW_FORMAT, DEFAULT_DATA_FORMAT,\
-    DEFAULT_FUSED_BIAS_ACT, DEFAULT_USE_MIXED_PRECISION, DEFAULT_NUM_FP16_RESOLUTIONS,\
-    DEFAULT_CONV_CLAMP, DEFAULT_START_RESOLUTION,\
-    DEFAULT_MAPPING_LAYERS, DEFAULT_MAPPING_UNITS, DEFAULT_MAPPING_LRMUL, DEFAULT_MAPPING_ACTIVATION, DEFAULT_MAPPING_USE_BIAS,\
-    DEFAULT_OVERRIDE_G_PROJECTING_GAIN, \
-    DEFAULT_NORMALIZE_LATENTS, DEFAULT_CONST_INPUT_LAYER,\
-    DEFAULT_USE_NOISE, DEFAULT_RANDOMIZE_NOISE,\
-    DEFAULT_G_ACTIVATION, DEFAULT_D_ACTIVATION,\
-    DEFAULT_G_FUSED_SCALE, DEFAULT_D_FUSED_SCALE,\
-    DEFAULT_G_KERNEL_SIZE, DEFAULT_D_KERNEL_SIZE, DEFAULT_USE_BIAS,\
-    DEFAULT_USE_PIXEL_NORM, DEFAULT_USE_INSTANCE_NORM, DEFAULT_USE_STYLES,\
-    DEFAULT_BLUR_FILTER,\
-    DEFAULT_FMAP_BASE, DEFAULT_FMAP_DECAY, DEFAULT_FMAP_MAX,\
-    DEFAULT_TRUNCATION_PSI, DEFAULT_TRUNCATION_CUTOFF, DEFAULT_DLATENT_AVG_BETA, DEFAULT_STYLE_MIXING_PROB
-
-from utils import weights_to_dict, load_model_weights_from_dict
+from utils import generate_latents, level_of_details, validate_data_format, create_model_type_key, to_int_dict, to_z_dim,\
+    get_start_fp16_resolution, should_use_fp16, get_compute_dtype, adjust_clamp, lerp, weights_to_dict, load_model_weights_from_dict
+from utils import DEFAULT_DATA_FORMAT, NHWC_FORMAT, NCHW_FORMAT, \
+    TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME, GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT
 
 
 def n_filters(stage, fmap_base, fmap_decay, fmap_max):
@@ -56,38 +26,37 @@ class GeneratorMapping:
     def __init__(self, config):
         self.config = config
 
-        self.target_resolution = config[TARGET_RESOLUTION]
+        self.target_resolution = config[cfg.TARGET_RESOLUTION]
         self.resolution_log2 = int(np.log2(self.target_resolution))
         assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
 
-        self.start_resolution = config.get(START_RESOLUTION, DEFAULT_START_RESOLUTION)
+        self.start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
         self.start_resolution_log2 = int(np.log2(self.start_resolution))
         assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
 
-        self.data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+        self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
         validate_data_format(self.data_format)
 
-        self.latent_size = config[LATENT_SIZE]
-        self.z_dim = to_z_dim(self.latent_size, self.data_format)
-        self.dlatent_size = config[DLATENT_SIZE]
-        self.normalize_latents = config.get(NORMALIZE_LATENTS, DEFAULT_NORMALIZE_LATENTS)
-        self.use_styles = config.get(USE_STYLES, DEFAULT_USE_STYLES)
+        self.latent_size       = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
+        self.z_dim             = to_z_dim(self.latent_size, self.data_format)
+        self.dlatent_size      = config.get(cfg.DLATENT_SIZE, cfg.DEFAULT_DLATENT_SIZE)
+        self.normalize_latents = config.get(cfg.NORMALIZE_LATENTS, cfg.DEFAULT_NORMALIZE_LATENTS)
+        self.use_styles        = config.get(cfg.USE_STYLES, cfg.DEFAULT_USE_STYLES)
+        self.mapping_layers    = config.get(cfg.MAPPING_LAYERS, cfg.DEFAULT_MAPPING_LAYERS)
+        self.mapping_units     = config.get(cfg.MAPPING_UNITS, cfg.DEFAULT_MAPPING_UNITS)
+        self.mapping_lrmul     = config.get(cfg.MAPPING_LRMUL, cfg.DEFAULT_MAPPING_LRMUL)
+        self.mapping_act_name  = config.get(cfg.MAPPING_ACTIVATION, cfg.DEFAULT_MAPPING_ACTIVATION)
+        self.mapping_gain      = GAIN_ACTIVATION_FUNS_DICT[self.mapping_act_name]
+        self.mapping_use_bias  = config.get(cfg.MAPPING_USE_BIAS, cfg.DEFAULT_MAPPING_USE_BIAS)
 
-        self.mapping_layers = config.get(MAPPING_LAYERS, DEFAULT_MAPPING_LAYERS)
-        self.mapping_units = config.get(MAPPING_UNITS, DEFAULT_MAPPING_UNITS)
-        self.mapping_lrmul = config.get(MAPPING_LRMUL, DEFAULT_MAPPING_LRMUL)
-        self.mapping_act_name = config.get(MAPPING_ACTIVATION, DEFAULT_MAPPING_ACTIVATION)
-        self.mapping_gain = GAIN_ACTIVATION_FUNS_DICT[self.mapping_act_name]
-        self.mapping_use_bias = config.get(MAPPING_USE_BIAS, DEFAULT_MAPPING_USE_BIAS)
-
-        self.fused_bias_act = config.get(FUSED_BIAS_ACT, DEFAULT_FUSED_BIAS_ACT)
-        self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
-        self.num_fp16_resolutions = config.get(NUM_FP16_RESOLUTIONS, DEFAULT_NUM_FP16_RESOLUTIONS)
+        # Computations
+        self.fused_bias_act             = config.get(cfg.FUSED_BIAS_ACT, cfg.DEFAULT_FUSED_BIAS_ACT)
+        self.use_mixed_precision        = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
+        self.num_fp16_resolutions       = config.get(cfg.NUM_FP16_RESOLUTIONS, cfg.DEFAULT_NUM_FP16_RESOLUTIONS)
         self.start_fp16_resolution_log2 =\
             get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
-        self.policy = mixed_precision.Policy('mixed_float16') if self.use_mixed_precision else 'float32'
-        self.compute_dtype = self.policy.compute_dtype if self.use_mixed_precision else 'float32'
-        self.conv_clamp = config.get(CONV_CLAMP, DEFAULT_CONV_CLAMP)
+        self.compute_dtype              = get_compute_dtype(self.use_mixed_precision)
+        self.conv_clamp                 = config.get(cfg.CONV_CLAMP, cfg.DEFAULT_CONV_CLAMP)
 
         # Note: now mapping network is built for target resolution, so when current resolution is lower that that,
         # some broadcast outputs aren't connected to any part of the graph. It's fine, but may look strange.
@@ -145,25 +114,23 @@ class GeneratorStyle(tf.keras.Model):
         self.model_res = model_res
         self.config = config
 
-        self.target_resolution = config[TARGET_RESOLUTION]
+        self.target_resolution = config[cfg.TARGET_RESOLUTION]
         self.resolution_log2 = int(np.log2(self.target_resolution))
         assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
 
-        self.data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+        self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
         validate_data_format(self.data_format)
 
-        self.latent_size = config[LATENT_SIZE]
-        self.z_dim = to_z_dim(self.latent_size, self.data_format)
-        self.dlatent_size = config[DLATENT_SIZE]
-        self.randomize_noise = config.get(RANDOMIZE_NOISE, DEFAULT_RANDOMIZE_NOISE)
-
-        self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
-        self.latents_dtype = 'float16' if self.use_mixed_precision else 'float32'
-
-        self.truncation_psi = config.get(TRUNCATION_PSI, DEFAULT_TRUNCATION_PSI)
-        self.truncation_cutoff = config.get(TRUNCATION_CUTOFF, DEFAULT_TRUNCATION_CUTOFF)
-        self.dlatent_avg_beta = config.get(DLATENT_AVG_BETA, DEFAULT_DLATENT_AVG_BETA)
-        self.style_mixing_prob = config.get(STYLE_MIXING_PROB, DEFAULT_STYLE_MIXING_PROB)
+        self.latent_size         = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
+        self.z_dim               = to_z_dim(self.latent_size, self.data_format)
+        self.dlatent_size        = config.get(cfg.DLATENT_SIZE, cfg.DEFAULT_DLATENT_SIZE)
+        self.randomize_noise     = config.get(cfg.RANDOMIZE_NOISE, cfg.DEFAULT_RANDOMIZE_NOISE)
+        self.use_mixed_precision = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
+        self.latents_dtype       = get_compute_dtype(self.use_mixed_precision)
+        self.truncation_psi      = config.get(cfg.TRUNCATION_PSI, cfg.DEFAULT_TRUNCATION_PSI)
+        self.truncation_cutoff   = config.get(cfg.TRUNCATION_CUTOFF, cfg.DEFAULT_TRUNCATION_CUTOFF)
+        self.dlatent_avg_beta    = config.get(cfg.DLATENT_AVG_BETA, cfg.DEFAULT_DLATENT_AVG_BETA)
+        self.style_mixing_prob   = config.get(cfg.STYLE_MIXING_PROB, cfg.DEFAULT_STYLE_MIXING_PROB)
 
         self.num_layers = self.resolution_log2 * 2 - 2
         self.res_num_layers = self.model_res * 2 - 2
@@ -267,54 +234,53 @@ class Generator:
     def __init__(self, config):
         self.config = config
 
-        self.target_resolution = config[TARGET_RESOLUTION]
+        self.target_resolution = config[cfg.TARGET_RESOLUTION]
         self.resolution_log2 = int(np.log2(self.target_resolution))
         assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
 
-        self.start_resolution = config.get(START_RESOLUTION, DEFAULT_START_RESOLUTION)
+        self.start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
         self.start_resolution_log2 = int(np.log2(self.start_resolution))
         assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
 
-        self.data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+        self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
         validate_data_format(self.data_format)
 
-        self.latent_size = config[LATENT_SIZE]
-        self.z_dim = to_z_dim(self.latent_size, self.data_format)
-        self.dlatent_size = config[DLATENT_SIZE]
-        self.normalize_latents = config.get(NORMALIZE_LATENTS, DEFAULT_NORMALIZE_LATENTS)
-        self.const_input_layer = config.get(CONST_INPUT_LAYER, DEFAULT_CONST_INPUT_LAYER)
-        self.use_noise = config.get(USE_NOISE, DEFAULT_USE_NOISE)
-        self.randomize_noise = config.get(RANDOMIZE_NOISE, DEFAULT_RANDOMIZE_NOISE)
-        self.use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
-        self.use_pixel_norm = config.get(USE_PIXEL_NORM, DEFAULT_USE_PIXEL_NORM)
-        self.use_instance_norm = config.get(USE_INSTANCE_NORM, DEFAULT_USE_INSTANCE_NORM)
-        self.use_styles = config.get(USE_STYLES, DEFAULT_USE_STYLES)
-        self.G_fused_scale = config.get(G_FUSED_SCALE, DEFAULT_G_FUSED_SCALE)
-        self.G_kernel_size = config.get(G_KERNEL_SIZE, DEFAULT_G_KERNEL_SIZE)
-        self.G_fmap_base = config.get(G_FMAP_BASE, DEFAULT_FMAP_BASE)
-        self.G_fmap_decay = config.get(G_FMAP_DECAY, DEFAULT_FMAP_DECAY)
-        self.G_fmap_max = config.get(G_FMAP_MAX, DEFAULT_FMAP_MAX)
-        self.G_act_name = config.get(G_ACTIVATION, DEFAULT_G_ACTIVATION)
-        self.blur_filter = config.get(BLUR_FILTER, DEFAULT_BLUR_FILTER)
+        self.latent_size       = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
+        self.z_dim             = to_z_dim(self.latent_size, self.data_format)
+        self.dlatent_size      = config.get(cfg.DLATENT_SIZE, cfg.DEFAULT_DLATENT_SIZE)
+        self.normalize_latents = config.get(cfg.NORMALIZE_LATENTS, cfg.DEFAULT_NORMALIZE_LATENTS)
+        self.const_input_layer = config.get(cfg.CONST_INPUT_LAYER, cfg.DEFAULT_CONST_INPUT_LAYER)
+        self.use_noise         = config.get(cfg.USE_NOISE, cfg.DEFAULT_USE_NOISE)
+        self.randomize_noise   = config.get(cfg.RANDOMIZE_NOISE, cfg.DEFAULT_RANDOMIZE_NOISE)
+        self.use_bias          = config.get(cfg.USE_BIAS, cfg.DEFAULT_USE_BIAS)
+        self.use_pixel_norm    = config.get(cfg.USE_PIXEL_NORM, cfg.DEFAULT_USE_PIXEL_NORM)
+        self.use_instance_norm = config.get(cfg.USE_INSTANCE_NORM, cfg.DEFAULT_USE_INSTANCE_NORM)
+        self.use_styles        = config.get(cfg.USE_STYLES, cfg.DEFAULT_USE_STYLES)
+        self.G_fused_scale     = config.get(cfg.G_FUSED_SCALE, cfg.DEFAULT_G_FUSED_SCALE)
+        self.G_kernel_size     = config.get(cfg.G_KERNEL_SIZE, cfg.DEFAULT_G_KERNEL_SIZE)
+        self.G_fmap_base       = config.get(cfg.G_FMAP_BASE, cfg.DEFAULT_FMAP_BASE)
+        self.G_fmap_decay      = config.get(cfg.G_FMAP_DECAY, cfg.DEFAULT_FMAP_DECAY)
+        self.G_fmap_max        = config.get(cfg.G_FMAP_MAX, cfg.DEFAULT_FMAP_MAX)
+        self.G_act_name        = config.get(cfg.G_ACTIVATION, cfg.DEFAULT_G_ACTIVATION)
+        self.blur_filter       = config.get(cfg.BLUR_FILTER, cfg.DEFAULT_BLUR_FILTER)
 
-        self.fused_bias_act = config.get(FUSED_BIAS_ACT, DEFAULT_FUSED_BIAS_ACT)
-        self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
-        self.num_fp16_resolutions = config.get(NUM_FP16_RESOLUTIONS, DEFAULT_NUM_FP16_RESOLUTIONS)
+        # Computations
+        self.fused_bias_act             = config.get(cfg.FUSED_BIAS_ACT, cfg.DEFAULT_FUSED_BIAS_ACT)
+        self.use_mixed_precision        = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
+        self.num_fp16_resolutions       = config.get(cfg.NUM_FP16_RESOLUTIONS, cfg.DEFAULT_NUM_FP16_RESOLUTIONS)
         self.start_fp16_resolution_log2 =\
             get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
-        self.policy = mixed_precision.Policy('mixed_float16') if self.use_mixed_precision else 'float32'
-        self.compute_dtype = self.policy.compute_dtype if self.use_mixed_precision else 'float32'
-        self.conv_clamp = config.get(CONV_CLAMP, DEFAULT_CONV_CLAMP)
+        self.compute_dtype              = get_compute_dtype(self.use_mixed_precision)
+        self.conv_clamp                 = config.get(cfg.CONV_CLAMP, cfg.DEFAULT_CONV_CLAMP)
 
-        self.weights_init_mode = config.get(G_WEIGHTS_INIT_MODE, None)
+        self.weights_init_mode = config.get(cfg.G_WEIGHTS_INIT_MODE, None)
         if self.weights_init_mode is None:
             self.gain = GAIN_ACTIVATION_FUNS_DICT[self.G_act_name]
         else:
             self.gain = GAIN_INIT_MODE_DICT[self.weights_init_mode]
 
-        self.override_projecting_gain = config.get(OVERRIDE_G_PROJECTING_GAIN, DEFAULT_OVERRIDE_G_PROJECTING_GAIN)
-        # Gain is overridden to match the original ProGAN implementation
-        # sqrt(2) / 4 was used with He init
+        self.override_projecting_gain = config.get(cfg.OVERRIDE_G_PROJECTING_GAIN, cfg.DEFAULT_OVERRIDE_G_PROJECTING_GAIN)
+        # Gain is overridden to match the original ProGAN implementation (sqrt(2) / 4 was used with He init)
         self.projecting_gain_correction = 4. if self.override_projecting_gain else 1.
         self.projecting_gain = self.gain / self.projecting_gain_correction
 
@@ -327,7 +293,7 @@ class Generator:
         self.projecting_units = np.prod(self.projecting_target_shape)
 
         self.num_layers = self.resolution_log2 * 2 - 2
-        self.batch_sizes = to_int_dict(config[BATCH_SIZES])
+        self.batch_sizes = to_int_dict(config[cfg.BATCH_SIZES])
 
         self.create_model_layers()
         self.G_models = {}
@@ -565,48 +531,46 @@ class Discriminator:
     def __init__(self, config):
         self.config = config
 
-        self.target_resolution = config[TARGET_RESOLUTION]
+        self.target_resolution = config[cfg.TARGET_RESOLUTION]
         self.resolution_log2 = int(np.log2(self.target_resolution))
         assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
 
-        self.start_resolution = config.get(START_RESOLUTION, DEFAULT_START_RESOLUTION)
+        self.start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
         self.start_resolution_log2 = int(np.log2(self.start_resolution))
         assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
 
-        self.data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+        self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
         validate_data_format(self.data_format)
 
-        self.use_bias = config.get(USE_BIAS, DEFAULT_USE_BIAS)
-        self.mbstd_group_size = config[MBSTD_GROUP_SIZE]
-        self.D_fused_scale = config.get(D_FUSED_SCALE, DEFAULT_D_FUSED_SCALE)
-        self.D_kernel_size = config.get(D_KERNEL_SIZE, DEFAULT_D_KERNEL_SIZE)
-        self.D_fmap_base = config.get(D_FMAP_BASE, DEFAULT_FMAP_BASE)
-        self.D_fmap_decay = config.get(D_FMAP_DECAY, DEFAULT_FMAP_DECAY)
-        self.D_fmap_max = config.get(D_FMAP_MAX, DEFAULT_FMAP_MAX)
-        self.D_act_name = config.get(D_ACTIVATION, DEFAULT_D_ACTIVATION)
-        self.blur_filter = config.get(BLUR_FILTER, DEFAULT_BLUR_FILTER)
+        self.use_bias         = config.get(cfg.USE_BIAS, cfg.DEFAULT_USE_BIAS)
+        self.mbstd_group_size = config[cfg.MBSTD_GROUP_SIZE]
+        self.D_fused_scale    = config.get(cfg.D_FUSED_SCALE, cfg.DEFAULT_D_FUSED_SCALE)
+        self.D_kernel_size    = config.get(cfg.D_KERNEL_SIZE, cfg.DEFAULT_D_KERNEL_SIZE)
+        self.D_fmap_base      = config.get(cfg.D_FMAP_BASE, cfg.DEFAULT_FMAP_BASE)
+        self.D_fmap_decay     = config.get(cfg.D_FMAP_DECAY, cfg.DEFAULT_FMAP_DECAY)
+        self.D_fmap_max       = config.get(cfg.D_FMAP_MAX, cfg.DEFAULT_FMAP_MAX)
+        self.D_act_name       = config.get(cfg.D_ACTIVATION, cfg.DEFAULT_D_ACTIVATION)
+        self.blur_filter      = config.get(cfg.BLUR_FILTER, cfg.DEFAULT_BLUR_FILTER)
 
-        self.fused_bias_act = config.get(FUSED_BIAS_ACT, DEFAULT_FUSED_BIAS_ACT)
-        self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
-        self.num_fp16_resolutions = config.get(NUM_FP16_RESOLUTIONS, DEFAULT_NUM_FP16_RESOLUTIONS)
+        self.fused_bias_act             = config.get(cfg.FUSED_BIAS_ACT, cfg.DEFAULT_FUSED_BIAS_ACT)
+        self.use_mixed_precision        = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
+        self.num_fp16_resolutions       = config.get(cfg.NUM_FP16_RESOLUTIONS,cfg.DEFAULT_NUM_FP16_RESOLUTIONS)
         self.start_fp16_resolution_log2 =\
             get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
-        self.policy = mixed_precision.Policy('mixed_float16') if self.use_mixed_precision else 'float32'
-        self.compute_dtype = self.policy.compute_dtype if self.use_mixed_precision else 'float32'
-        self.conv_clamp = config.get(CONV_CLAMP, DEFAULT_CONV_CLAMP)
+        self.compute_dtype              = get_compute_dtype(self.use_mixed_precision)
+        self.conv_clamp                 = config.get(cfg.CONV_CLAMP, cfg.DEFAULT_CONV_CLAMP)
 
-        self.weights_init_mode = config.get(D_WEIGHTS_INIT_MODE, None)
+        self.weights_init_mode = config.get(cfg.D_WEIGHTS_INIT_MODE, None)
         if self.weights_init_mode is None:
             self.gain = GAIN_ACTIVATION_FUNS_DICT[self.D_act_name]
         else:
             self.gain = GAIN_INIT_MODE_DICT[self.weights_init_mode]
 
-        # Might be useful to override number of units in projecting layer
-        # in case latent size is not 512 to make models have almost the same number
-        # of trainable params
-        self.projecting_nf = config.get(D_PROJECTING_NF, self.D_n_filters(2 - 2))
+        # Might be useful to override number of units in projecting layer in case latent size is not 512
+        # to make models have almost the same number of trainable params
+        self.projecting_nf = config.get(cfg.D_PROJECTING_NF, self.D_n_filters(2 - 2))
 
-        self.batch_sizes = to_int_dict(config[BATCH_SIZES])
+        self.batch_sizes = to_int_dict(config[cfg.BATCH_SIZES])
 
         self.create_model_layers()
         self.D_models = {}

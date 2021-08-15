@@ -3,8 +3,6 @@
     "images_paths_filename": "ffhq.txt",
     "target_resolution": 1024,
     "start_resolution": 8,
-    "latent_size": 512,
-    "dlatent_size": 512,
     "use_mixed_precision": false,
     "fused_bias_act": false,
     "use_XLA": false,

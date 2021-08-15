@@ -174,14 +174,16 @@ def linear_model(input_image_size):
     assert isinstance(input_image_size, int)
 
     vgg_channels = [64, 128, 256, 512, 512]
-    inputs, outputs = list(), list()
+    inputs, outputs = [], []
     for ii, channel in enumerate(vgg_channels):
         name = 'lin{}'.format(ii)
         image_size = input_image_size // (2 ** ii)
 
         # Note: keep fp32 dtype to avoid numerical later with upcoming operations
         model_input = Input(shape=(channel, image_size, image_size), dtype='float32')
-        model_output = Dropout(rate=0.5, dtype='float32')(model_input)
+        model_output = model_input
+        # No need to use dropout, as model is only used for inference
+        # model_output = Dropout(rate=0.5, dtype='float32')(model_input)
         model_output = Conv2D(filters=1, kernel_size=1, strides=1, use_bias=False,
                               data_format='channels_first', dtype='float32', name=name)(model_output)
         inputs.append(model_input)

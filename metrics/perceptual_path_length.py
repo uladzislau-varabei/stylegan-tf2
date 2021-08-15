@@ -5,9 +5,10 @@ import numpy as np
 import tensorflow as tf
 
 from .lpips_models.lpips_tensorflow import learned_perceptual_metric_model
+from config import Config as cfg
 from custom_layers import naive_downsample, naive_upsample
 from utils import lerp, generate_latents, toNHWC_AXIS, toNCHW_AXIS, NCHW_FORMAT, enable_random_noise, disable_random_noise, \
-    DATA_FORMAT, validate_data_format, enable_mixed_precision_policy, disable_mixed_precision_policy
+    validate_data_format, enable_mixed_precision_policy, disable_mixed_precision_policy
 
 
 #----------------------------------------------------------------------------
@@ -47,7 +48,7 @@ class PPL:
         self.space = space
         self.sampling = sampling
         self.crop_face = crop_face
-        self.data_format = dataset_params[DATA_FORMAT]
+        self.data_format = dataset_params[cfg.DATA_FORMAT]
         validate_data_format(self.data_format)
         self.use_fp16 = use_fp16
         self.use_xla = use_xla
@@ -103,7 +104,7 @@ class PPL:
 
         # TODO: check if this is necessary
         # Cast to fp32.
-        if not self.use_fp16:
+        if self.use_fp16:
             images = tf.cast(images, tf.float32)
 
         return images
@@ -112,6 +113,7 @@ class PPL:
         # Outputs of mapping network are casted to fp32. In mixed precision latents will be automatically be casted.
         dtype = tf.float32
         # Generate random latents and interpolation t-values.
+        # TODO: change to use a noise consistent with the one used by network
         lat_t01 = generate_latents(batch_size * 2, list(G_mapping.input_shape[1:]),  dtype)
         lerp_t = tf.random.uniform([batch_size], 0.0, 1.0 if self.sampling == 'full' else 0.0, dtype=dtype)
 
@@ -144,9 +146,11 @@ class PPL:
     def run_metric(self, input_batch_size, G_model):
         G_mapping = G_model.G_mapping
         G_synthesis = G_model.G_synthesis
-        randomize_noise = G_model.randomize_noise
 
+        randomize_noise = G_model.randomize_noise
         if randomize_noise:
+            # This line is very important. Otherwise, images might have visible differences,
+            # which leads to very high PPl scores, e.g.. 2.5M - 3.5M.
             disable_random_noise(G_synthesis)
 
         # Sampling loop.

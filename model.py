@@ -5,56 +5,22 @@ from tqdm import tqdm
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import mixed_precision
+from tensorflow.keras.mixed_precision import LossScaleOptimizer
 
 from metrics.metrics_utils import setup_metrics
 from losses import select_G_loss_fn, select_D_loss_fn
-from utils import generate_latents, compute_alpha, update_wsum_alpha, lerp, get_start_fp16_resolution, should_use_fp16,\
+from utils import generate_latents, compute_alpha, update_wsum_alpha, lerp,\
+    get_start_fp16_resolution, should_use_fp16, get_compute_dtype,\
     save_model, load_model, save_optimizer_loss_scale, load_optimizer_loss_scale, is_finite_grad,\
-    TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
     create_images_dir_name, create_images_grid_title, remove_old_models,\
-    trace_vars, trace_message,\
+    trace_vars, trace_message, get_gpu_memory_usage,\
     format_time, to_int_dict, validate_data_format, to_z_dim, mult_by_zero, is_last_step, should_write_summary,\
     maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, load_images_paths, set_tf_logging
-from utils import TARGET_RESOLUTION, START_RESOLUTION, LATENT_SIZE, \
-    USE_MIXED_PRECISION, NUM_FP16_RESOLUTIONS, USE_XLA,\
-    DATA_FORMAT, MODEL_NAME, MAX_MODELS_TO_KEEP, \
-    SUMMARY_SCALARS_EVERY_KIMAGES, SUMMARY_HISTS_EVERY_KIMAGES, SAVE_MODEL_EVERY_KIMAGES, SAVE_IMAGES_EVERY_KIMAGES, \
-    METRICS_DICT, RUN_METRICS_EVERY_KIMAGES,\
-    G_LOSS_FN, D_LOSS_FN, G_LOSS_FN_PARAMS, D_LOSS_FN_PARAMS,\
-    G_LEARNING_RATE, D_LEARNING_RATE, \
-    G_LEARNING_RATE_DICT, D_LEARNING_RATE_DICT,\
-    ADAM_BETA1, ADAM_BETA2, RESET_OPT_STATE_FOR_NEW_LOD,\
-    USE_G_SMOOTHING, G_SMOOTHING_BETA, G_SMOOTHING_BETA_KIMAGES, USE_GPU_FOR_GS,\
-    GENERATOR_NAME, DISCRIMINATOR_NAME,\
-    NCHW_FORMAT, NHWC_FORMAT,\
-    TF_LOGS_DIR, STORAGE_PATH, DATASET_CACHE_DIR, CACHE_DIR,\
-    BATCH_SIZES, BATCH_REPEATS, DATASET_MAX_CACHE_RES,\
-    TOTAL_KIMAGES, TRANSITION_KIMAGES, TRANSITION_KIMAGES_DICT, STABILIZATION_KIMAGES, STABILIZATION_KIMAGES_DICT,\
-    DATASET_N_PARALLEL_CALLS, DATASET_N_PREFETCHED_BATCHES,\
-    SHUFFLE_DATASET, MIRROR_AUGMENT,\
-    VALID_GRID_NROWS, VALID_GRID_NCOLS, VALID_MIN_TARGET_SINGLE_IMAGE_SIZE, VALID_MAX_PNG_RES,\
-    TRAIN_MODE, INFERENCE_MODE, BENCHMARK_MODE, DEFAULT_MODE
-from utils import DEFAULT_STORAGE_PATH, DEFAULT_MAX_MODELS_TO_KEEP,\
-    DEFAULT_SUMMARY_SCALARS_EVERY_KIMAGES, DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES,\
-    DEFAULT_SAVE_MODEL_EVERY_KIMAGES, DEFAULT_SAVE_IMAGES_EVERY_KIMAGES, \
-    DEFAULT_METRICS_DICT, DEFAULT_RUN_METRICS_EVERY_KIMAGES,\
-    DEFAULT_BATCH_REPEATS, DEFAULT_G_LOSS_FN, DEFAULT_D_LOSS_FN, DEFAULT_G_LOSS_FN_PARAMS, DEFAULT_D_LOSS_FN_PARAMS,\
-    DEFAULT_G_LEARNING_RATE, DEFAULT_D_LEARNING_RATE,\
-    DEFAULT_G_LEARNING_RATE_DICT, DEFAULT_D_LEARNING_RATE_DICT,\
-    DEFAULT_ADAM_BETA1, DEFAULT_ADAM_BETA2, DEFAULT_RESET_OPT_STATE_FOR_NEW_LOD,\
-    DEFAULT_DATASET_MAX_CACHE_RES,\
-    DEFAULT_START_RESOLUTION, DEFAULT_USE_MIXED_PRECISION, DEFAULT_NUM_FP16_RESOLUTIONS, DEFAULT_USE_XLA,\
-    DEFAULT_DATASET_N_PARALLEL_CALLS,\
-    DEFAULT_DATASET_N_PREFETCHED_BATCHES,\
-    DEFAULT_SHUFFLE_DATASET, DEFAULT_MIRROR_AUGMENT,\
-    DEFAULT_TOTAL_KIMAGES, DEFAULT_TRANSITION_KIMAGES, DEFAULT_STABILIZATION_KIMAGES, \
-    DEFAULT_TRANSITION_KIMAGES_DICT, DEFAULT_STABILIZATION_KIMAGES_DICT,\
-    DEFAULT_USE_G_SMOOTHING, DEFAULT_G_SMOOTHING_BETA, DEFAULT_G_SMOOTHING_BETA_KIMAGES, DEFAULT_USE_GPU_FOR_GS,\
-    DEFAULT_DATA_FORMAT,\
-    DEFAULT_VALID_GRID_NROWS, DEFAULT_VALID_GRID_NCOLS,\
-    DEFAULT_VALID_MIN_TARGET_SINGLE_IMAGE_SIZE, DEFAULT_VALID_MAX_PNG_RES,\
-    toNHWC_AXIS, toNCHW_AXIS
+from utils import DEFAULT_DATA_FORMAT, NHWC_FORMAT, NCHW_FORMAT, toNHWC_AXIS, toNCHW_AXIS,\
+    DEFAULT_MODE, TRAIN_MODE, INFERENCE_MODE, BENCHMARK_MODE,\
+    GENERATOR_NAME, DISCRIMINATOR_NAME, TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
+    CACHE_DIR, DATASET_CACHE_DIR, TF_LOGS_DIR
+from config import Config as cfg
 from dataloader_utils import create_training_dataset, convert_outputs_to_images
 from image_utils import fast_save_grid
 from networks import Generator, Discriminator
@@ -81,11 +47,6 @@ def show_vars_stats(vars):
         print(f'{idx}) {var.name}: mean={mean:.3f}, std={std:.3f}')
 
 
-def tf_round(x, decimals=0):
-    multiplier = tf.constant(10**decimals, dtype=x.dtype)
-    return tf.math.round(x * multiplier) / multiplier
-
-
 FIRST_STEP_COND_KEY = 'first_step_cond'
 LAST_STEP_COND_KEY = 'last_step_cond'
 STAGE_IMAGES_KEY = 'stage_images'
@@ -99,96 +60,96 @@ class StyleGAN:
     def __init__(self, config, mode=DEFAULT_MODE, images_paths=None, res=None, stage=None,
                  single_process_training=False):
 
-        self.target_resolution = config[TARGET_RESOLUTION]
+        self.target_resolution = config[cfg.TARGET_RESOLUTION]
         self.resolution_log2 = int(np.log2(self.target_resolution))
         assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
 
-        self.start_resolution = config.get(START_RESOLUTION, DEFAULT_START_RESOLUTION)
+        self.start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
         self.start_resolution_log2 = int(np.log2(self.start_resolution))
         assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
 
-        self.data_format = config.get(DATA_FORMAT, DEFAULT_DATA_FORMAT)
+        self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
         validate_data_format(self.data_format)
 
-        self.latent_size = config[LATENT_SIZE]
+        self.latent_size = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
         self.z_dim = to_z_dim(self.latent_size, self.data_format)
 
         # Training images and batches
-        self.batch_sizes = to_int_dict(config[BATCH_SIZES])
-        self.batch_repeats = config.get(BATCH_REPEATS, DEFAULT_BATCH_REPEATS)
-        self.total_kimages = config.get(TOTAL_KIMAGES, DEFAULT_TOTAL_KIMAGES)
-        self.transition_kimages = config.get(TRANSITION_KIMAGES, DEFAULT_TRANSITION_KIMAGES)
-        self.transition_kimages_dict = to_int_dict(config.get(TRANSITION_KIMAGES_DICT, DEFAULT_TRANSITION_KIMAGES_DICT))
-        self.stabilization_kimages = config.get(STABILIZATION_KIMAGES, DEFAULT_STABILIZATION_KIMAGES)
-        self.stabilization_kimages_dict = to_int_dict(config.get(STABILIZATION_KIMAGES_DICT, DEFAULT_STABILIZATION_KIMAGES_DICT))
+        self.batch_sizes                = to_int_dict(config[cfg.BATCH_SIZES])
+        self.batch_repeats                          = config.get(cfg.BATCH_REPEATS, cfg.DEFAULT_BATCH_REPEATS)
+        self.total_kimages                          = config.get(cfg.TOTAL_KIMAGES, cfg.DEFAULT_TOTAL_KIMAGES)
+        self.transition_kimages                     = config.get(cfg.TRANSITION_KIMAGES, cfg.DEFAULT_TRANSITION_KIMAGES)
+        self.transition_kimages_dict    = to_int_dict(config.get(cfg.TRANSITION_KIMAGES_DICT, cfg.DEFAULT_TRANSITION_KIMAGES_DICT))
+        self.stabilization_kimages                  = config.get(cfg.STABILIZATION_KIMAGES, cfg.DEFAULT_STABILIZATION_KIMAGES)
+        self.stabilization_kimages_dict = to_int_dict(config.get(cfg.STABILIZATION_KIMAGES_DICT, cfg.DEFAULT_STABILIZATION_KIMAGES_DICT))
 
-        # Computation
-        self.use_mixed_precision = config.get(USE_MIXED_PRECISION, DEFAULT_USE_MIXED_PRECISION)
-        self.num_fp16_resolutions = config.get(NUM_FP16_RESOLUTIONS, DEFAULT_NUM_FP16_RESOLUTIONS)
+        # Computations
+        self.use_mixed_precision  = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
+        self.num_fp16_resolutions = config.get(cfg.NUM_FP16_RESOLUTIONS, cfg.DEFAULT_NUM_FP16_RESOLUTIONS)
         self.start_fp16_resolution_log2 =\
             get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
-        self.compute_dtype = 'float16' if self.use_mixed_precision else 'float32'
-        self.use_xla = config.get(USE_XLA, DEFAULT_USE_XLA)
-        self.use_Gs = config.get(USE_G_SMOOTHING, DEFAULT_USE_G_SMOOTHING)
-        self.use_gpu_for_Gs = config.get(USE_GPU_FOR_GS, DEFAULT_USE_GPU_FOR_GS)
-        self.Gs_beta = config.get(G_SMOOTHING_BETA, DEFAULT_G_SMOOTHING_BETA)
-        self.Gs_beta_kimgs = config.get(G_SMOOTHING_BETA_KIMAGES, DEFAULT_G_SMOOTHING_BETA_KIMAGES)
+        self.compute_dtype        = get_compute_dtype(self.use_mixed_precision)
+        self.use_xla              = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
+        self.use_Gs               = config.get(cfg.USE_G_SMOOTHING, cfg.DEFAULT_USE_G_SMOOTHING)
+        self.use_gpu_for_Gs       = config.get(cfg.USE_GPU_FOR_GS, cfg.DEFAULT_USE_GPU_FOR_GS)
+        self.Gs_beta              = config.get(cfg.G_SMOOTHING_BETA, cfg.DEFAULT_G_SMOOTHING_BETA)
+        self.Gs_beta_kimgs        = config.get(cfg.G_SMOOTHING_BETA_KIMAGES, cfg.DEFAULT_G_SMOOTHING_BETA_KIMAGES)
         # Resolution-specific betas for Gs
         self.Gs_betas = {}
         # Used for training in a single process
         self.clear_session_for_new_model = True
 
         # Dataset
-        self.dataset_max_cache_res = config.get(DATASET_MAX_CACHE_RES, DEFAULT_DATASET_MAX_CACHE_RES)
+        self.dataset_max_cache_res = config.get(cfg.DATASET_MAX_CACHE_RES, cfg.DEFAULT_DATASET_MAX_CACHE_RES)
         if images_paths is None:
             images_paths = load_images_paths(config)
         # These options are used for metrics
         self.dataset_params = {
             'fpaths':               images_paths,
-            'mirror_augment':       config.get(MIRROR_AUGMENT, DEFAULT_MIRROR_AUGMENT),
-            'shuffle_dataset':      config.get(SHUFFLE_DATASET, DEFAULT_SHUFFLE_DATASET),
+            'mirror_augment':       config.get(cfg.MIRROR_AUGMENT, cfg.DEFAULT_MIRROR_AUGMENT),
+            'shuffle_dataset':      config.get(cfg.SHUFFLE_DATASET, cfg.DEFAULT_SHUFFLE_DATASET),
             'dtype':                self.compute_dtype,
             'data_format':          self.data_format,
-            'n_parallel_calls':     config.get(DATASET_N_PARALLEL_CALLS, DEFAULT_DATASET_N_PARALLEL_CALLS),
-            'n_prefetched_batches': config.get(DATASET_N_PREFETCHED_BATCHES, DEFAULT_DATASET_N_PREFETCHED_BATCHES)
+            'n_parallel_calls':     config.get(cfg.DATASET_N_PARALLEL_CALLS, cfg.DEFAULT_DATASET_N_PARALLEL_CALLS),
+            'n_prefetched_batches': config.get(cfg.DATASET_N_PREFETCHED_BATCHES, cfg.DEFAULT_DATASET_N_PREFETCHED_BATCHES)
         }
 
         # Losses
-        self.G_loss_fn_name = config.get(G_LOSS_FN, DEFAULT_G_LOSS_FN)
-        self.D_loss_fn_name = config.get(D_LOSS_FN, DEFAULT_D_LOSS_FN)
+        self.G_loss_fn_name = config.get(cfg.G_LOSS_FN, cfg.DEFAULT_G_LOSS_FN)
+        self.D_loss_fn_name = config.get(cfg.D_LOSS_FN, cfg.DEFAULT_D_LOSS_FN)
         self.G_loss_fn = select_G_loss_fn(self.G_loss_fn_name)
         self.D_loss_fn = select_D_loss_fn(self.D_loss_fn_name)
-        self.G_loss_params = config.get(G_LOSS_FN_PARAMS, DEFAULT_G_LOSS_FN_PARAMS)
-        self.D_loss_params = config.get(D_LOSS_FN_PARAMS, DEFAULT_D_LOSS_FN_PARAMS)
+        self.G_loss_params = config.get(cfg.G_LOSS_FN_PARAMS, cfg.DEFAULT_G_LOSS_FN_PARAMS)
+        self.D_loss_params = config.get(cfg.D_LOSS_FN_PARAMS, cfg.DEFAULT_D_LOSS_FN_PARAMS)
 
         # Optimizers options
-        self.G_learning_rate = config.get(G_LEARNING_RATE, DEFAULT_G_LEARNING_RATE)
-        self.D_learning_rate = config.get(D_LEARNING_RATE, DEFAULT_D_LEARNING_RATE)
-        self.G_learning_rate_dict = to_int_dict(config.get(G_LEARNING_RATE_DICT, DEFAULT_G_LEARNING_RATE_DICT))
-        self.D_learning_rate_dict = to_int_dict(config.get(D_LEARNING_RATE_DICT, DEFAULT_D_LEARNING_RATE_DICT))
-        self.beta1 = config.get(ADAM_BETA1, DEFAULT_ADAM_BETA1)
-        self.beta2 = config.get(ADAM_BETA2, DEFAULT_ADAM_BETA2)
-        self.reset_opt_state_for_new_lod = config.get(RESET_OPT_STATE_FOR_NEW_LOD, DEFAULT_RESET_OPT_STATE_FOR_NEW_LOD)
+        self.G_learning_rate = config.get(cfg.G_LEARNING_RATE, cfg.DEFAULT_G_LEARNING_RATE)
+        self.D_learning_rate = config.get(cfg.D_LEARNING_RATE, cfg.DEFAULT_D_LEARNING_RATE)
+        self.G_learning_rate_dict = to_int_dict(config.get(cfg.G_LEARNING_RATE_DICT, cfg.DEFAULT_G_LEARNING_RATE_DICT))
+        self.D_learning_rate_dict = to_int_dict(config.get(cfg.D_LEARNING_RATE_DICT, cfg.DEFAULT_D_LEARNING_RATE_DICT))
+        self.beta1 = config.get(cfg.ADAM_BETA1, cfg.DEFAULT_ADAM_BETA1)
+        self.beta2 = config.get(cfg.ADAM_BETA2, cfg.DEFAULT_ADAM_BETA2)
+        self.reset_opt_state_for_new_lod = config.get(cfg.RESET_OPT_STATE_FOR_NEW_LOD, cfg.DEFAULT_RESET_OPT_STATE_FOR_NEW_LOD)
 
         # Valid images options
-        self.valid_grid_nrows = config.get(VALID_GRID_NROWS, DEFAULT_VALID_GRID_NROWS)
-        self.valid_grid_ncols = config.get(VALID_GRID_NCOLS, DEFAULT_VALID_GRID_NCOLS)
+        self.valid_grid_nrows = config.get(cfg.VALID_GRID_NROWS, cfg.DEFAULT_VALID_GRID_NROWS)
+        self.valid_grid_ncols = config.get(cfg.VALID_GRID_NCOLS, cfg.DEFAULT_VALID_GRID_NCOLS)
         self.valid_grid_padding = 2
-        self.min_target_single_image_size = config.get(VALID_MIN_TARGET_SINGLE_IMAGE_SIZE, DEFAULT_VALID_MIN_TARGET_SINGLE_IMAGE_SIZE)
+        self.min_target_single_image_size = config.get(cfg.VALID_MIN_TARGET_SINGLE_IMAGE_SIZE, cfg.DEFAULT_VALID_MIN_TARGET_SINGLE_IMAGE_SIZE)
         if self.min_target_single_image_size < 0:
            self.min_target_single_image_size = max(2 ** (self.resolution_log2 - 1), 2 ** 7)
-        self.max_png_res = config.get(VALID_MAX_PNG_RES, DEFAULT_VALID_MAX_PNG_RES)
+        self.max_png_res = config.get(cfg.VALID_MAX_PNG_RES, cfg.DEFAULT_VALID_MAX_PNG_RES)
 
         # Summaries
-        self.model_name = config[MODEL_NAME]
-        self.metrics = config.get(METRICS_DICT, DEFAULT_METRICS_DICT)
-        self.storage_path = config.get(STORAGE_PATH, DEFAULT_STORAGE_PATH)
-        self.max_models_to_keep = config.get(MAX_MODELS_TO_KEEP, DEFAULT_MAX_MODELS_TO_KEEP)
-        self.run_metrics_every = int(1000 * config.get(RUN_METRICS_EVERY_KIMAGES, DEFAULT_RUN_METRICS_EVERY_KIMAGES))
-        self.summary_scalars_every = int(1000 * config.get(SUMMARY_SCALARS_EVERY_KIMAGES, DEFAULT_SUMMARY_SCALARS_EVERY_KIMAGES))
-        self.summary_hists_every = int(1000 * config.get(SUMMARY_HISTS_EVERY_KIMAGES, DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES))
-        self.save_model_every = int(1000 * config.get(SAVE_MODEL_EVERY_KIMAGES, DEFAULT_SAVE_MODEL_EVERY_KIMAGES))
-        self.save_images_every = int(1000 * config.get(SAVE_IMAGES_EVERY_KIMAGES, DEFAULT_SAVE_IMAGES_EVERY_KIMAGES))
+        self.model_name                       = config[cfg.MODEL_NAME]
+        self.metrics                          = config.get(cfg.METRICS_DICT, cfg.DEFAULT_METRICS_DICT)
+        self.storage_path                     = config.get(cfg.STORAGE_PATH, cfg.DEFAULT_STORAGE_PATH)
+        self.max_models_to_keep               = config.get(cfg.MAX_MODELS_TO_KEEP, cfg.DEFAULT_MAX_MODELS_TO_KEEP)
+        self.run_metrics_every     = int(1000 * config.get(cfg.RUN_METRICS_EVERY_KIMAGES, cfg.DEFAULT_RUN_METRICS_EVERY_KIMAGES))
+        self.summary_scalars_every = int(1000 * config.get(cfg.SUMMARY_SCALARS_EVERY_KIMAGES, cfg.DEFAULT_SUMMARY_SCALARS_EVERY_KIMAGES))
+        self.summary_hists_every   = int(1000 * config.get(cfg.SUMMARY_HISTS_EVERY_KIMAGES, cfg.DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES))
+        self.save_model_every      = int(1000 * config.get(cfg.SAVE_MODEL_EVERY_KIMAGES, cfg.DEFAULT_SAVE_MODEL_EVERY_KIMAGES))
+        self.save_images_every     = int(1000 * config.get(cfg.SAVE_IMAGES_EVERY_KIMAGES, cfg.DEFAULT_SAVE_IMAGES_EVERY_KIMAGES))
         self.logs_path = os.path.join(TF_LOGS_DIR, self.model_name)
         self.writers_dirs = {
             res: os.path.join(self.logs_path, f'{2**res}x{2**res}')
@@ -210,7 +171,7 @@ class StyleGAN:
             self.Gs_valid_latents = self.valid_latents
             self.Gs_device = '/GPU:0' if self.use_gpu_for_Gs else '/CPU:0'
             if not self.use_gpu_for_Gs:
-                Gs_config[DATA_FORMAT] = NHWC_FORMAT
+                Gs_config[cfg.DATA_FORMAT] = NHWC_FORMAT
                 self.Gs_valid_latents = tf.transpose(self.valid_latents, toNHWC_AXIS)
             self.Gs_object = Generator(Gs_config)
 
@@ -224,7 +185,7 @@ class StyleGAN:
                 self.initialize_optimizers(create_all_variables=False, benchmark=True)
             elif mode == TRAIN_MODE:
                 if single_process_training:
-                    # TODO: think about using metrics
+                    # TODO: think about using metrics and updating optimizers scales
                     self.initialize_optimizers(create_all_variables=True)
                 else:
                     self.metrics_objects = setup_metrics(2 ** res,
@@ -378,7 +339,7 @@ class StyleGAN:
         )
         if self.use_mixed_precision:
             initial_scale, dynamic = self.get_optimizer_initial_loss_scale(GENERATOR_NAME, res, stage, benchmark)
-            self.G_optimizer = mixed_precision.LossScaleOptimizer(self.G_optimizer, dynamic=dynamic, initial_scale=initial_scale)
+            self.G_optimizer = LossScaleOptimizer(self.G_optimizer, dynamic=dynamic, initial_scale=initial_scale)
         self.G_optimizer.use_mixed_precision = self.use_mixed_precision
 
         if not create_all_variables:
@@ -479,7 +440,7 @@ class StyleGAN:
         )
         if self.use_mixed_precision:
             initial_scale, dynamic = self.get_optimizer_initial_loss_scale(DISCRIMINATOR_NAME, res, stage, benchmark)
-            self.D_optimizer = mixed_precision.LossScaleOptimizer(self.D_optimizer, dynamic=dynamic, initial_scale=initial_scale)
+            self.D_optimizer = LossScaleOptimizer(self.D_optimizer, dynamic=dynamic, initial_scale=initial_scale)
         self.D_optimizer.use_mixed_precision = self.use_mixed_precision
 
         if not create_all_variables:
@@ -745,7 +706,7 @@ class StyleGAN:
 
     def get_n_steps(self, res, mode):
         """
-        Returns number of training steps fir provided res and mode
+        Returns number of training steps for provided res and mode
         """
         self.validate_res_and_mode_combination(res, mode)
         images_res = 2 ** res
@@ -957,7 +918,6 @@ class StyleGAN:
         source_net_vars = G_model.trainable_variables
         trace_vars(smoothed_net_vars, 'Smoothed vars:')
         trace_vars(source_net_vars, 'Source vars:')
-
         with tf.device(self.Gs_device):
             for a, b in zip(smoothed_net_vars, source_net_vars):
                 a.assign(lerp(b, a, beta))
@@ -1049,6 +1009,27 @@ class StyleGAN:
         self.D_train_step(G_model, D_model, D_latents, images, write_scalars_summary, write_hists_summary, step)
         self.G_train_step(G_model, D_model, G_latents, write_scalars_summary, write_hists_summary, step)
 
+    def add_resources_summary(self, training_finished_images):
+        for device, memory_stats in get_gpu_memory_usage().items():
+            for k, v in memory_stats.items():
+                tf.summary.scalar(f'Resources/{device}/{k}(Mbs)', v, step=training_finished_images)
+
+    def add_timing_summary(self, training_finished_images):
+        # 1. Get time info and update last used value
+        # One tick is number of images after each scalar summaries is updated
+        cur_update_time = time.time()
+        tick_time = cur_update_time - self.last_update_time
+        self.last_update_time = cur_update_time
+        kimg_denom = self.summary_scalars_every / 1000
+        total_time = cur_update_time - self.start_time
+        # 2. Summary tick time
+        # Note: picks when metrics are evaluated and on first call (graph compilation)
+        tf.summary.scalar(f'Timing/Tick(s)', tick_time, step=training_finished_images)
+        tf.summary.scalar(f'Timing/Kimg(s)', tick_time / kimg_denom, step=training_finished_images)
+        # 3. Summary total time
+        tf.summary.scalar(f'Timing/Total(hours)', total_time / (60.0 * 60.0), step=training_finished_images)
+        tf.summary.scalar(f'Timing/Total(days)', total_time / (24.0 * 60.0 * 60.0), step=training_finished_images)
+
     def post_train_step_actions(self, res, mode, summary_options, summary_writer):
         # Get all needed options
         first_step_cond = summary_options[FIRST_STEP_COND_KEY]
@@ -1083,6 +1064,8 @@ class StyleGAN:
 
         # TODO: think how to write summaries outside of this function
         if write_scalars_summary:
+            self.add_resources_summary(training_finished_images)
+            self.add_timing_summary(training_finished_images)
             summary_writer.flush()
 
         if should_write_summary(self.save_model_every, training_finished_images, batch_size) or last_step_cond:
@@ -1106,9 +1089,13 @@ class StyleGAN:
             WRITE_HISTS_SUMMARY_KEY: should_write_summary(self.summary_hists_every, stage_images, batch_size) or last_step_cond,
         }
 
+    def init_training_time(self):
+        self.start_time = time.time()
+        self.last_update_time = time.time()
+
     def train(self):
         # TODO: refactor this function, and make it consistent with training for each separate stage
-        train_start_time = time.time()
+        self.init_training_time()
         tf_step = tf.Variable(0, trainable=False, dtype=tf.int64)
         tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
         tf_write_hists_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
@@ -1233,11 +1220,11 @@ class StyleGAN:
                 logging.info(f'----------------------------------------------------------------------')
                 logging.info('')
 
-        train_total_time = time.time() - train_start_time
+        train_total_time = time.time() - self.start_time
         logging.info(f'Training finished in {format_time(train_total_time)}!')
 
     def run_transition_stage(self, res):
-        transition_stage_start_time = time.time()
+        self.init_training_time()
 
         self.D_model, self.G_model, self.Gs_model = self.create_models(res, mode=TRANSITION_MODE)
         # Load weights from previous stage: res - 1 and stabilization mode
@@ -1301,11 +1288,11 @@ class StyleGAN:
         # Save states after extra weights are removed
         self.save_optimizers_weights(res, stage=TRANSITION_MODE)
 
-        transition_stage_total_time = time.time() - transition_stage_start_time
+        transition_stage_total_time = time.time() - self.start_time
         logging.info(f'Transition stage took {format_time(transition_stage_total_time)}')
 
     def run_stabilization_stage(self, res):
-        stabilization_stage_start_time = time.time()
+        self.init_training_time()
 
         self.D_model, self.G_model, self.Gs_model = self.create_models(res, mode=STABILIZATION_MODE)
         if res > self.start_resolution_log2:
@@ -1360,7 +1347,7 @@ class StyleGAN:
         # Save states after extra weights are removed
         self.save_optimizers_weights(res, stage=STABILIZATION_MODE)
 
-        stabilization_stage_total_time = time.time() - stabilization_stage_start_time
+        stabilization_stage_total_time = time.time() - self.start_time
         logging.info(f'Stabilization stage took {format_time(stabilization_stage_total_time)}')
 
     def run_metrics(self, res, mode, training_finished_images):

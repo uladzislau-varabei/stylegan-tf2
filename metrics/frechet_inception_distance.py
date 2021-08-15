@@ -7,9 +7,10 @@ import tensorflow as tf
 from tensorflow.keras.applications.inception_v3 import InceptionV3
 from tensorflow.keras.applications.inception_v3 import preprocess_input as preprocess_inception_input
 
+from config import Config as cfg
 from custom_layers import naive_upsample
 from dataloader_utils import create_training_dataset
-from utils import generate_latents, CACHE_DIR, toNHWC_AXIS, NCHW_FORMAT, DATA_FORMAT, validate_data_format,\
+from utils import generate_latents, CACHE_DIR, toNHWC_AXIS, NCHW_FORMAT, validate_data_format,\
     enable_mixed_precision_policy, disable_mixed_precision_policy
 
 
@@ -29,7 +30,7 @@ class FID:
         self.num_samples = num_samples
         self.model_name = model_name
         self.dataset_params = dataset_params
-        self.data_format = dataset_params[DATA_FORMAT]
+        self.data_format = dataset_params[cfg.DATA_FORMAT]
         validate_data_format(self.data_format)
         self.use_fp16 = use_fp16
         self.use_xla = use_xla

@@ -9,8 +9,8 @@ import numpy as np
 # Note: do not import tensorflow here or you won't be able to train each stage
 # in a new process
 
-from utils import LOGS_DIR, TRAIN_MODE, INFERENCE_MODE, TRANSITION_MODE, STABILIZATION_MODE,\
-    TARGET_RESOLUTION, START_RESOLUTION, DEFAULT_START_RESOLUTION
+from config import Config as cfg
+from utils import LOGS_DIR, TRAIN_MODE, INFERENCE_MODE, TRANSITION_MODE, STABILIZATION_MODE
 from utils import load_config, prepare_gpu, load_images_paths, format_time, DEBUG_MODE
 from model import StyleGAN
 
@@ -85,11 +85,11 @@ def run_train_stage(config, images_paths, res, mode, config_path=None):
 
 
 def train_model(config, config_path=None):
-    target_resolution = config[TARGET_RESOLUTION]
+    target_resolution = config[cfg.TARGET_RESOLUTION]
     resolution_log2 = int(np.log2(target_resolution))
     assert target_resolution == 2 ** resolution_log2 and target_resolution >= 4
 
-    start_resolution = config.get(START_RESOLUTION, DEFAULT_START_RESOLUTION)
+    start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
     start_resolution_log2 = int(np.log2(start_resolution))
     assert start_resolution == 2 ** start_resolution_log2 and start_resolution >= 4
 

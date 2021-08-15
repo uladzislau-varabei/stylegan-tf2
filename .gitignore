@@ -15,3 +15,8 @@ results
 __pycache__
 *.png
 *.txt
+
+# Cuda custom ops (not yet ready)
+dnnlib
+# Cuda ops tests
+test_*
