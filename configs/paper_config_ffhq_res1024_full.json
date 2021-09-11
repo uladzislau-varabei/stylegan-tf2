@@ -99,6 +99,7 @@
     "mbstd_group_size": 4,
     "mbstd_num_features": 1,
     "dataset_max_kimages": -1,
+    "dataset_hw_ratio": 1,
     "shuffle_dataset": true,
     "mirror_augment": true
 }

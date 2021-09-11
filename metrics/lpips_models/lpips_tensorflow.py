@@ -33,8 +33,8 @@ def learned_perceptual_metric_model(image_size, vgg_model_ckpt_fn, lin_model_ckp
 
     # Note: originally these 2 layers were built with dtype fp32
     # merge two model
-    input1 = Input(shape=(image_size, image_size, 3), name='input1')
-    input2 = Input(shape=(image_size, image_size, 3), name='input2')
+    input1 = Input(shape=(image_size[0], image_size[1], 3), name='input1')
+    input2 = Input(shape=(image_size[0], image_size[1], 3), name='input2')
 
     # preprocess input images
     net_out1 = Lambda(lambda x: image_preprocess(x))(input1)
@@ -127,7 +127,7 @@ def perceptual_model(image_size):
     # (None, 8, 8, 512)
     # (None, 4, 4, 512)
     layers = ['block1_conv2', 'block2_conv2', 'block3_conv3', 'block4_conv3', 'block5_conv3']
-    vgg16 = VGG16(include_top=False, weights='imagenet', input_shape=(image_size, image_size, 3))
+    vgg16 = VGG16(include_top=False, weights='imagenet', input_shape=(image_size[0], image_size[1], 3))
 
     vgg16_output_layers = [l.output for l in vgg16.layers if l.name in layers]
     model = Model(vgg16.input, vgg16_output_layers, name='perceptual_model')
@@ -171,19 +171,19 @@ def perceptual_model(image_size):
 
 # functional api
 def linear_model(input_image_size):
-    assert isinstance(input_image_size, int)
+    #assert isinstance(input_image_size, int)
 
     vgg_channels = [64, 128, 256, 512, 512]
     inputs, outputs = [], []
     for ii, channel in enumerate(vgg_channels):
         name = 'lin{}'.format(ii)
-        image_size = input_image_size // (2 ** ii)
+        h_size = input_image_size[0] // (2 ** ii)
+        w_size = input_image_size[1] // (2 ** ii)
+        #image_size = input_image_size[0] // (2 ** ii)
 
-        # Note: keep fp32 dtype to avoid numerical later with upcoming operations
-        model_input = Input(shape=(channel, image_size, image_size), dtype='float32')
-        model_output = model_input
-        # No need to use dropout, as model is only used for inference
-        # model_output = Dropout(rate=0.5, dtype='float32')(model_input)
+        # Note: keep fp32 dtype to avoid numerical issues later with upcoming operations
+        model_input = Input(shape=(channel, h_size, w_size), dtype='float32')
+        model_output = Dropout(rate=0.5, dtype='float32')(model_input)
         model_output = Conv2D(filters=1, kernel_size=1, strides=1, use_bias=False,
                               data_format='channels_first', dtype='float32', name=name)(model_output)
         inputs.append(model_input)

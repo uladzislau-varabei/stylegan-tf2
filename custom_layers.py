@@ -493,6 +493,7 @@ class Noise(Layer):
         self.randomize_noise = randomize_noise
         self.use_xla = use_xla
         self.scope = scope #+ 'Noise'
+        self.tf_zero = tf.constant(0.0, dtype=self._dtype_policy.compute_dtype, name='zero')
         # XLA doesn't seem to work.
         # self.call = tf.function(self.call, jit_compile=self.use_xla)
         self.call = tf.function(self.call, jit_compile=False)
@@ -525,13 +526,7 @@ class Noise(Layer):
                 initializer=tf.random_normal_initializer(),
                 trainable=False
             )
-            # Add dummy non trainable variables to control randomness of noise
-            self.tf_zero = self.add_weight(
-                name='zero',
-                initializer=tf.constant_initializer(0.),
-                trainable=False,
-                dtype=self._dtype_policy.compute_dtype
-            )
+            # Add dummy non trainable variable to control randomness of noise
             self.tf_randomize_noise = self.add_weight(
                 name=RANDOMIZE_NOISE_VAR_NAME,
                 initializer=tf.constant_initializer(1. if self.randomize_noise else -1.),
@@ -634,7 +629,7 @@ class WeightedSum(Layer):
         # Note: for mixed precision training constants can have float16 dtype
         self.alpha =self.add_weight(
             name='alpha',
-            initializer=tf.constant_initializer(0.),
+            initializer=tf.constant_initializer(0.0),
             trainable=False,
             dtype=self._dtype_policy.compute_dtype,
             experimental_autocast=False
@@ -907,7 +902,7 @@ def conv2d_layer(x, fmaps, kernel_size, gain, lrmul=LRMUL,
 
     use_wscale = config.get(cfg.USE_WSCALE, cfg.DEFAULT_USE_WSCALE)
     truncate_weights = config.get(cfg.TRUNCATE_WEIGHTS, cfg.DEFAULT_TRUNCATE_WEIGHTS)
-    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('conv2d', use_fp16=use_fp16)
 
@@ -1001,14 +996,14 @@ def blur_layer(x, use_fp16=None, scope='', config=None):
 
 
 def pixel_norm_layer(x, use_fp16=None, scope='', config=None):
-    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('pixel_norm', use_fp16=use_fp16)
     return PixelNorm(dtype=dtype, use_xla=use_xla, data_format=data_format, scope=scope)(x)
 
 
 def instance_norm_layer(x, use_fp16=None, scope='', config=None):
-    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('instance_norm', use_fp16=use_fp16)
     return InstanceNorm(dtype=dtype, use_xla=use_xla, data_format=data_format, scope=scope)(x)
@@ -1018,7 +1013,7 @@ def style_mod_layer(x, dlatents, use_fp16=None, scope='', config=None):
     use_bias = config.get(cfg.USE_BIAS, cfg.DEFAULT_USE_BIAS)
     use_wscale = config.get(cfg.USE_WSCALE, cfg.DEFAULT_USE_WSCALE)
     truncate_weights = config.get(cfg.TRUNCATE_WEIGHTS, cfg.DEFAULT_TRUNCATE_WEIGHTS)
-    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('style_mod', use_fp16=use_fp16)
     return StyleMod(
@@ -1034,7 +1029,7 @@ def downscale2d_layer(x, factor, use_fp16=None, config=None):
 
 
 def upscale2d_layer(x, factor, use_fp16=None, config=None):
-    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('upscale2d', use_fp16=use_fp16)
     return Upscale2d(factor=factor, dtype=dtype, use_xla=use_xla, data_format=data_format)(x)
@@ -1043,7 +1038,7 @@ def upscale2d_layer(x, factor, use_fp16=None, config=None):
 def minibatch_stddev_layer(x, use_fp16=None, scope='', config=None):
     group_size = config.get(cfg.MBSTD_GROUP_SIZE, 4)
     num_new_features = config.get(cfg.MBSTD_NUM_FEATURES, cfg.DEFAULT_MBSTD_NUM_FEATURES)
-    use_xla = config.get(cfg.USE_XLA, DEFAULT_USE_XLA)
+    use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     dtype = layer_dtype('minibatch_stddev', use_fp16=use_fp16)
     return MinibatchStdDev(

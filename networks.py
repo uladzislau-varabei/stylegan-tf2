@@ -6,8 +6,9 @@ from config import Config as cfg
 from custom_layers import WeightedSum, layer_dtype,\
     dense_layer, conv2d_layer, fused_bias_act_layer, bias_act_layer, const_layer, noise_layer, blur_layer,\
     pixel_norm_layer, instance_norm_layer, style_mod_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer
+from checkpoint_utils import weights_to_dict, load_model_weights_from_dict
 from utils import generate_latents, level_of_details, validate_data_format, create_model_type_key, to_int_dict, to_z_dim,\
-    get_start_fp16_resolution, should_use_fp16, get_compute_dtype, adjust_clamp, lerp, weights_to_dict, load_model_weights_from_dict
+    get_start_fp16_resolution, should_use_fp16, get_compute_dtype, adjust_clamp, lerp
 from utils import DEFAULT_DATA_FORMAT, NHWC_FORMAT, NCHW_FORMAT, \
     TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME, GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT
 
@@ -97,10 +98,7 @@ class GeneratorMapping:
                     x = self.bias_act(x, use_fp16=use_fp16, scope=scope)
 
             with tf.name_scope('Broadcast'):
-                x = tf.cast(x, tf.float32)
                 x = tf.tile(x[:, tf.newaxis], [1, self.num_styles, 1])
-            # TODO: should x be casted to fp32? Can be important if model starts using mixed precision starting from some resolution
-            #  (e.g. in metrics calculation)
 
         self.G_mapping = tf.keras.Model(self.latents, tf.identity(x, name='dlatents'), name='G_mapping')
 
@@ -126,7 +124,7 @@ class GeneratorStyle(tf.keras.Model):
         self.dlatent_size        = config.get(cfg.DLATENT_SIZE, cfg.DEFAULT_DLATENT_SIZE)
         self.randomize_noise     = config.get(cfg.RANDOMIZE_NOISE, cfg.DEFAULT_RANDOMIZE_NOISE)
         self.use_mixed_precision = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
-        self.latents_dtype       = get_compute_dtype(self.use_mixed_precision)
+        self.model_compute_dtype = get_compute_dtype(self.use_mixed_precision)
         self.truncation_psi      = config.get(cfg.TRUNCATION_PSI, cfg.DEFAULT_TRUNCATION_PSI)
         self.truncation_cutoff   = config.get(cfg.TRUNCATION_CUTOFF, cfg.DEFAULT_TRUNCATION_CUTOFF)
         self.dlatent_avg_beta    = config.get(cfg.DLATENT_AVG_BETA, cfg.DEFAULT_DLATENT_AVG_BETA)
@@ -148,11 +146,10 @@ class GeneratorStyle(tf.keras.Model):
         validate_range(self.style_mixing_prob, 0.0, 1.0)
 
     def initialize_variables(self):
-        # Outputs of mapping network are casted to fp32
         self.dlatent_avg = self.add_weight(
             name='dlatent_avg',
             shape=[self.dlatent_size],
-            dtype=tf.float32,
+            dtype=self.model_compute_dtype,
             initializer=tf.zeros_initializer(),
             trainable=False
         )
@@ -164,7 +161,7 @@ class GeneratorStyle(tf.keras.Model):
             self.mixing_cur_layers = self.res_num_layers
 
         if (self.truncation_psi is not None) and (self.truncation_cutoff is not None):
-            ones = tf.ones(self.layer_idx.shape, dtype=tf.float32)
+            ones = tf.ones(self.layer_idx.shape, dtype=self.model_compute_dtype)
             self.truncation_coefs = tf.where(self.layer_idx < self.truncation_cutoff, self.truncation_psi * ones, ones)
 
     def update_dlatent_avg(self, dlatents):
@@ -174,7 +171,7 @@ class GeneratorStyle(tf.keras.Model):
         )
 
     def generate_latents(self, batch_size):
-        return generate_latents(batch_size, self.z_dim, self.latents_dtype)
+        return generate_latents(batch_size, self.z_dim, self.model_compute_dtype)
 
     def apply_style_mixing(self, dlatents):
         latents2 = self.generate_latents(tf.shape(dlatents)[0])

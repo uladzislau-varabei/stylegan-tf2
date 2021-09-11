@@ -1,3 +1,4 @@
+from copy import deepcopy
 import logging
 
 from .frechet_inception_distance import FID
@@ -25,7 +26,6 @@ METRICS_DICT = {
 
 
 def remove_dataset_info(d):
-    from copy import deepcopy
     new_d = deepcopy(d)
     rm_key = 'dataset_params'
     for k in list(d.keys()):
@@ -34,7 +34,7 @@ def remove_dataset_info(d):
     return new_d
 
 
-def setup_metrics(image_size, model_name, dataset_params, use_fp16, use_xla, metrics):
+def setup_metrics(image_size, hw_ratio, dataset_params, use_fp16, use_xla, model_name, metrics):
     metrics_objects = []
     if metrics is None:
         metrics = {}
@@ -45,10 +45,11 @@ def setup_metrics(image_size, model_name, dataset_params, use_fp16, use_xla, met
         metric_kwargs = {
             **{
                 'image_size': image_size,
-                'model_name': model_name,
+                'hw_ratio': hw_ratio,
                 'dataset_params': dataset_params,
                 'use_fp16': use_fp16,
-                'use_xla': use_xla
+                'use_xla': use_xla,
+                'model_name': model_name
             },
             **m_def_kwargs,
             **m_kwargs

@@ -76,6 +76,7 @@ def generate_images(model: tf.keras.Model, truncation_psi: float, truncation_cut
     latent_size = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     z_dim = to_z_dim(latent_size, data_format)
+    hw_ratio = config.get(cfg.DATASET_HW_RATIO, cfg.DEFAULT_DATASET_HW_RATIO)
 
     # Try dealing with a case when lots of images are to be generated
     if grid_cols * grid_rows < 32:
@@ -90,7 +91,7 @@ def generate_images(model: tf.keras.Model, truncation_psi: float, truncation_cut
             model(batch_latents, training=False, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
         )
     images = tf.concat(images, axis=0)
-    images = convert_outputs_to_images(images, 2 ** res, data_format=data_format).numpy()
+    images = convert_outputs_to_images(images, 2 ** res, hw_ratio=hw_ratio, data_format=data_format).numpy()
 
     total_time = time.time() - start_time
     print(f'Generated images in {total_time:.3f}s')
@@ -129,7 +130,7 @@ if __name__ == '__main__':
     python .\inference.py --config_path .\configs\lsun_living_room.json --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --disable_truncation --image_fname images --grid_cols 12 --grid_rows 9 --save_in_jpg
     
     2) Provide options values for truncation trick (skip to use default ones from config) and save output image in png
-    python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --truncation_psi 0.7 --truncation_cutoff 8  --image_fname temp_images --grid_cols 4 --grid_rows 3    
+    python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --truncation_psi 0.7 --truncation_cutoff 8  --image_fname images --grid_cols 4 --grid_rows 3    
     """
     args = parse_args()
 

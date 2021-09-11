@@ -11,7 +11,7 @@ from config import Config as cfg
 from custom_layers import naive_upsample
 from dataloader_utils import create_training_dataset
 from utils import generate_latents, CACHE_DIR, toNHWC_AXIS, NCHW_FORMAT, validate_data_format,\
-    enable_mixed_precision_policy, disable_mixed_precision_policy
+    enable_mixed_precision_policy, disable_mixed_precision_policy, to_hw_size, extract_images
 
 
 FID_DIR = 'fid'
@@ -21,12 +21,13 @@ SIGMA_REAL_KEY = 'sigma_real'
 
 class FID:
 
-    def __init__(self, image_size, num_samples, model_name, dataset_params, use_fp16, use_xla, **kwargs):
+    def __init__(self, image_size, hw_ratio, num_samples, dataset_params, use_fp16, use_xla, model_name, **kwargs):
         assert isinstance(num_samples, int)
         # Inception model was trained on 299x299 images. So set minimal size to 256x256
         self.min_size = 256
-        self.image_size = image_size if image_size > self.min_size else self.min_size
-        self.image_res_log2 = int(np.log2(self.image_size))
+        self.hw_ratio = hw_ratio
+        self.image_size = to_hw_size(image_size if image_size > self.min_size else self.min_size, hw_ratio)
+        self.image_res_log2 = int(np.log2(self.image_size[1]))
         self.num_samples = num_samples
         self.model_name = model_name
         self.dataset_params = dataset_params
@@ -42,10 +43,11 @@ class FID:
         if self.use_fp16:
             enable_mixed_precision_policy()
         # With pooling specified output shape will always be (None, 2048), so no need to provide input shape
-        self.inception_model = InceptionV3(include_top=False, weights='imagenet', pooling='avg')
-        self.activations_shape = [self.num_samples, self.inception_model.output_shape[1]]
+        self.base_model = InceptionV3(include_top=False, weights='imagenet', pooling='avg')
+        self.activations_shape = [self.num_samples, self.base_model.output_shape[1]]
         self.activations_dtype = np.float16 if self.use_fp16 else np.float32
-        self.inception_model = tf.function(self.inception_model, jit_compile=self.use_xla)
+        # Note: for some reason model = tf.function(lambda x: model(x, args), ...) doesn't work
+        self.inception_model = tf.function(lambda x: self.base_model(x, training=False), jit_compile=self.use_xla)
         if self.use_fp16:
             disable_mixed_precision_policy()
 
@@ -55,13 +57,16 @@ class FID:
 
     @tf.function
     def process_images(self, images):
+        images = extract_images(images, self.hw_ratio, self.data_format)
+
         # TODO: think about face cropping (like for PPL metric)
         # TODO: think about downsampling images (like for PPL metric)
-        # Upsample image to 256x256 if it's smaller than that. Inception was built for 256x256 images.
+        # Upsample image to 256x256 if it's smaller than that. Inception was built for 299x299 images.
+        # Use W dimension due to wide images
         if self.data_format == NCHW_FORMAT:
-            shape_idx = 2
+            shape_idx = 3
         else: # data_format == NHWC_FORMAT:
-            shape_idx = 1
+            shape_idx = 2
         if images.shape[shape_idx] < self.min_size:
             factor = self.min_size // images.shape[shape_idx]
             images = naive_upsample(images, factor, data_format=self.data_format)
@@ -73,12 +78,8 @@ class FID:
         if self.data_format == NCHW_FORMAT:
             images = tf.transpose(images, toNHWC_AXIS)
 
-        # TODO: check if this is necessary
-        # Cast to fp32.
-        images = tf.cast(images, tf.float32)
-
         # Prepare images for Inception model.
-        images = preprocess_inception_input(images)
+        images = preprocess_inception_input(images, data_format='channels_last')
 
         return images
 
@@ -108,11 +109,11 @@ class FID:
     def evaluate_on_fakes(self, batch_size, G_model):
         activations = np.empty(self.activations_shape, dtype=self.activations_dtype)
         z_dim = G_model.z_dim
-        latents_dtype = G_model.latents_dtype
+        dtype = G_model.model_compute_dtype
         for idx in tqdm(range(0, self.num_samples, batch_size), 'FID metric fakes steps'):
             start = idx * batch_size
             end = min(start + batch_size, self.num_samples)
-            latents = generate_latents(batch_size, z_dim, latents_dtype)
+            latents = generate_latents(batch_size, z_dim, dtype)
             fake_images = G_model(latents, training=False, validation=True)
             fake_images = self.process_images(fake_images)
             activations[start:end] = self.inception_model(fake_images).numpy()[:(end-start)]

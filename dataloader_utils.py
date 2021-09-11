@@ -4,9 +4,11 @@ import logging
 import tensorflow as tf
 
 from config import Config as cfg
-from utils import DEFAULT_DTYPE, DEFAULT_DATA_FORMAT, NCHW_FORMAT,\
-    validate_data_format
+from utils import DEFAULT_USE_FP16, DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT, toNCHW_AXIS, toNHWC_AXIS, \
+    validate_data_format, validate_hw_ratio, to_hw_size, extract_images
 
+
+DEFAULT_DATASET_HW_RATIO             = cfg.DEFAULT_DATASET_HW_RATIO
 DEFAULT_DATASET_N_PARALLEL_CALLS     = cfg.DEFAULT_DATASET_N_PARALLEL_CALLS
 DEFAULT_DATASET_N_PREFETCHED_BATCHES = cfg.DEFAULT_DATASET_N_PREFETCHED_BATCHES
 DEFAULT_SHUFFLE_DATASET              = cfg.DEFAULT_SHUFFLE_DATASET
@@ -26,76 +28,86 @@ def adjust_dynamic_range(data, drange_in, drange_out):
 
 
 def normalize_images(images):
-    # Scaling is performed with the function convert_image_dtype
-    return 2 * images - 1.
+    return 2.0 * images - 1.0
 
 
 def restore_images(images):
     # Minimum OP doesn't support uint8
-    images = tf.math.round((images + 1.) * 127.5)
+    images = tf.math.round((images + 1.0) * (255 / 2))
     images = tf.clip_by_value(tf.cast(images, dtype=tf.int32), 0, 255)
     images = tf.cast(images, dtype=tf.uint8)
     return images
 
 
-def convert_outputs_to_images(net_outputs, target_single_image_size, data_format=DEFAULT_DATA_FORMAT):
+def convert_outputs_to_images(net_outputs, target_single_image_size, hw_ratio=1, data_format=DEFAULT_DATA_FORMAT):
     # Note: should work for linear and tanh activation
-    validate_data_format(data_format)
+    # 1. Adjust dynamic range of images
     x = restore_images(net_outputs)
+    # 2. Optionally change data format
+    validate_data_format(data_format)
     if data_format == NCHW_FORMAT:
-        x = tf.transpose(x, [0, 2, 3, 1])
+        x = tf.transpose(x, toNHWC_AXIS)
+    # 3. Optionally extract target images for wide dataset
+    validate_hw_ratio(hw_ratio)
+    x = extract_images(x, hw_ratio, NHWC_FORMAT)
+    # 4. Resize images
     x = tf.image.resize(
         x,
-        size=(target_single_image_size, target_single_image_size),
+        size=to_hw_size(target_single_image_size, hw_ratio),
         method=tf.image.ResizeMethod.NEAREST_NEIGHBOR
     )
     return x
 
 
-def load_image(file_path, dtype=DEFAULT_DTYPE):
+def load_image(file_path):
     image = tf.io.read_file(file_path)
-    image = tf.image.decode_jpeg(image, channels=3)
-    image = tf.image.convert_image_dtype(image, dtype=dtype)
+    image = tf.io.decode_jpeg(image, channels=3)
+    # Always cast to fp32
+    image = tf.cast(image, tf.float32) / 255.0
     return image
 
 
-def preprocess_image(image, res, mirror_augment=DEFAULT_MIRROR_AUGMENT, dtype=DEFAULT_DTYPE):
-    # Image is resized according to a paper implementation (PIL.Image.ANTIALIAS was used)
-    image = tf.image.resize(
-        image,
-        size=(2 ** res, 2 ** res),
-        method=tf.image.ResizeMethod.LANCZOS3,
-        antialias=True
+def preprocess_images(images, res, hw_ratio=1, mirror_augment=DEFAULT_MIRROR_AUGMENT, data_format=DEFAULT_DATA_FORMAT, use_fp16=DEFAULT_USE_FP16):
+    validate_hw_ratio(hw_ratio)
+    # 1. Resize images according to the paper implementation (PIL.Image.ANTIALIAS was used)
+    images = tf.image.resize(
+        images, size=to_hw_size(2 ** res, hw_ratio), method=tf.image.ResizeMethod.LANCZOS3, antialias=True
     )
-    # Dtype and range might change due to resizing
-    image = tf.cast(image, dtype)
-    image = tf.clip_by_value(image, 0.0, 1.0)
+    # 2. Make sure that dtype and dynamic range didn't change
+    images = tf.cast(images, tf.float32)
+    images = tf.clip_by_value(images, 0.0, 1.0)
+    # Iteration is not allowed, so just take values by idxs
+    s = tf.shape(images)
+    n, h, w, c = s[0], s[1], s[2], s[3]
+    # 3. Optionally apply augmentations
     if mirror_augment:
-        # Augmentations
-        if tf.random.uniform([], 0.0, 1.0) > 0.5:
-            image = tf.image.flip_left_right(image)
-    return image
-
-
-def load_and_preprocess_image(file_path, res,
-                              mirror_augment=DEFAULT_MIRROR_AUGMENT,
-                              dtype=DEFAULT_DTYPE,
-                              data_format=DEFAULT_DATA_FORMAT):
-    validate_data_format(data_format)
-    image = load_image(file_path, dtype)
-    image = preprocess_image(image, res, mirror_augment, dtype)
-    image = normalize_images(image)
+        mask = tf.random.uniform([n, 1, 1, 1], 0.0, 1.0)
+        mask = tf.tile(mask, [1, h, w, c])
+        # See source code for tf.image.flip_left_right
+        images = tf.where(mask > 0.5, tf.reverse(images, axis=[2]), images)
+    # 4. Adjust dynamic range of images
+    images = normalize_images(images)
+    # 5. Optionally pad images for wide dataset
+    if hw_ratio != 1:
+        pad_down = (w - h) // 2
+        pad_up = w - h - pad_down
+        images = tf.pad(images, [[0, 0], [pad_down, pad_up], [0, 0], [0, 0]])
+    # 6. Optionally change data format
     if data_format == NCHW_FORMAT:
-        image = tf.transpose(image, [2, 0, 1])
-    return image
+        images = tf.transpose(images, toNCHW_AXIS)
+    # 7. Optionally convert to fp16
+    if use_fp16:
+        images = tf.cast(images, tf.float16)
+    return images
 
 
 def create_training_dataset(fpaths, res, batch_size,
                             cache=None,
+                            hw_ratio=DEFAULT_DATASET_HW_RATIO,
                             mirror_augment=DEFAULT_MIRROR_AUGMENT,
                             shuffle_dataset=DEFAULT_SHUFFLE_DATASET,
-                            dtype=DEFAULT_DTYPE,
                             data_format=DEFAULT_DATA_FORMAT,
+                            use_fp16=DEFAULT_USE_FP16,
                             n_parallel_calls=DEFAULT_DATASET_N_PARALLEL_CALLS,
                             n_prefetched_batches=DEFAULT_DATASET_N_PREFETCHED_BATCHES):
     def get_value(n):
@@ -114,12 +126,8 @@ def create_training_dataset(fpaths, res, batch_size,
             buffer_size=shuffle_buffer_size, reshuffle_each_iteration=True
         )
 
-    ds = ds.map(
-        lambda x: load_and_preprocess_image(
-            x, res=res, mirror_augment=mirror_augment, dtype=dtype, data_format=data_format
-        ),
-        num_parallel_calls=get_value(n_parallel_calls)
-    )
+    # Split loading and preprocessing to make data pipeline more efficient
+    ds = ds.map(lambda x: load_image(x), num_parallel_calls=get_value(n_parallel_calls))
 
     # cache can be a path to folder where files should be created
     # Note: when working with high resolutions there is no need to cache ds
@@ -131,6 +139,13 @@ def create_training_dataset(fpaths, res, batch_size,
     # Repeat forever
     ds = ds.repeat()
     ds = ds.batch(batch_size, drop_remainder=True)
+    # Perform vectorized operations
+    ds = ds.map(
+        lambda x: preprocess_images(
+            x, res=res, hw_ratio=hw_ratio,mirror_augment=mirror_augment, data_format=data_format, use_fp16=use_fp16
+        ),
+        num_parallel_calls=get_value(n_parallel_calls)
+    )
 
     # Fetch batches in the background while model is training
     # If applied after ds.batch() then buffer_size is given in batches,

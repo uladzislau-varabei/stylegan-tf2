@@ -205,6 +205,9 @@ class Config:
 
     ### ---------- Dataset options ---------- ###
 
+    # Height / width ratio of dataset images. Only set it if a wide dataset is used, e.g. LSUN Car.
+    # The value is target height / image
+    DATASET_HW_RATIO = 'dataset_hw_ratio'
     # Number of parallel calls to dataset
     # Note: a good choice is to use a number of cpu cores
     DATASET_N_PARALLEL_CALLS = 'dataset_n_parallel_calls'
@@ -213,7 +216,6 @@ class Config:
     # Maximum number of images to be used for training
     DATASET_N_MAX_KIMAGES = 'dataset_max_kimages'
     # Shuffle dataset every time it is finished?
-    # Note: on Windows one might need to set it to False
     SHUFFLE_DATASET = 'shuffle_dataset'
     # Enable image augmentations?
     MIRROR_AUGMENT = 'mirror_augment'
@@ -306,6 +308,7 @@ class Config:
     DEFAULT_G_SMOOTHING_BETA_KIMAGES = 10.0
     DEFAULT_MBSTD_NUM_FEATURES = 1
     DEFAULT_USE_GPU_FOR_GS = True
+    DEFAULT_DATASET_HW_RATIO = 1
     DEFAULT_DATASET_N_PARALLEL_CALLS = 'auto'
     DEFAULT_DATASET_N_PREFETCHED_BATCHES = 'auto'
     DEFAULT_DATASET_N_MAX_KIMAGES = -1

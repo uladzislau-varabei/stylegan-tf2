@@ -120,10 +120,9 @@ def fast_save_grid(out_dir, fname, images, nrows, ncols, padding, title, save_in
     else:
         img = convert_to_pil_image(img_grid)
 
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
 
     if save_in_jpg:
-        img.save(os.path.join(out_dir, fname + '.jpg'), 'JPEG', quality=95, optimize=True)
+        img.save(os.path.join(out_dir, fname + '.jpg'), 'JPEG', subsample=0, quality=95, optimize=True)
     else:
-        img.save(os.path.join(out_dir, fname + '.png'), 'PNG')
+        img.save(os.path.join(out_dir, fname + '.png'), 'PNG', optimize=True)

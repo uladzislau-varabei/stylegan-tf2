@@ -7,8 +7,9 @@ import tensorflow as tf
 from .lpips_models.lpips_tensorflow import learned_perceptual_metric_model
 from config import Config as cfg
 from custom_layers import naive_downsample, naive_upsample
-from utils import lerp, generate_latents, toNHWC_AXIS, toNCHW_AXIS, NCHW_FORMAT, enable_random_noise, disable_random_noise, \
-    validate_data_format, enable_mixed_precision_policy, disable_mixed_precision_policy
+from utils import lerp, generate_latents, toNHWC_AXIS, toNCHW_AXIS, NCHW_FORMAT, enable_random_noise, disable_random_noise,\
+    validate_data_format, enable_mixed_precision_policy, disable_mixed_precision_policy, get_compute_dtype,\
+    to_hw_size, extract_images
 
 
 #----------------------------------------------------------------------------
@@ -38,7 +39,8 @@ def slerp(a, b, t):
 
 class PPL:
 
-    def __init__(self, image_size, num_samples, epsilon, space, sampling, crop_face, dataset_params, use_fp16, use_xla, **kwargs):
+    def __init__(self, image_size, hw_ratio, num_samples, epsilon, space, sampling, crop_face,
+                 dataset_params, use_fp16, use_xla, **kwargs):
         assert space in ['w', 'z']
         assert sampling in ['full', 'end']
         assert isinstance(num_samples, int)
@@ -51,17 +53,18 @@ class PPL:
         self.data_format = dataset_params[cfg.DATA_FORMAT]
         validate_data_format(self.data_format)
         self.use_fp16 = use_fp16
+        self.compute_dtype = get_compute_dtype(self.use_fp16)
         self.use_xla = use_xla
         # Required field for each metric class (used in tensorboard)
         self.name = f'PPL_{space}_{sampling}_{num_samples // 1000}k'
 
         # Min size for the network is 32x32.
         # TODO: think to which resolution should images be upsampled if size is smaller than that?
-        # self.min_size = 32
         # Always upscale to 256
         self.min_size = 256
-        self.input_image_size = image_size if image_size > self.min_size else self.min_size
-        print('Input image size for PPL metric:', self.input_image_size)
+        self.hw_ratio = hw_ratio
+        self.image_size = to_hw_size(image_size if image_size > self.min_size else self.min_size, hw_ratio)
+
         # Tf 2.x port of vgg16_zhang_perceptual
         vgg_ckpt_fn = os.path.join('metrics', 'lpips_models' ,'vgg', 'exported')
         lin_ckpt_fn = os.path.join('metrics', 'lpips_models', 'lin', 'exported')
@@ -69,25 +72,31 @@ class PPL:
         if self.use_fp16:
             enable_mixed_precision_policy()
         # Note: input images should be in NHWC format in range (0, 255)
-        self.lpips_model = tf.function(
-            learned_perceptual_metric_model(self.input_image_size, vgg_ckpt_fn, lin_ckpt_fn),
-            jit_compile=self.use_xla
-        )
+        self.base_model = learned_perceptual_metric_model(self.image_size, vgg_ckpt_fn, lin_ckpt_fn)
+        #  Note: for some reason model = tf.function(lambda x: model(x, args), ...) doesn't work
+        self.lpips_model = tf.function(lambda x: self.base_model(x, training=False), jit_compile=self.use_xla)
         if self.use_fp16:
             disable_mixed_precision_policy()
 
     @tf.function
     def process_images(self, images):
-        # Crop only the face region (images are in NCHW format).
+        # Crop only the face region
         if self.crop_face:
-            c = int(images.shape[2] // 8)
-            images = images[:, :, c * 3: c * 7, c * 2: c * 6]
+            if self.data_format == NCHW_FORMAT:
+                c = int(images.shape[2] // 8)
+                images = images[:, :, (c * 3) : (c * 7), (c * 2) : (c * 6)]
+            else:  # data_format == NHWC_FORMAT
+                c = int(images.shape[2] // 8)
+                images = images[:, (c * 3) : (c * 7), (c * 2) : (c * 6), :]
+
+        images = extract_images(images, self.hw_ratio, self.data_format)
 
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
+        # Use W dimension due to wide images
         if self.data_format == NCHW_FORMAT:
-            shape_idx = 2
+            shape_idx = 3
         else: # data_format == NHWC_FORMAT:
-            shape_idx = 1
+            shape_idx = 2
         if images.shape[shape_idx] > 256:
             factor = images.shape[shape_idx] // 256
             images = naive_downsample(images, factor, data_format=self.data_format)
@@ -102,20 +111,13 @@ class PPL:
         if self.data_format == NCHW_FORMAT:
             images = tf.transpose(images, toNHWC_AXIS)
 
-        # TODO: check if this is necessary
-        # Cast to fp32.
-        if self.use_fp16:
-            images = tf.cast(images, tf.float32)
-
         return images
 
     def evaluate_distance_for_batch(self, batch_size, G_mapping, G_synthesis):
-        # Outputs of mapping network are casted to fp32. In mixed precision latents will be automatically be casted.
-        dtype = tf.float32
         # Generate random latents and interpolation t-values.
         # TODO: change to use a noise consistent with the one used by network
-        lat_t01 = generate_latents(batch_size * 2, list(G_mapping.input_shape[1:]),  dtype)
-        lerp_t = tf.random.uniform([batch_size], 0.0, 1.0 if self.sampling == 'full' else 0.0, dtype=dtype)
+        lat_t01 = generate_latents(batch_size * 2, list(G_mapping.input_shape[1:]),  self.compute_dtype)
+        lerp_t = tf.random.uniform([batch_size], 0.0, 1.0 if self.sampling == 'full' else 0.0, dtype=self.compute_dtype)
 
         # Interpolate in W or Z.
         if self.space == 'w':

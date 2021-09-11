@@ -108,6 +108,7 @@
     "dataset_n_parallel_calls": "auto",
     "dataset_n_prefetched_batches": "auto",
     "dataset_max_kimages": 100,
+    "dataset_hw_ratio": 0.75,
     "shuffle_dataset": true,
     "mirror_augment": true,
     "dataset_max_cache_res": null

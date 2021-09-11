@@ -9,10 +9,11 @@ from tensorflow.keras.mixed_precision import LossScaleOptimizer
 
 from metrics.metrics_utils import setup_metrics
 from losses import select_G_loss_fn, select_D_loss_fn
+from checkpoint_utils import save_model, load_model, save_optimizer_loss_scale, load_optimizer_loss_scale,\
+    remove_old_models
 from utils import generate_latents, compute_alpha, update_wsum_alpha, lerp,\
-    get_start_fp16_resolution, should_use_fp16, get_compute_dtype,\
-    save_model, load_model, save_optimizer_loss_scale, load_optimizer_loss_scale, is_finite_grad,\
-    create_images_dir_name, create_images_grid_title, remove_old_models,\
+    get_start_fp16_resolution, should_use_fp16, get_compute_dtype, is_finite_grad,\
+    create_images_dir_name, create_images_grid_title,\
     trace_vars, trace_message, get_gpu_memory_usage,\
     format_time, to_int_dict, validate_data_format, to_z_dim, mult_by_zero, is_last_step, should_write_summary,\
     maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, load_images_paths, set_tf_logging
@@ -47,12 +48,12 @@ def show_vars_stats(vars):
         print(f'{idx}) {var.name}: mean={mean:.3f}, std={std:.3f}')
 
 
-FIRST_STEP_COND_KEY = 'first_step_cond'
-LAST_STEP_COND_KEY = 'last_step_cond'
-STAGE_IMAGES_KEY = 'stage_images'
+FIRST_STEP_COND_KEY          = 'first_step_cond'
+LAST_STEP_COND_KEY           = 'last_step_cond'
+STAGE_IMAGES_KEY             = 'stage_images'
 TRAINING_FINISHED_IMAGES_KEY = 'training_finished_images'
-WRITE_SCALARS_SUMMARY_KEY = 'write_scalars_summary'
-WRITE_HISTS_SUMMARY_KEY = 'write_hists_summary'
+WRITE_SCALARS_SUMMARY_KEY    = 'write_scalars_summary'
+WRITE_HISTS_SUMMARY_KEY      = 'write_hists_summary'
 
 
 class StyleGAN:
@@ -100,17 +101,19 @@ class StyleGAN:
         self.clear_session_for_new_model = True
 
         # Dataset
+        self.dataset_hw_ratio      = config.get(cfg.DATASET_HW_RATIO, cfg.DEFAULT_DATASET_HW_RATIO)
         self.dataset_max_cache_res = config.get(cfg.DATASET_MAX_CACHE_RES, cfg.DEFAULT_DATASET_MAX_CACHE_RES)
         if images_paths is None:
             images_paths = load_images_paths(config)
         # These options are used for metrics
         self.dataset_params = {
-            'fpaths':               images_paths,
-            'mirror_augment':       config.get(cfg.MIRROR_AUGMENT, cfg.DEFAULT_MIRROR_AUGMENT),
-            'shuffle_dataset':      config.get(cfg.SHUFFLE_DATASET, cfg.DEFAULT_SHUFFLE_DATASET),
-            'dtype':                self.compute_dtype,
-            'data_format':          self.data_format,
-            'n_parallel_calls':     config.get(cfg.DATASET_N_PARALLEL_CALLS, cfg.DEFAULT_DATASET_N_PARALLEL_CALLS),
+            'fpaths'              : images_paths,
+            'hw_ratio'            : self.dataset_hw_ratio,
+            'mirror_augment'      : config.get(cfg.MIRROR_AUGMENT, cfg.DEFAULT_MIRROR_AUGMENT),
+            'shuffle_dataset'     : config.get(cfg.SHUFFLE_DATASET, cfg.DEFAULT_SHUFFLE_DATASET),
+            'data_format'         : self.data_format,
+            'use_fp16'            : self.use_mixed_precision,
+            'n_parallel_calls'    : config.get(cfg.DATASET_N_PARALLEL_CALLS, cfg.DEFAULT_DATASET_N_PARALLEL_CALLS),
             'n_prefetched_batches': config.get(cfg.DATASET_N_PREFETCHED_BATCHES, cfg.DEFAULT_DATASET_N_PREFETCHED_BATCHES)
         }
 
@@ -189,10 +192,11 @@ class StyleGAN:
                     self.initialize_optimizers(create_all_variables=True)
                 else:
                     self.metrics_objects = setup_metrics(2 ** res,
-                                                         model_name=self.model_name,
+                                                         hw_ratio=self.dataset_hw_ratio,
                                                          dataset_params=self.dataset_params,
                                                          use_fp16=self.use_mixed_precision,
                                                          use_xla=self.use_xla,
+                                                         model_name=self.model_name,
                                                          metrics=self.metrics)
                     self.initialize_optimizers(create_all_variables=False, res=res, stage=stage)
 
@@ -893,7 +897,8 @@ class StyleGAN:
             valid_images = self.G_model(self.valid_latents, training=False)
 
         valid_images = convert_outputs_to_images(
-            valid_images, max(2 ** res, self.min_target_single_image_size), data_format=self.data_format
+            valid_images, max(2 ** res, self.min_target_single_image_size),
+            hw_ratio=self.dataset_hw_ratio, data_format=self.data_format
         ).numpy()
 
         fast_save_grid(
@@ -1032,11 +1037,11 @@ class StyleGAN:
 
     def post_train_step_actions(self, res, mode, summary_options, summary_writer):
         # Get all needed options
-        first_step_cond = summary_options[FIRST_STEP_COND_KEY]
-        last_step_cond = summary_options[LAST_STEP_COND_KEY]
+        first_step_cond          = summary_options[FIRST_STEP_COND_KEY]
+        last_step_cond           = summary_options[LAST_STEP_COND_KEY]
         training_finished_images = summary_options[TRAINING_FINISHED_IMAGES_KEY]
-        write_scalars_summary = summary_options[WRITE_SCALARS_SUMMARY_KEY]
-        batch_size = self.batch_sizes[2 ** res]
+        write_scalars_summary    = summary_options[WRITE_SCALARS_SUMMARY_KEY]
+        batch_size               = self.batch_sizes[2 ** res]
         # Adjust number of processed images if method is called for last step
         if last_step_cond:
             if mode == TRANSITION_MODE:
@@ -1081,12 +1086,12 @@ class StyleGAN:
         stage_images = (step + 1) * batch_size
         # TODO: should summaries use stage_images or training_finished_images?
         return {
-            FIRST_STEP_COND_KEY: step == 0,
-            LAST_STEP_COND_KEY: last_step_cond,
-            STAGE_IMAGES_KEY: stage_images,
+            FIRST_STEP_COND_KEY         : step == 0,
+            LAST_STEP_COND_KEY          : last_step_cond,
+            STAGE_IMAGES_KEY            : stage_images,
             TRAINING_FINISHED_IMAGES_KEY: stage_images + n_finished_images,
-            WRITE_SCALARS_SUMMARY_KEY: should_write_summary(self.summary_scalars_every, stage_images, batch_size) or last_step_cond,
-            WRITE_HISTS_SUMMARY_KEY: should_write_summary(self.summary_hists_every, stage_images, batch_size) or last_step_cond,
+            WRITE_SCALARS_SUMMARY_KEY   : should_write_summary(self.summary_scalars_every, stage_images, batch_size) or last_step_cond,
+            WRITE_HISTS_SUMMARY_KEY     : should_write_summary(self.summary_hists_every, stage_images, batch_size) or last_step_cond,
         }
 
     def init_training_time(self):

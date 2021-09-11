@@ -20,6 +20,7 @@ NHWC_FORMAT = 'NHWC'
 
 DEFAULT_DATA_FORMAT = NCHW_FORMAT
 DEFAULT_DTYPE = 'float32'
+DEFAULT_USE_FP16 = False
 
 TRANSITION_MODE = 'transition'
 STABILIZATION_MODE = 'stabilization'
@@ -142,9 +143,7 @@ toNHWC_AXIS = [0, 2, 3, 1]
 # NHWC -> NCHW
 toNCHW_AXIS = [0, 3, 1, 2]
 
-LOSS_SCALE_KEY = 'loss_scale'
 RANDOMIZE_NOISE_VAR_NAME = 'is_random_noise'
-DEFAULT_STORAGE_PATH = cfg.DEFAULT_STORAGE_PATH
 
 DEBUG_MODE = 'debug_mode'
 DEFAULT_DEBUG_MODE = '0'
@@ -181,6 +180,10 @@ def validate_data_format(data_format):
     assert data_format in [NCHW_FORMAT, NHWC_FORMAT]
 
 
+def validate_hw_ratio(hw_ratio):
+    assert hw_ratio == 1 or 0.1 < hw_ratio < 1.0
+
+
 def to_z_dim(latent_size, data_format) -> list:
     validate_data_format(data_format)
     if data_format == NCHW_FORMAT:
@@ -188,6 +191,11 @@ def to_z_dim(latent_size, data_format) -> list:
     else:  # data_format == NHWC_FORMAT:
         z_dim = [1, 1, latent_size]
     return z_dim
+
+
+def to_hw_size(image_size, hw_ratio) -> tuple:
+    validate_hw_ratio(hw_ratio)
+    return (int(hw_ratio * image_size), image_size)
 
 
 def create_images_dir_name(model_name, res, mode):
@@ -323,6 +331,20 @@ def get_gpu_memory_usage():
 
 def generate_latents(batch_size: int, z_dim: list, dtype=tf.float32):
     return tf.random.normal(shape=[batch_size] + z_dim, mean=0., stddev=1., dtype=dtype)
+
+
+def extract_images(x, hw_ratio, data_format):
+    if hw_ratio != 1:
+        s = tf.shape(x)
+        if data_format == NCHW_FORMAT:
+            n, c, h, w = s[0], s[1], s[2], s[3]
+            h = int(hw_ratio * float(h))  # h is tensor, so dtypes must match
+            x = x[:, :, (w - h) // 2 : (w + h) // 2, :]
+        else: # data_format == NHWC_FORMAT
+            n, h, w, c = s[0], s[1], s[2], s[3]
+            h = int(hw_ratio * float(h))  # h is tensor, so dtypes must match
+            x = x[:, (w - h) // 2 : (w + h) // 2, :, :]
+    return x
 
 
 # Linear interpolation
@@ -490,274 +512,3 @@ def prepare_gpu(mode='auto', memory_limit=None):
             print(f'Physical GPUs: {len(physical_gpus)} \nSet memory growth\n')
         else:
             print('GPU is not available\n')
-
-
-#----------------------------------------------------------------------------
-# Model saving/loading/remove utils.
-
-h5_weights_key = 'weights'
-
-
-def weights_to_dict(model, optimizer_call: bool = False):
-    vars = model.trainable_variables if not optimizer_call else model.weights
-    if should_log_debug_info():
-        print('\nSaving weights:')
-        for idx, var in enumerate(vars):
-            print(f'{idx}: {var.name}')
-    return {var.name: var.numpy() for var in vars}
-
-
-def load_model_weights_from_dict(model, weights_dict):
-    log_debug_info = should_log_debug_info()
-    print('\nLoading weights from dict')
-    print('\nModel train vars:', model.trainable_variables)
-    print('\nDict vars:', list(weights_dict.keys()))
-    for var in model.trainable_variables:
-        if var.name in weights_dict.keys():
-            if log_debug_info:
-                print(f'Loading {var.name}')
-            var.assign(weights_dict[var.name])
-
-    return model
-
-
-def save_weights(weights_dict, filename: str):
-    f = h5py.File(filename, 'w')
-    g = f.create_group(h5_weights_key)
-
-    for idx, var_name in enumerate(weights_dict.keys()):
-        value = weights_dict[var_name]
-        shape = value.shape
-        dset = g.create_dataset(name=var_name, shape=shape, dtype=value.dtype.name)
-        if not shape:
-            # Scalar
-            dset[()] = value
-        else:
-            dset[:] = value
-
-    f.flush()
-    f.close()
-
-
-def load_weights_into_dict(var_names, filename: str):
-    f = h5py.File(filename, 'r')
-    g = f[h5_weights_key]
-
-    var_dict = {}
-    for var_name in var_names:
-        if var_name in g:
-            # Check for scalar
-            try:
-                var_dict[var_name] = g[var_name][:]
-            except:
-                var_dict[var_name] = g[var_name][()]
-
-    f.close()
-    return var_dict
-
-
-def load_weights(model, filename, optimizer_call: bool = False):
-    vars = model.trainable_variables if not optimizer_call else model.weights
-    var_names = [var.name for var in vars]
-    var_dict = load_weights_into_dict(var_names, filename)
-
-    log_debug_info = should_log_debug_info()
-    loaded_vars = []
-    # Note: another approach is to use set_weights (load ur use existing value) for models and optimizers (maybe with deepcopy?)
-    for var in vars:
-        if var.name in var_dict.keys():
-            if log_debug_info:
-                print(f'Loading {var.name}')
-            # Might be a Strange line for optimizer
-            var.assign(var_dict[var.name])
-            loaded_vars.append(var.name)
-
-    # TODO: for debugging, remove later
-    # print('\nOptimizer call:', optimizer_call)
-    # print('Loaded these vars:\n', loaded_vars)
-
-    return model
-
-
-def create_model_dir_path(model_name, res, stage, step=None, storage_path: str = DEFAULT_STORAGE_PATH):
-    """
-    model_name - name of configuration model
-    res - current resolution
-    stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of all processed images for given resolution and stage
-    storage_path - optional prefix path
-    """
-    res_dir = f'{2**res}x{2**res}'
-    stage_dir = stage
-    step_dir = 'step' + str(step) if step is not None else ''
-    model_dir_path = os.path.join(WEIGHTS_DIR, model_name, res_dir, stage_dir, step_dir)
-
-    if storage_path is not None:
-        model_dir_path = os.path.join(storage_path, model_dir_path)
-
-    return model_dir_path
-
-
-def save_model(model, model_name, model_type, res,
-               stage, step, storage_path: str = DEFAULT_STORAGE_PATH):
-    """
-    model - a model to be saved
-    model_name - name of configuration model
-    model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME],
-                 used as a separate dir level
-    res - current log2 resolution
-    stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of all processed images for given resolution and stage
-    storage_path - optional prefix path
-    Note: should probably change this fun to standard way of saving model
-    """
-    optimizer_call = OPTIMIZER_POSTFIX in model_type
-
-    model_dir_path = create_model_dir_path(
-        model_name=model_name,
-        res=res,
-        stage=stage,
-        step=step,
-        storage_path=storage_path
-    )
-    if optimizer_call:
-        model_dir_path += OPTIMIZER_POSTFIX
-    if not os.path.exists(model_dir_path):
-        os.makedirs(model_dir_path)
-
-    filepath = os.path.join(model_dir_path, model_type + '.h5')
-    weights_dict = weights_to_dict(model, optimizer_call=optimizer_call)
-
-    save_weights(weights_dict, filepath)
-
-
-def save_optimizer_loss_scale(optimizer: mixed_precision.LossScaleOptimizer,
-                              model_name: str, model_type: str, res: int, stage: str,
-                              step: int, storage_path: str = DEFAULT_STORAGE_PATH):
-    """
-    optimizer - an optimizer model from which loss scale is to be saved
-    model_name - name of configuration model
-    model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME],
-                 used as a separate dir level
-    res - current log2 resolution
-    stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of all processed images for given resolution and stage
-    storage_path - optional prefix path
-    Note: should probably change this fun to standard way of saving model
-    """
-    model_dir_path = create_model_dir_path(
-        model_name=model_name,
-        res=res,
-        stage=stage,
-        step=step,
-        storage_path=storage_path
-    )
-    model_dir_path += OPTIMIZER_POSTFIX
-    if not os.path.exists(model_dir_path):
-        os.makedirs(model_dir_path)
-
-    # This function is only called when loss scale is dynamic
-    loss_scale = float(optimizer._loss_scale().numpy())
-    if should_log_debug_info():
-        print(f'Saved loss scale for {model_type}: {loss_scale}')
-
-    filepath = os.path.join(model_dir_path, model_type + '.json')
-    with open(filepath, 'w') as fp:
-        json.dump({LOSS_SCALE_KEY: loss_scale}, fp)
-
-
-def load_model(model, model_name, model_type, res,
-               stage, step, storage_path: str = DEFAULT_STORAGE_PATH):
-    """
-    model - a model to be loaded
-    model_name - name of configuration model
-    model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME], used as a separate dir level
-    res - current log2 resolution
-    stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of all processed images for given resolution and stage
-    storage_path - optional prefix path
-    Note: should probably change this fun to standard way of loading model
-    """
-    optimizer_call = OPTIMIZER_POSTFIX in model_type
-
-    model_dir_path = create_model_dir_path(
-        model_name=model_name,
-        res=res,
-        stage=stage,
-        step=step,
-        storage_path=storage_path
-    )
-    if optimizer_call:
-        model_dir_path += OPTIMIZER_POSTFIX
-    assert os.path.exists(model_dir_path),\
-        f"Can't load weights: directory {model_dir_path} does not exist"
-
-    filepath = os.path.join(model_dir_path, model_type + '.h5')
-    model = load_weights(model, filepath, optimizer_call=optimizer_call)
-    return model
-
-
-def load_optimizer_loss_scale(model_name: str, model_type: str, res: int, stage: str,
-                              step: int, storage_path: str = DEFAULT_STORAGE_PATH):
-    """
-    optimizer - an optimizer model from which loss scale is to be saved
-    model_name - name of configuration model
-    model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME],
-                 used as a separate dir level
-    res - current log2 resolution
-    stage - one of [TRANSITION_MODE, STABILIZATION_MODE]
-    step - number of all processed images for given resolution and stage
-    storage_path - optional prefix path
-    Note: should probably change this fun to standard way of saving model
-    """
-    model_dir_path = create_model_dir_path(
-        model_name=model_name,
-        res=res,
-        stage=stage,
-        step=step,
-        storage_path=storage_path
-    )
-    model_dir_path += OPTIMIZER_POSTFIX
-    if not os.path.exists(model_dir_path):
-        os.makedirs(model_dir_path)
-
-    filepath = os.path.join(model_dir_path, model_type +  OPTIMIZER_POSTFIX + '.json')
-    with open(filepath, 'r') as fp:
-        loss_scale = json.load(fp)[LOSS_SCALE_KEY]
-
-    if should_log_debug_info():
-        print(f'Loaded loss scale for {model_type}: {loss_scale}')
-
-    return loss_scale
-
-
-def remove_old_models(model_name, res, stage, max_models_to_keep: int, storage_path: str = DEFAULT_STORAGE_PATH):
-    """
-    model_name - name of configuration model
-    model_type - one of [GENERATOR_NAME, DISCRIMINATOR_NAME],
-                 used as a separate dir level
-    res - current resolution
-    max_models_to_keep - max number of models to keep
-    storage_path - optional prefix path
-    """
-    # step and model_type are not used, so jut use valid values
-    log_debug_info = should_log_debug_info()
-    if log_debug_info:
-        logging.info('\nRemoving weights...')
-    weights_path = create_model_dir_path(
-        model_name=model_name,
-        res=res,
-        stage=stage,
-        step=1,
-        storage_path=storage_path
-    )
-    res_stage_path = os.path.split(weights_path)[0]
-    sorted_steps_paths = sorted(
-        [x for x in glob.glob(res_stage_path + os.sep + '*') if 'step' in x],
-        key=lambda x: int(x.split('step')[1])
-    )
-    # Remove weights for all steps except the last one
-    for p in sorted_steps_paths[:-max_models_to_keep]:
-        shutil.rmtree(p)
-        if log_debug_info:
-            logging.info(f'Removed weights for path={p}')
