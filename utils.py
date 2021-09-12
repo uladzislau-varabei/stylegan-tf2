@@ -1,14 +1,11 @@
 import os
 import json
 import logging
-import glob
-import shutil
 import platform
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import mixed_precision
-import h5py
 
 from config import Config as cfg
 
@@ -198,7 +195,7 @@ def to_hw_size(image_size, hw_ratio) -> tuple:
     return (int(hw_ratio * image_size), image_size)
 
 
-def create_images_dir_name(model_name, res, mode):
+def create_images_dir_path(model_name, res, mode):
     return os.path.join(IMAGES_DIR, model_name, f'{2**res}x{2**res}', mode)
 
 
@@ -333,6 +330,34 @@ def generate_latents(batch_size: int, z_dim: list, dtype=tf.float32):
     return tf.random.normal(shape=[batch_size] + z_dim, mean=0., stddev=1., dtype=dtype)
 
 
+def restore_images(images):
+    # Minimum OP doesn't support uint8
+    images = tf.math.round((images + 1.0) * (255 / 2))
+    images = tf.clip_by_value(tf.cast(images, dtype=tf.int32), 0, 255)
+    images = tf.cast(images, dtype=tf.uint8)
+    return images
+
+
+def convert_outputs_to_images(net_outputs, target_single_image_size, hw_ratio=1, data_format=DEFAULT_DATA_FORMAT):
+    # Note: should work for linear and tanh activation
+    # 1. Adjust dynamic range of images
+    x = restore_images(net_outputs)
+    # 2. Optionally change data format
+    validate_data_format(data_format)
+    if data_format == NCHW_FORMAT:
+        x = tf.transpose(x, toNHWC_AXIS)
+    # 3. Optionally extract target images for wide dataset
+    validate_hw_ratio(hw_ratio)
+    x = extract_images(x, hw_ratio, NHWC_FORMAT)
+    # 4. Resize images
+    x = tf.image.resize(
+        x,
+        size=to_hw_size(target_single_image_size, hw_ratio),
+        method=tf.image.ResizeMethod.NEAREST_NEIGHBOR
+    )
+    return x
+
+
 def extract_images(x, hw_ratio, data_format):
     if hw_ratio != 1:
         s = tf.shape(x)
@@ -350,6 +375,18 @@ def extract_images(x, hw_ratio, data_format):
 # Linear interpolation
 def lerp(a, b, t):
     return a + (b - a) * t
+
+
+@tf.function
+def smooth_model_weights(sm_model, src_model, beta, device):
+    trace_message('...Tracing smoothing weights...')
+    smoothed_net_vars = sm_model.trainable_variables
+    source_net_vars = src_model.trainable_variables
+    trace_vars(smoothed_net_vars, 'Smoothed vars:')
+    trace_vars(source_net_vars, 'Source vars:')
+    with tf.device(device):
+        for a, b in zip(smoothed_net_vars, source_net_vars):
+            a.assign(lerp(b, a, beta))
 
 
 def enable_mixed_precision_policy():

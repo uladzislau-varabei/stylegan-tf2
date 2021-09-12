@@ -5,7 +5,7 @@ import tensorflow as tf
 
 from config import Config as cfg
 from utils import DEFAULT_USE_FP16, DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT, toNCHW_AXIS, toNHWC_AXIS, \
-    validate_data_format, validate_hw_ratio, to_hw_size, extract_images
+    validate_data_format, validate_hw_ratio, to_hw_size
 
 
 DEFAULT_DATASET_HW_RATIO             = cfg.DEFAULT_DATASET_HW_RATIO
@@ -31,34 +31,6 @@ def normalize_images(images):
     return 2.0 * images - 1.0
 
 
-def restore_images(images):
-    # Minimum OP doesn't support uint8
-    images = tf.math.round((images + 1.0) * (255 / 2))
-    images = tf.clip_by_value(tf.cast(images, dtype=tf.int32), 0, 255)
-    images = tf.cast(images, dtype=tf.uint8)
-    return images
-
-
-def convert_outputs_to_images(net_outputs, target_single_image_size, hw_ratio=1, data_format=DEFAULT_DATA_FORMAT):
-    # Note: should work for linear and tanh activation
-    # 1. Adjust dynamic range of images
-    x = restore_images(net_outputs)
-    # 2. Optionally change data format
-    validate_data_format(data_format)
-    if data_format == NCHW_FORMAT:
-        x = tf.transpose(x, toNHWC_AXIS)
-    # 3. Optionally extract target images for wide dataset
-    validate_hw_ratio(hw_ratio)
-    x = extract_images(x, hw_ratio, NHWC_FORMAT)
-    # 4. Resize images
-    x = tf.image.resize(
-        x,
-        size=to_hw_size(target_single_image_size, hw_ratio),
-        method=tf.image.ResizeMethod.NEAREST_NEIGHBOR
-    )
-    return x
-
-
 def load_image(file_path):
     image = tf.io.read_file(file_path)
     image = tf.io.decode_jpeg(image, channels=3)
@@ -68,6 +40,7 @@ def load_image(file_path):
 
 
 def preprocess_images(images, res, hw_ratio=1, mirror_augment=DEFAULT_MIRROR_AUGMENT, data_format=DEFAULT_DATA_FORMAT, use_fp16=DEFAULT_USE_FP16):
+    validate_data_format(data_format)
     validate_hw_ratio(hw_ratio)
     # 1. Resize images according to the paper implementation (PIL.Image.ANTIALIAS was used)
     images = tf.image.resize(

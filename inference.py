@@ -6,10 +6,10 @@ import numpy as np
 import tensorflow as tf
 
 from config import Config as cfg
-from dataloader_utils import convert_outputs_to_images
+from checkpoint_utils import load_weights
 from image_utils import fast_save_grid
 from utils import INFERENCE_MODE, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WEIGHTS_DIR
-from utils import load_config, prepare_gpu, load_weights, generate_latents, to_z_dim
+from utils import load_config, prepare_gpu, generate_latents, to_z_dim, convert_outputs_to_images
 from model import StyleGAN
 
 
@@ -78,7 +78,7 @@ def generate_images(model: tf.keras.Model, truncation_psi: float, truncation_cut
     z_dim = to_z_dim(latent_size, data_format)
     hw_ratio = config.get(cfg.DATASET_HW_RATIO, cfg.DEFAULT_DATASET_HW_RATIO)
 
-    # Try dealing with a case when lots of images are to be generated
+    #  Case when lots of images are to be generated
     if grid_cols * grid_rows < 32:
         iters, batch_size = 1, grid_cols * grid_rows
     else:

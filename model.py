@@ -13,16 +13,17 @@ from checkpoint_utils import save_model, load_model, save_optimizer_loss_scale, 
     remove_old_models
 from utils import generate_latents, compute_alpha, update_wsum_alpha, lerp,\
     get_start_fp16_resolution, should_use_fp16, get_compute_dtype, is_finite_grad,\
-    create_images_dir_name, create_images_grid_title,\
+    create_images_dir_path, create_images_grid_title,\
     trace_vars, trace_message, get_gpu_memory_usage,\
     format_time, to_int_dict, validate_data_format, to_z_dim, mult_by_zero, is_last_step, should_write_summary,\
-    maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, load_images_paths, set_tf_logging
+    maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, load_images_paths, set_tf_logging,\
+    smooth_model_weights, convert_outputs_to_images
 from utils import DEFAULT_DATA_FORMAT, NHWC_FORMAT, NCHW_FORMAT, toNHWC_AXIS, toNCHW_AXIS,\
     DEFAULT_MODE, TRAIN_MODE, INFERENCE_MODE, BENCHMARK_MODE,\
     GENERATOR_NAME, DISCRIMINATOR_NAME, TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
     CACHE_DIR, DATASET_CACHE_DIR, TF_LOGS_DIR
 from config import Config as cfg
-from dataloader_utils import create_training_dataset, convert_outputs_to_images
+from dataloader_utils import create_training_dataset
 from image_utils import fast_save_grid
 from networks import Generator, Discriminator
 
@@ -48,12 +49,151 @@ def show_vars_stats(vars):
         print(f'{idx}) {var.name}: mean={mean:.3f}, std={std:.3f}')
 
 
+D_KEY  = 'D'
+G_KEY  = 'G'
+GS_KEY = 'Gs'
+
 FIRST_STEP_COND_KEY          = 'first_step_cond'
 LAST_STEP_COND_KEY           = 'last_step_cond'
 STAGE_IMAGES_KEY             = 'stage_images'
 TRAINING_FINISHED_IMAGES_KEY = 'training_finished_images'
 WRITE_SCALARS_SUMMARY_KEY    = 'write_scalars_summary'
 WRITE_HISTS_SUMMARY_KEY      = 'write_hists_summary'
+
+
+class Scheduler:
+
+    def __init__(self, config):
+        self.target_resolution = config[cfg.TARGET_RESOLUTION]
+        self.resolution_log2 = int(np.log2(self.target_resolution))
+        assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
+
+        self.start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
+        self.start_resolution_log2 = int(np.log2(self.start_resolution))
+        assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
+
+        # Training images and batches
+        self.batch_sizes                = to_int_dict(config[cfg.BATCH_SIZES])
+        self.total_kimages              =             config.get(cfg.TOTAL_KIMAGES, cfg.DEFAULT_TOTAL_KIMAGES)
+        self.transition_kimages         =             config.get(cfg.TRANSITION_KIMAGES, cfg.DEFAULT_TRANSITION_KIMAGES)
+        self.transition_kimages_dict    = to_int_dict(config.get(cfg.TRANSITION_KIMAGES_DICT, cfg.DEFAULT_TRANSITION_KIMAGES_DICT))
+        self.stabilization_kimages      =             config.get(cfg.STABILIZATION_KIMAGES, cfg.DEFAULT_STABILIZATION_KIMAGES)
+        self.stabilization_kimages_dict = to_int_dict(config.get(cfg.STABILIZATION_KIMAGES_DICT, cfg.DEFAULT_STABILIZATION_KIMAGES_DICT))
+
+        self.Gs_beta              = config.get(cfg.G_SMOOTHING_BETA, cfg.DEFAULT_G_SMOOTHING_BETA)
+        self.Gs_beta_kimgs        = config.get(cfg.G_SMOOTHING_BETA_KIMAGES, cfg.DEFAULT_G_SMOOTHING_BETA_KIMAGES)
+        # Resolution-specific betas for Gs
+        self.Gs_betas = {}
+
+        self.reset_opt_state_for_new_lod = config.get(cfg.RESET_OPT_STATE_FOR_NEW_LOD, cfg.DEFAULT_RESET_OPT_STATE_FOR_NEW_LOD)
+
+        self.validate_config()
+
+    def validate_config(self):
+        for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
+            if 2 ** res not in self.batch_sizes.keys():
+                assert False, f'Missing batch size for res={2**res}'
+        self.get_n_steps_for_last_stage()
+
+    def validate_res_and_mode_combination(self, res, mode):
+        assert self.start_resolution_log2 <= res <= self.resolution_log2
+        assert res > self.start_resolution_log2 or mode == STABILIZATION_MODE, \
+            'For start resolution only stabilization stage is run'
+
+    def compute_optimizer_steps(self, res, stage):
+        # Note: res and stage refer to the last used model not the current one
+        n_steps = 0
+        if self.reset_opt_state_for_new_lod:
+            assert stage == TRANSITION_MODE, \
+                'If optimizers states should be reset for each resolution, ' \
+                'then optimizers weights should only be loaded from transition stage'
+            n_steps = self.get_n_steps_for_stage(res, stage)
+        else:
+            # Optimizer state is not reset, so sum all previous number of iters
+            for r in range(self.start_resolution_log2, res + 1):
+                if r > self.start_resolution_log2:
+                    n_steps += self.get_n_steps_for_stage(r, TRANSITION_MODE)
+                if r < res or (r == res and stage == STABILIZATION_MODE):
+                    n_steps += self.get_n_steps_for_stage(r, STABILIZATION_MODE)
+        return np.array(n_steps)
+
+    def get_n_steps_for_last_stage(self):
+        batch_size = self.batch_sizes[self.target_resolution]
+        # Simple case when total number of training images is not provided
+        if self.total_kimages is None:
+            n_kimages = self.stabilization_kimages_dict.get(self.target_resolution, self.stabilization_kimages)
+            return int(np.ceil(1000 * n_kimages / batch_size))
+        # Advanced case when total number of training images is not provided
+        n_kimages = 0
+        for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
+            if res > self.start_resolution_log2:
+                n_kimages += self.transition_kimages_dict.get(2 ** res, self.transition_kimages)
+                # TODO: for debugging, remove later
+                # print(f'After res={res}, mode={TRANSITION_MODE}', n_kimages)
+            if res < self.resolution_log2:
+                n_kimages += self.stabilization_kimages_dict.get(2 ** res, self.stabilization_kimages)
+                # TODO: for debugging, remove later
+                # print(f'After res={res}, mode={STABILIZATION_MODE}', n_kimages)
+        n_kimages = self.total_kimages - n_kimages
+        # TODO: for debugging, remove later
+        # print(f'n_kimages for the last stage: {n_kimages}')
+        logging.info(f'n_kimages for the last stage: {n_kimages}')
+        assert n_kimages > 0, 'Total number of images is greater than total number of images for all stages'
+        return int(np.ceil(1000 * n_kimages / batch_size))
+
+    def get_n_steps_for_stage(self, res, mode):
+        """
+        Returns number of training steps for provided res and mode
+        """
+        self.validate_res_and_mode_combination(res, mode)
+        images_res = 2 ** res
+        batch_size = self.batch_sizes[images_res]
+        if mode == TRANSITION_MODE:
+            n_kimages = self.transition_kimages_dict.get(images_res, self.transition_kimages)
+            return int(np.ceil(1000 * n_kimages / batch_size))
+        elif mode == STABILIZATION_MODE:
+            if res < self.resolution_log2:
+                n_kimages = self.stabilization_kimages_dict.get(images_res, self.stabilization_kimages)
+                return int(np.ceil(1000 * n_kimages / batch_size))
+            else:
+                # Last training stage, which usually uses more images
+                return self.get_n_steps_for_last_stage()
+
+    def get_stage_start_processed_images(self, res, mode):
+        """
+        Returns number of processed images when training for provided res and mode is started
+        """
+        self.validate_res_and_mode_combination(res, mode)
+        n_kimages = 0
+        # Iterate for all previous resolutions
+        for r in range(self.start_resolution_log2, res + 1):
+            images_res = 2 ** r
+            if r == res:
+                if mode == STABILIZATION_MODE and r > self.start_resolution_log2:
+                    n_kimages += self.transition_kimages_dict.get(images_res, self.transition_kimages)
+            else:
+                # The first resolution doesn't have transition stage
+                if r > self.start_resolution_log2:
+                    n_kimages += self.transition_kimages_dict.get(images_res, self.transition_kimages)
+                n_kimages += self.stabilization_kimages_dict.get(images_res, self.stabilization_kimages)
+        return int(1000 * n_kimages)
+
+    def get_stage_end_processed_images(self, res, mode):
+        if mode == TRANSITION_MODE:
+            stage_kimages = self.transition_kimages_dict.get(2 ** res, self.transition_kimages)
+        else:  # mode == STABILIZATION_MODE
+            stage_kimages = self.stabilization_kimages_dict.get(2 ** res, self.stabilization_kimages)
+        stage_images = int(1000 * stage_kimages) + self.get_stage_start_processed_images(res, mode)
+        return stage_images
+
+    def get_previous_res_and_stage(self, res, stage):
+        if stage == STABILIZATION_MODE:
+            load_res = res
+            load_stage = TRANSITION_MODE
+        else:
+            load_res = res - 1
+            load_stage = STABILIZATION_MODE
+        return load_res, load_stage
 
 
 class StyleGAN:
@@ -76,13 +216,9 @@ class StyleGAN:
         self.z_dim = to_z_dim(self.latent_size, self.data_format)
 
         # Training images and batches
-        self.batch_sizes                = to_int_dict(config[cfg.BATCH_SIZES])
-        self.batch_repeats                          = config.get(cfg.BATCH_REPEATS, cfg.DEFAULT_BATCH_REPEATS)
-        self.total_kimages                          = config.get(cfg.TOTAL_KIMAGES, cfg.DEFAULT_TOTAL_KIMAGES)
-        self.transition_kimages                     = config.get(cfg.TRANSITION_KIMAGES, cfg.DEFAULT_TRANSITION_KIMAGES)
-        self.transition_kimages_dict    = to_int_dict(config.get(cfg.TRANSITION_KIMAGES_DICT, cfg.DEFAULT_TRANSITION_KIMAGES_DICT))
-        self.stabilization_kimages                  = config.get(cfg.STABILIZATION_KIMAGES, cfg.DEFAULT_STABILIZATION_KIMAGES)
-        self.stabilization_kimages_dict = to_int_dict(config.get(cfg.STABILIZATION_KIMAGES_DICT, cfg.DEFAULT_STABILIZATION_KIMAGES_DICT))
+        self.scheduler = Scheduler(config)
+        self.batch_sizes = to_int_dict(config[cfg.BATCH_SIZES])
+        self.batch_repeats = config.get(cfg.BATCH_REPEATS, cfg.DEFAULT_BATCH_REPEATS)
 
         # Computations
         self.use_mixed_precision  = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
@@ -163,8 +299,6 @@ class StyleGAN:
             for res in range(self.start_resolution_log2, self.resolution_log2 + 1)
         }
         self.valid_latents = self.initialize_valid_latents()
-
-        self.validate_config()
 
         self.G_object = Generator(config)
         self.D_object = Discriminator(config)
@@ -259,12 +393,6 @@ class StyleGAN:
         D_model = self.D_object.create_D_model(model_res=self.resolution_log2, mode=TRANSITION_MODE)
         logging.info('\nThe biggest Discriminator:\n')
         D_model.summary(print_fn=logging.info)
-
-    def validate_config(self):
-        for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
-            if 2 ** res not in self.batch_sizes.keys():
-                assert False, f'Missing batch size for res={2**res}'
-        self.get_n_steps_for_last_stage()
 
     def initialize_main_vars_for_G_optimizer(self, n_iters):
         # The purpose of this function is to create all variables needed for optimizer
@@ -483,12 +611,7 @@ class StyleGAN:
                          f'for resolution lower then or equal to start_fp16_resolution')
             return None, True
 
-        if stage == STABILIZATION_MODE:
-            load_res = res
-            load_stage = TRANSITION_MODE
-        else:
-            load_res = res - 1
-            load_stage = STABILIZATION_MODE
+        load_res, load_stage = self.scheduler.get_previous_res_and_stage(res, stage)
         kwargs = {
             'model_name': self.model_name,
             'model_type': model_type,
@@ -580,30 +703,13 @@ class StyleGAN:
             self.D_optimizer = load_model(**D_optimizer_kwargs)
             self.G_optimizer = load_model(**G_optimizer_kwargs)
 
-        optimizer_steps = self.compute_optimizer_steps(res, stage)
+        optimizer_steps = self.scheduler.compute_optimizer_steps(res, stage)
         set_optimizer_iters(self.D_optimizer, optimizer_steps)
         set_optimizer_iters(self.G_optimizer, optimizer_steps)
 
         # TODO: for debugging, remove later
         print('D opt iters:', self.D_optimizer.iterations)
         print('G opt iters:', self.G_optimizer.iterations)
-
-    def compute_optimizer_steps(self, res, stage):
-        # Note: res and stage refer to the last used model not the current one
-        n_steps = 0
-        if self.reset_opt_state_for_new_lod:
-            assert stage == TRANSITION_MODE, \
-                'If optimizers states should be reset for each resolution, ' \
-                'then optimizers weights should only be loaded from transition stage'
-            n_steps = self.get_n_steps(res, stage)
-        else:
-            # Optimizer state is not reset, so sum all previous number of iters
-            for r in range(self.start_resolution_log2, res + 1):
-                if r > self.start_resolution_log2:
-                    n_steps += self.get_n_steps(r, TRANSITION_MODE)
-                if r < res or (r == res and stage == STABILIZATION_MODE):
-                    n_steps += self.get_n_steps(r, STABILIZATION_MODE)
-        return np.array(n_steps)
 
     def create_images_datasets(self, res=None):
         start_time = time.time()
@@ -645,7 +751,7 @@ class StyleGAN:
 
         return images_dataset
 
-    def create_models(self, res, mode):
+    def create_models(self, res, mode, load_prev_stage_weights=False):
         # All models should be initialized before calling this function
         D_model = self.D_object.create_D_model(res, mode=mode)
         G_model = self.G_object.create_G_model(res, mode=mode)
@@ -662,119 +768,34 @@ class StyleGAN:
         self.G_object.G_synthesis.summary(print_fn=logging.info)
         G_model.summary(print_fn=logging.info)
 
+        if load_prev_stage_weights:
+            load_res, load_mode = self.scheduler.get_previous_res_and_stage(res, mode)
+            D_model, G_model, Gs_model = self.load_trained_models(
+                {D_KEY: D_model, G_KEY: G_model, GS_KEY: Gs_model}, res=load_res, mode=load_mode
+            )
+
         return D_model, G_model, Gs_model
 
-    def update_models_weights(self):
-        self.D_object.save_D_weights_in_class(self.D_model)
-        self.G_object.save_G_weights_in_class(self.G_model)
+    def update_models_weights(self, models):
+        self.D_object.save_D_weights_in_class(models[D_KEY])
+        self.G_object.save_G_weights_in_class(models[G_KEY])
         if self.use_Gs:
-            self.Gs_object.save_G_weights_in_class(self.Gs_model)
+            self.Gs_object.save_G_weights_in_class(models[GS_KEY])
 
-    def load_models_from_class(self):
-        D_model = self.D_object.load_D_weights_from_class(self.D_model)
-        G_model = self.G_object.load_G_weights_from_class(self.G_model)
+    def load_models_from_class(self, models):
+        D_model = self.D_object.load_D_weights_from_class(models[D_KEY])
+        G_model = self.G_object.load_G_weights_from_class(models[G_KEY])
         if self.use_Gs:
-            Gs_model = self.Gs_object.load_G_weights_from_class(self.Gs_model)
+            Gs_model = self.Gs_object.load_G_weights_from_class(models[GS_KEY])
         else:
             Gs_model = None
         return D_model, G_model, Gs_model
 
-    def validate_res_and_mode_combination(self, res, mode):
-        assert self.start_resolution_log2 <= res <= self.resolution_log2
-        assert res > self.start_resolution_log2 or mode == STABILIZATION_MODE, \
-            'For start resolution only stabilization stage is run'
+    def load_trained_models(self, models, res, mode):
+        logging.info(f'Loading models for res={res} and mode={STABILIZATION_MODE}...')
 
-    def get_n_steps_for_last_stage(self):
-        batch_size = self.batch_sizes[self.target_resolution]
-        # Simple case when total number of training images is not provided
-        if self.total_kimages is None:
-            n_kimages = self.stabilization_kimages_dict.get(self.target_resolution, self.stabilization_kimages)
-            return int(np.ceil(1000 * n_kimages / batch_size))
-        # Advanced case when total number of training images is not provided
-        n_kimages = 0
-        for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
-            if res > self.start_resolution_log2:
-                n_kimages += self.transition_kimages_dict.get(2 ** res, self.transition_kimages)
-                # TODO: for debugging, remove later
-                # print(f'After res={res}, mode={TRANSITION_MODE}', n_kimages)
-            if res < self.resolution_log2:
-                n_kimages += self.stabilization_kimages_dict.get(2 ** res, self.stabilization_kimages)
-                # TODO: for debugging, remove later
-                # print(f'After res={res}, mode={STABILIZATION_MODE}', n_kimages)
-        n_kimages = self.total_kimages - n_kimages
-        # TODO: for debugging, remove later
-        # print(f'n_kimages for the last stage: {n_kimages}')
-        logging.info(f'n_kimages for the last stage: {n_kimages}')
-        assert n_kimages > 0, 'Total number of images is greater than total number of images for all stages'
-        return int(np.ceil(1000 * n_kimages / batch_size))
-
-    def get_n_steps(self, res, mode):
-        """
-        Returns number of training steps for provided res and mode
-        """
-        self.validate_res_and_mode_combination(res, mode)
-        images_res = 2 ** res
-        batch_size = self.batch_sizes[images_res]
-        if mode == TRANSITION_MODE:
-            n_kimages = self.transition_kimages_dict.get(images_res, self.transition_kimages)
-            return int(np.ceil(1000 * n_kimages / batch_size))
-        elif mode == STABILIZATION_MODE:
-            if res < self.resolution_log2:
-                n_kimages = self.stabilization_kimages_dict.get(images_res, self.stabilization_kimages)
-                return int(np.ceil(1000 * n_kimages / batch_size))
-            else:
-                # Last training stage, which usually uses more images
-                return self.get_n_steps_for_last_stage()
-
-    def get_n_finished_steps(self, res, mode):
-        """
-        Returns number of finished training steps when training for provided res and mode
-        """
-        self.validate_res_and_mode_combination(res, mode)
-        n_steps = 0
-        # Iterate for all previous resolutions
-        for r in range(self.start_resolution_log2, res + 1):
-            if r == res:
-                if mode == STABILIZATION_MODE and r > self.start_resolution_log2:
-                    n_steps += self.get_n_steps(res, TRANSITION_MODE)
-            else:
-                # The first resolution doesn't have transition stage
-                if r > self.start_resolution_log2:
-                    n_steps += self.get_n_steps(r, TRANSITION_MODE)
-                n_steps += self.get_n_steps(r, STABILIZATION_MODE)
-        return n_steps
-
-    def get_n_processed_images(self, res, mode):
-        """
-        Returns number of processed images when training for provided res and mode is started
-        """
-        self.validate_res_and_mode_combination(res, mode)
-        n_kimages = 0
-        # Iterate for all previous resolutions
-        for r in range(self.start_resolution_log2, res + 1):
-            images_res = 2 ** r
-            if r == res:
-                if mode == STABILIZATION_MODE and r > self.start_resolution_log2:
-                    n_kimages += self.transition_kimages_dict.get(images_res, self.transition_kimages)
-            else:
-                # The first resolution doesn't have transition stage
-                if r > self.start_resolution_log2:
-                    n_kimages += self.transition_kimages_dict.get(images_res, self.transition_kimages)
-                n_kimages += self.stabilization_kimages_dict.get(images_res, self.stabilization_kimages)
-        return int(1000 * n_kimages)
-
-    def load_trained_models(self, res, mode, models=None):
-        # Note: when calling this function for inference models arg should not be passed
-        if models is None:
-            D_model, G_model, Gs_model = self.create_models(res, mode=mode)
-        else:
-            D_model, G_model, Gs_model = models
-
-        if mode == TRANSITION_MODE:
-            stage_kimages = self.transition_kimages_dict.get(2 ** res, self.transition_kimages)
-        else:  # mode == STABILIZATION_MODE
-            stage_kimages = self.stabilization_kimages_dict.get(2 ** res, self.stabilization_kimages)
-        step = int(1000 * stage_kimages) + self.get_n_processed_images(res, mode)
+        D_model, G_model, Gs_model = models[D_KEY], models[G_KEY], models[GS_KEY]
+        step = self.scheduler.get_stage_end_processed_images(res, mode)
 
         # TODO: for debugging, remove later
         # print('\nD stats after init:')
@@ -790,7 +811,7 @@ class StyleGAN:
             G_model, self.model_name, GENERATOR_NAME,
             res=res, stage=mode, step=step, storage_path=self.storage_path
         )
-        if self.use_Gs:
+        if Gs_model is not None:
             Gs_model = load_model(
                 Gs_model, self.model_name, GENERATOR_NAME + SMOOTH_POSTFIX,
                 res=res, stage=mode, step=step, storage_path=self.storage_path
@@ -805,37 +826,19 @@ class StyleGAN:
         logging.info(f'Loaded model weights from res={res}, mode={mode}')
         return D_model, G_model, Gs_model
 
-    def save_model_wrapper(self, model_type, res, stage, step):
-        Gs_name = 'G' + SMOOTH_POSTFIX
-        assert model_type in ['G', 'D', Gs_name]
-        MODEL_ARG = 'model'
-        MODEL_TYPE_ARG = 'model_type'
-
-        if model_type == 'D':
-            kwargs = {MODEL_ARG: self.D_model, MODEL_TYPE_ARG: DISCRIMINATOR_NAME}
-        elif model_type == 'G':
-            kwargs = {MODEL_ARG: self.G_model, MODEL_TYPE_ARG: GENERATOR_NAME}
-        elif model_type == Gs_name:
-            kwargs = {MODEL_ARG: self.Gs_model, MODEL_TYPE_ARG: GENERATOR_NAME + SMOOTH_POSTFIX}
-        else:
-            assert False, f"Unsupported model type '{model_type}'"
-
+    def save_models(self, models, res, mode, step):
+        D_model, G_model, Gs_model = models[D_KEY], models[G_KEY], models[GS_KEY]
         shared_kwargs = {
             'model_name': self.model_name,
             'res': res,
-            'stage': stage,
+            'stage': mode,
             'step': step,
             'storage_path': self.storage_path
         }
-
-        kwargs = {**kwargs, **shared_kwargs}
-        save_model(**kwargs)
-
-    def save_models(self, res, mode, step):
-        self.save_model_wrapper(model_type='D', res=res, stage=mode, step=step)
-        self.save_model_wrapper(model_type='G', res=res, stage=mode, step=step)
-        if self.use_Gs:
-            self.save_model_wrapper(model_type='G' + SMOOTH_POSTFIX, res=res, stage=mode, step=step)
+        save_model(model=D_model, model_type=DISCRIMINATOR_NAME, **shared_kwargs)
+        save_model(model=G_model, model_type=GENERATOR_NAME, **shared_kwargs)
+        if Gs_model is not None:
+            save_model(model=Gs_model, model_type=GENERATOR_NAME + SMOOTH_POSTFIX, **shared_kwargs)
 
     def save_optimizers_weights(self, res, stage):
         shared_kwargs = {
@@ -872,7 +875,8 @@ class StyleGAN:
             save_optimizer_loss_scale(**{OPTIMIZER_ARG: self.D_optimizer, MODEL_TYPE_ARG: D_model_type, **shared_kwargs})
             save_optimizer_loss_scale(**{OPTIMIZER_ARG: self.G_optimizer, MODEL_TYPE_ARG: G_model_type, **shared_kwargs})
 
-    def save_valid_images(self, res, training_finished_images, stage, smoothed=False):
+    def save_valid_images(self, models, training_finished_images, res, stage, smoothed=False):
+        G_model, Gs_model = models[G_KEY], models[GS_KEY]
         dir_stage = stage
         if smoothed:
             dir_stage += SMOOTH_POSTFIX
@@ -880,7 +884,7 @@ class StyleGAN:
         digits_in_number = 8 # Total number of training images is 25000k for resolution 1024
         fname = ('%0' + str(digits_in_number) + 'd') % training_finished_images
 
-        valid_images_dir = create_images_dir_name(self.model_name, res, dir_stage)
+        valid_images_dir = create_images_dir_path(self.model_name, res, dir_stage)
         use_grid_title = False
         if use_grid_title:
             valid_images_grid_title = create_images_grid_title(res, dir_stage, training_finished_images)
@@ -890,11 +894,11 @@ class StyleGAN:
         save_in_jpg = res > self.max_png_res
 
         if smoothed:
-            valid_images = self.Gs_model(self.Gs_valid_latents, training=False)
+            valid_images = Gs_model(self.Gs_valid_latents, training=False)
             if not self.use_gpu_for_Gs:
                 valid_images = tf.transpose(valid_images, toNCHW_AXIS)
         else:
-            valid_images = self.G_model(self.valid_latents, training=False)
+            valid_images = G_model(self.valid_latents, training=False)
 
         valid_images = convert_outputs_to_images(
             valid_images, max(2 ** res, self.min_target_single_image_size),
@@ -915,17 +919,6 @@ class StyleGAN:
     @tf.function
     def generate_latents(self, batch_size):
         return generate_latents(batch_size, self.z_dim, self.compute_dtype)
-
-    @tf.function
-    def smooth_net_weights(self, Gs_model, G_model, beta):
-        trace_message('...Tracing smoothing weights...')
-        smoothed_net_vars = Gs_model.trainable_variables
-        source_net_vars = G_model.trainable_variables
-        trace_vars(smoothed_net_vars, 'Smoothed vars:')
-        trace_vars(source_net_vars, 'Source vars:')
-        with tf.device(self.Gs_device):
-            for a, b in zip(smoothed_net_vars, source_net_vars):
-                a.assign(lerp(b, a, beta))
 
     @tf.function
     def G_train_step(self, G_model, D_model, latents, write_scalars_summary, write_hists_summary, step):
@@ -1035,7 +1028,8 @@ class StyleGAN:
         tf.summary.scalar(f'Timing/Total(hours)', total_time / (60.0 * 60.0), step=training_finished_images)
         tf.summary.scalar(f'Timing/Total(days)', total_time / (24.0 * 60.0 * 60.0), step=training_finished_images)
 
-    def post_train_step_actions(self, res, mode, summary_options, summary_writer):
+    def post_train_step_actions(self, models, res, mode, summary_options, summary_writer):
+        D_model, G_model, Gs_model = models[D_KEY], models[G_KEY], models[GS_KEY]
         # Get all needed options
         first_step_cond          = summary_options[FIRST_STEP_COND_KEY]
         last_step_cond           = summary_options[LAST_STEP_COND_KEY]
@@ -1044,18 +1038,13 @@ class StyleGAN:
         batch_size               = self.batch_sizes[2 ** res]
         # Adjust number of processed images if method is called for last step
         if last_step_cond:
-            if mode == TRANSITION_MODE:
-                stage_kimages = self.transition_kimages_dict.get(2 ** res, self.transition_kimages)
-            else: # mode == STABILIZATION_MODE
-                stage_kimages = self.stabilization_kimages_dict.get(2 ** res, self.stabilization_kimages)
-            max_stage_images = int(1000 * stage_kimages) + self.get_n_processed_images(res, mode)
-            training_finished_images = min(training_finished_images, max_stage_images)
+            training_finished_images = self.scheduler.get_stage_end_processed_images(res, mode)
 
         if not first_step_cond:
             # For the first step optimizers learning rates are zeros
-            if self.use_Gs:
-                self.smooth_net_weights(
-                    Gs_model=self.Gs_model, G_model=self.G_model, beta=self.Gs_betas[res]
+            if Gs_model is not None:
+                smooth_model_weights(
+                    sm_model=Gs_model, src_model=G_model, beta=self.Gs_betas[res], device=self.Gs_device
                 )
 
         if should_write_summary(self.run_metrics_every, training_finished_images, batch_size) or last_step_cond:
@@ -1074,12 +1063,12 @@ class StyleGAN:
             summary_writer.flush()
 
         if should_write_summary(self.save_model_every, training_finished_images, batch_size) or last_step_cond:
-            self.save_models(res=res, mode=mode, step=training_finished_images)
+            self.save_models(models=models, res=res, mode=mode, step=training_finished_images)
 
         if should_write_summary(self.save_images_every, training_finished_images, batch_size) or last_step_cond:
-            self.save_valid_images(res, training_finished_images, stage=mode)
-            if self.use_Gs:
-                self.save_valid_images(res, training_finished_images, stage=mode, smoothed=True)
+            self.save_valid_images(models, training_finished_images, res=res, stage=mode)
+            if Gs_model is not None:
+                self.save_valid_images(models, training_finished_images, res=res, stage=mode, smoothed=True)
 
     def summary_options(self, step, stage_steps, n_finished_images, batch_size):
         last_step_cond = is_last_step(step, stage_steps)
@@ -1101,9 +1090,10 @@ class StyleGAN:
     def train(self):
         # TODO: refactor this function, and make it consistent with training for each separate stage
         self.init_training_time()
-        tf_step = tf.Variable(0, trainable=False, dtype=tf.int64)
+
+        tf_step                  = tf.Variable(0, trainable=False, dtype=tf.int64)
         tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
-        tf_write_hists_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_write_hists_summary   = tf.Variable(True, trainable=False, dtype=tf.bool)
 
         for res in tqdm(range(self.start_resolution_log2, self.resolution_log2 + 1), desc='Training res'):
             logging.info(f'Training {2**res}x{2**res} model...')
@@ -1114,12 +1104,12 @@ class StyleGAN:
             self.adjust_optimizers_learning_rate(res)
 
             images_dataset = iter(self.images_datasets[res])
-            batch_size = self.batch_sizes[2 ** res]
+            batch_size     = self.batch_sizes[2 ** res]
             summary_writer = self.summary_writers[res]
 
-            n_finished_images = self.get_n_processed_images(res, TRANSITION_MODE)
-            transition_steps = self.get_n_steps(res, TRANSITION_MODE)
-            stabilization_steps = self.get_n_steps(res, STABILIZATION_MODE)
+            n_finished_images   = self.scheduler.get_stage_start_processed_images(res, TRANSITION_MODE)
+            transition_steps    = self.scheduler.get_n_steps_for_stage(res, TRANSITION_MODE)
+            stabilization_steps = self.scheduler.get_n_steps_for_stage(res, STABILIZATION_MODE)
 
             with summary_writer.as_default():
                 # The first resolution doesn't use alpha parameter,
@@ -1132,8 +1122,8 @@ class StyleGAN:
                         logging.info('Clearing session...')
                         tf.keras.backend.clear_session()
 
-                    self.D_model, self.G_model, self.Gs_model = self.create_models(res, mode=TRANSITION_MODE)
-                    self.D_model, self.G_model, self.Gs_model = self.load_models_from_class()
+                    D_model, G_model, Gs_model = self.create_models(res, mode=TRANSITION_MODE)
+                    D_model, G_model, Gs_model = self.load_models_from_class({D_KEY: D_model, G_KEY: G_model, GS_KEY: Gs_model})
 
                     tf_step.assign(n_finished_images)
                     tf_write_scalars_summary.assign(True)
@@ -1148,10 +1138,10 @@ class StyleGAN:
 
                         if step % self.batch_repeats == 0:
                             alpha = compute_alpha(step, transition_steps)
-                            self.D_model = update_wsum_alpha(self.D_model, alpha)
-                            self.G_model = update_wsum_alpha(self.G_model, alpha)
-                            if self.use_Gs:
-                                self.Gs_model = update_wsum_alpha(self.Gs_model, alpha)
+                            D_model = update_wsum_alpha(D_model, alpha)
+                            G_model = update_wsum_alpha(G_model, alpha)
+                            if Gs_model is not None:
+                                Gs_model = update_wsum_alpha(Gs_model, alpha)
 
                         if summary_options[WRITE_SCALARS_SUMMARY_KEY]:
                             tf.summary.scalar('Alpha', alpha, step=summary_options[TRAINING_FINISHED_IMAGES_KEY])
@@ -1160,17 +1150,18 @@ class StyleGAN:
                         D_latents = self.generate_latents(batch_size)
                         batch_images = next(images_dataset)
                         self.train_step(
-                            G_model=self.G_model, D_model=self.D_model,
+                            G_model=G_model, D_model=D_model,
                             G_latents=G_latents, D_latents=D_latents, images=batch_images,
                             write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                         )
                         self.post_train_step_actions(
-                            res, mode=TRANSITION_MODE, summary_options=summary_options, summary_writer=summary_writer
+                            models={D_KEY: D_model, G_KEY: G_model, GS_KEY: Gs_model},
+                            res=res, mode=TRANSITION_MODE, summary_options=summary_options, summary_writer=summary_writer
                         )
 
-                    self.update_models_weights()
+                    self.update_models_weights({D_KEY: D_model, G_KEY: G_model, GS_KEY: Gs_model})
                     remove_old_models(
-                        self.model_name, res, stage=TRANSITION_MODE,
+                        self.model_name, res=res, stage=TRANSITION_MODE,
                         max_models_to_keep=self.max_models_to_keep, storage_path=self.storage_path
                     )
 
@@ -1184,8 +1175,8 @@ class StyleGAN:
                     logging.info('Clearing session...')
                     tf.keras.backend.clear_session()
 
-                self.D_model, self.G_model, self.Gs_model = self.create_models(res, mode=STABILIZATION_MODE)
-                self.D_model, self.G_model, self.Gs_model = self.load_models_from_class()
+                D_model, G_model, Gs_model = self.create_models(res, mode=STABILIZATION_MODE)
+                D_model, G_model, Gs_model = self.load_models_from_class({D_KEY: D_model, G_KEY: G_model, GS_KEY: Gs_model})
 
                 n_finished_images += transition_steps * batch_size if res > self.start_resolution_log2 else 0
                 tf_step.assign(n_finished_images)
@@ -1203,17 +1194,18 @@ class StyleGAN:
                     D_latents = self.generate_latents(batch_size)
                     batch_images = next(images_dataset)
                     self.train_step(
-                        G_model=self.G_model, D_model=self.D_model,
+                        G_model=G_model, D_model=D_model,
                         G_latents=G_latents, D_latents=D_latents, images=batch_images,
                         write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                     )
                     self.post_train_step_actions(
-                        res, mode=STABILIZATION_MODE, summary_options=summary_options, summary_writer=summary_writer
+                        models={D_KEY: D_model, G_KEY: G_model, GS_KEY: Gs_model},
+                        res=res, mode=STABILIZATION_MODE, summary_options=summary_options, summary_writer=summary_writer
                     )
 
-                self.update_models_weights()
+                self.update_models_weights({D_KEY: D_model, G_KEY: G_model, GS_KEY: Gs_model})
                 remove_old_models(
-                    self.model_name, res, stage=STABILIZATION_MODE,
+                    self.model_name, res=res, stage=STABILIZATION_MODE,
                     max_models_to_keep=self.max_models_to_keep, storage_path=self.storage_path
                 )
 
@@ -1231,24 +1223,17 @@ class StyleGAN:
     def run_transition_stage(self, res):
         self.init_training_time()
 
-        self.D_model, self.G_model, self.Gs_model = self.create_models(res, mode=TRANSITION_MODE)
-        # Load weights from previous stage: res - 1 and stabilization mode
-        logging.info(f'Loading models for res={res} and mode={TRANSITION_MODE}...')
-        self.D_model, self.G_model, self.Gs_model = self.load_trained_models(
-            res - 1, STABILIZATION_MODE, models=[self.D_model, self.G_model, self.Gs_model]
-        )
+        D_model, G_model, Gs_model = self.create_models(res, mode=TRANSITION_MODE, load_prev_stage_weights=True)
         self.zero_optimizers_learning_rate()
 
-        images_dataset = iter(self.images_datasets[res])
-        batch_size = self.batch_sizes[2 ** res]
-        summary_writer = self.summary_writers[res]
-
-        n_finished_images = self.get_n_processed_images(res, TRANSITION_MODE)
-        transition_steps = self.get_n_steps(res, TRANSITION_MODE)
-
-        tf_step = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
+        images_dataset           = iter(self.images_datasets[res])
+        batch_size               = self.batch_sizes[2 ** res]
+        summary_writer           = self.summary_writers[res]
+        n_finished_images        = self.scheduler.get_stage_start_processed_images(res, TRANSITION_MODE)
+        transition_steps         = self.scheduler.get_n_steps_for_stage(res, TRANSITION_MODE)
+        tf_step                  = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
         tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
-        tf_write_hists_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_write_hists_summary   = tf.Variable(True, trainable=False, dtype=tf.bool)
 
         with summary_writer.as_default():
             desc = f'{2**res}x{2**res} model, transition steps'
@@ -1260,10 +1245,10 @@ class StyleGAN:
 
                 if step % self.batch_repeats == 0:
                     alpha = compute_alpha(step, transition_steps)
-                    self.D_model = update_wsum_alpha(self.D_model, alpha)
-                    self.G_model = update_wsum_alpha(self.G_model, alpha)
-                    if self.use_Gs:
-                        self.Gs_model = update_wsum_alpha(self.Gs_model, alpha)
+                    D_model = update_wsum_alpha(D_model, alpha)
+                    G_model = update_wsum_alpha(G_model, alpha)
+                    if Gs_model is not None:
+                        Gs_model = update_wsum_alpha(Gs_model, alpha)
 
                 if summary_options[WRITE_SCALARS_SUMMARY_KEY]:
                     tf.summary.scalar('Alpha', alpha, step=summary_options[TRAINING_FINISHED_IMAGES_KEY])
@@ -1272,21 +1257,24 @@ class StyleGAN:
                 D_latents = self.generate_latents(batch_size)
                 batch_images = next(images_dataset)
                 self.train_step(
-                    G_model=self.G_model, D_model=self.D_model,
+                    G_model=G_model, D_model=D_model,
                     G_latents=G_latents, D_latents=D_latents, images=batch_images,
                     write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                 )
+
                 if summary_options[FIRST_STEP_COND_KEY]:
                     if not self.reset_opt_state_for_new_lod:
                         self.restore_optimizers_state(res - 1, STABILIZATION_MODE)
                     # Always adjust learning rates
                     self.adjust_optimizers_learning_rate(res)
+
                 self.post_train_step_actions(
+                    models={D_KEY: D_model, G_KEY: G_model, GS_KEY: Gs_model},
                     res=res, mode=TRANSITION_MODE, summary_options=summary_options, summary_writer=summary_writer
                 )
 
         remove_old_models(
-            self.model_name, res, stage=TRANSITION_MODE,
+            self.model_name, res=res, stage=TRANSITION_MODE,
             max_models_to_keep=self.max_models_to_keep, storage_path=self.storage_path
         )
 
@@ -1299,25 +1287,18 @@ class StyleGAN:
     def run_stabilization_stage(self, res):
         self.init_training_time()
 
-        self.D_model, self.G_model, self.Gs_model = self.create_models(res, mode=STABILIZATION_MODE)
-        if res > self.start_resolution_log2:
-            logging.info(f'Loading models for res={res} and mode={STABILIZATION_MODE}...')
-            # Load weights from previous stage: res and transition mode
-            self.D_model, self.G_model, self.Gs_model = self.load_trained_models(
-                res, TRANSITION_MODE, models=[self.D_model, self.G_model, self.Gs_model]
-            )
+        load_pres_stage_weights = res > self.start_resolution_log2
+        D_model, G_model, Gs_model = self.create_models(res, mode=STABILIZATION_MODE, load_prev_stage_weights=load_pres_stage_weights)
         self.zero_optimizers_learning_rate()
 
-        images_dataset = iter(self.images_datasets[res])
-        batch_size = self.batch_sizes[2 ** res]
-        summary_writer = self.summary_writers[res]
-
-        n_finished_images = self.get_n_processed_images(res, STABILIZATION_MODE)
-        stabilization_steps = self.get_n_steps(res, STABILIZATION_MODE)
-
-        tf_step = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
+        images_dataset           = iter(self.images_datasets[res])
+        batch_size               = self.batch_sizes[2 ** res]
+        summary_writer           = self.summary_writers[res]
+        n_finished_images        = self.scheduler.get_stage_start_processed_images(res, STABILIZATION_MODE)
+        stabilization_steps      = self.scheduler.get_n_steps_for_stage(res, STABILIZATION_MODE)
+        tf_step                  = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
         tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
-        tf_write_hists_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_write_hists_summary   = tf.Variable(True, trainable=False, dtype=tf.bool)
 
         with summary_writer.as_default():
             desc = f'{2**res}x{2**res} model, stabilization steps'
@@ -1331,21 +1312,24 @@ class StyleGAN:
                 D_latents = self.generate_latents(batch_size)
                 batch_images = next(images_dataset)
                 self.train_step(
-                    G_model=self.G_model, D_model=self.D_model,
+                    G_model=G_model, D_model=D_model,
                     G_latents=G_latents, D_latents=D_latents, images=batch_images,
                     write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                 )
+
                 if summary_options[FIRST_STEP_COND_KEY]:
                     if res > self.start_resolution_log2:
                         self.restore_optimizers_state(res, stage=TRANSITION_MODE)
                     # Always adjust learning rates
                     self.adjust_optimizers_learning_rate(res)
+
                 self.post_train_step_actions(
-                    res, mode=STABILIZATION_MODE, summary_options=summary_options, summary_writer=summary_writer
+                    models={D_KEY: D_model, G_KEY: G_model, GS_KEY: Gs_model},
+                    res=res, mode=STABILIZATION_MODE, summary_options=summary_options, summary_writer=summary_writer
                 )
 
         remove_old_models(
-            self.model_name, res, stage=STABILIZATION_MODE,
+            self.model_name, res=res, stage=STABILIZATION_MODE,
             max_models_to_keep=self.max_models_to_keep, storage_path=self.storage_path
         )
 
@@ -1384,11 +1368,11 @@ class StyleGAN:
     def run_benchmark_stage(self, res, mode, images):
         stage_start_time = time.time()
 
-        self.D_model, self.G_model, self.Gs_model = self.create_models(res, mode=mode)
+        D_model, G_model, Gs_model = self.create_models(res, mode=mode)
         self.adjust_optimizers_learning_rate(res)
 
-        images_dataset = iter(self.images_datasets[res])
-        batch_size = self.batch_sizes[2 ** res]
+        images_dataset  = iter(self.images_datasets[res])
+        batch_size      = self.batch_sizes[2 ** res]
         benchmark_steps = images // batch_size
 
         desc = f'Benchmark {2**res}x{2**res} model, {mode} steps'
@@ -1400,16 +1384,16 @@ class StyleGAN:
             if mode == TRANSITION_MODE:
                 if step % self.batch_repeats == 0:
                     alpha = compute_alpha(step, benchmark_steps)
-                    self.D_model = update_wsum_alpha(self.D_model, alpha)
-                    self.G_model = update_wsum_alpha(self.G_model, alpha)
-                    if self.use_Gs:
-                        self.Gs_model = update_wsum_alpha(self.Gs_model, alpha)
+                    D_model = update_wsum_alpha(D_model, alpha)
+                    G_model = update_wsum_alpha(G_model, alpha)
+                    if Gs_model is not None:
+                        Gs_model = update_wsum_alpha(Gs_model, alpha)
 
             G_latents = self.generate_latents(batch_size)
             D_latents = self.generate_latents(batch_size)
             batch_images = next(images_dataset)
             self.train_step(
-                G_model=self.G_model, D_model=self.D_model,
+                G_model=G_model, D_model=D_model,
                 G_latents=G_latents, D_latents=D_latents, images=batch_images,
                 write_scalars_summary=False, write_hists_summary=False, step=-1
             )
