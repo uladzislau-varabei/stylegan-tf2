@@ -4,8 +4,8 @@ import logging
 import tensorflow as tf
 
 from config import Config as cfg
-from utils import DEFAULT_USE_FP16, DEFAULT_DATA_FORMAT, NCHW_FORMAT, NHWC_FORMAT, toNCHW_AXIS, toNHWC_AXIS, \
-    validate_data_format, validate_hw_ratio, to_hw_size
+from utils import NCHW_FORMAT, NHWC_FORMAT, validate_data_format, validate_hw_ratio, to_hw_size
+from tf_utils import DEFAULT_USE_FP16, DEFAULT_DATA_FORMAT, toNCHW_AXIS, toNHWC_AXIS
 
 
 DEFAULT_DATASET_HW_RATIO             = cfg.DEFAULT_DATASET_HW_RATIO
@@ -40,8 +40,6 @@ def load_image(file_path):
 
 
 def preprocess_images(images, res, hw_ratio=1, mirror_augment=DEFAULT_MIRROR_AUGMENT, data_format=DEFAULT_DATA_FORMAT, use_fp16=DEFAULT_USE_FP16):
-    validate_data_format(data_format)
-    validate_hw_ratio(hw_ratio)
     # 1. Resize images according to the paper implementation (PIL.Image.ANTIALIAS was used)
     images = tf.image.resize(
         images, size=to_hw_size(2 ** res, hw_ratio), method=tf.image.ResizeMethod.LANCZOS3, antialias=True
@@ -90,14 +88,15 @@ def create_training_dataset(fpaths, res, batch_size,
                 value = n
         return value
 
+    validate_data_format(data_format)
+    validate_hw_ratio(hw_ratio)
+
     ds = tf.data.Dataset.from_tensor_slices(fpaths)
 
     if shuffle_dataset:
         shuffle_buffer_size = len(fpaths)
         logging.info('Shuffling dataset...')
-        ds = ds.shuffle(
-            buffer_size=shuffle_buffer_size, reshuffle_each_iteration=True
-        )
+        ds = ds.shuffle(buffer_size=shuffle_buffer_size, reshuffle_each_iteration=True)
 
     # Split loading and preprocessing to make data pipeline more efficient
     ds = ds.map(lambda x: load_image(x), num_parallel_calls=get_value(n_parallel_calls))
@@ -115,7 +114,7 @@ def create_training_dataset(fpaths, res, batch_size,
     # Perform vectorized operations
     ds = ds.map(
         lambda x: preprocess_images(
-            x, res=res, hw_ratio=hw_ratio,mirror_augment=mirror_augment, data_format=data_format, use_fp16=use_fp16
+            x, res=res, hw_ratio=hw_ratio, mirror_augment=mirror_augment, data_format=data_format, use_fp16=use_fp16
         ),
         num_parallel_calls=get_value(n_parallel_calls)
     )

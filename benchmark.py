@@ -4,7 +4,8 @@ import argparse
 import numpy as np
 
 from config import Config as cfg
-from utils import load_config, prepare_gpu, STABILIZATION_MODE, TRANSITION_MODE, BENCHMARK_MODE
+from utils import load_config, STABILIZATION_MODE, TRANSITION_MODE, BENCHMARK_MODE
+from tf_utils import prepare_gpu
 from model import StyleGAN
 
 
@@ -13,8 +14,7 @@ def parse_args():
     parser.add_argument(
         '--config_path',
         help='Path to a config of a model to benchmark (json format)',
-        default=os.path.join('configs', 'new_lsun_living_room.json'),
-        # required=True
+        required=True
     )
     parser.add_argument(
         '--images',
@@ -39,7 +39,10 @@ def parse_args():
 
 if __name__ == '__main__':
     # Example call:
-    # python .\benchmark.py --config .\configs\new_lsun_living_room.json --images 1000 --res 256
+    # python .\benchmark.py --config_path .\configs\new_lsun_living_room.json --images 1000 --res 256
+    #
+    # python .\benchmark.py --config_path .\configs\new_lsun_living_room.json --images 1000 --res 512 --transition_stage
+    # python .\benchmark.py --config_path .\configs\lsun_car_512x384.json --images 1000 --res 512 --transition_stage
     args = parse_args()
 
     images = args.images
@@ -55,7 +58,7 @@ if __name__ == '__main__':
         res = int(np.log2(res))
         stage = TRANSITION_MODE if transition_stage else STABILIZATION_MODE
 
-    # prepare_gpu(mode='growth')
+    #prepare_gpu(mode='growth')
     prepare_gpu()
     StyleGAN_model = StyleGAN(config, mode=BENCHMARK_MODE, res=res, stage=stage)
     # Note: script benchmarks only model training time, metrics and other post train step actions are not run
@@ -154,4 +157,5 @@ bs = 8: error (lots of OOM warnings for 1.41G)
 _pywrap_tensorflow_internal.lib
 fused_bias_act.cu
 
+prompt: %HOMEPATH%
 """

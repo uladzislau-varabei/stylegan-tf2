@@ -1,6 +1,6 @@
 import tensorflow as tf
 
-from utils import fp32, maybe_scale_loss, maybe_custom_unscale_grads
+from tf_utils import fp32, maybe_scale_loss, maybe_custom_unscale_grads
 
 
 def select_G_loss_fn(loss_name):

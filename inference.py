@@ -7,9 +7,8 @@ import tensorflow as tf
 
 from config import Config as cfg
 from checkpoint_utils import load_weights
-from image_utils import fast_save_grid
-from utils import INFERENCE_MODE, DEFAULT_DATA_FORMAT, NCHW_FORMAT, WEIGHTS_DIR
-from utils import load_config, prepare_gpu, generate_latents, to_z_dim, convert_outputs_to_images
+from utils import INFERENCE_MODE, WEIGHTS_DIR, fast_save_grid, load_config, to_z_dim
+from tf_utils import DEFAULT_DATA_FORMAT, prepare_gpu, generate_latents, convert_outputs_to_images, run_model_on_batches
 from model import StyleGAN
 
 
@@ -69,28 +68,18 @@ def parse_args():
     return args
 
 
-
 def generate_images(model: tf.keras.Model, truncation_psi: float, truncation_cutoff: int, config: dict):
     start_time = time.time()
 
     latent_size = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
-    z_dim = to_z_dim(latent_size, data_format)
     hw_ratio = config.get(cfg.DATASET_HW_RATIO, cfg.DEFAULT_DATASET_HW_RATIO)
 
-    #  Case when lots of images are to be generated
-    if grid_cols * grid_rows < 32:
-        iters, batch_size = 1, grid_cols * grid_rows
-    else:
-        iters, batch_size = max(grid_cols, grid_rows), min(grid_cols, grid_rows)
-
-    images = []
-    for _ in range(iters):
-        batch_latents = generate_latents(batch_size, z_dim)
-        images.append(
-            model(batch_latents, training=False, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-        )
-    images = tf.concat(images, axis=0)
+    z_dim = to_z_dim(latent_size, data_format)
+    latents = generate_latents(grid_cols * grid_rows, z_dim)
+    model_kwargs = {'training': False, 'truncation_psi': truncation_psi, 'truncation_cutoff': truncation_cutoff}
+    batch_size = 16
+    images = run_model_on_batches(model, model_kwargs, latents, batch_size)
     images = convert_outputs_to_images(images, 2 ** res, hw_ratio=hw_ratio, data_format=data_format).numpy()
 
     total_time = time.time() - start_time
@@ -127,10 +116,10 @@ if __name__ == '__main__':
     ----- Example calls -----
     
     1) Disable truncation trick and save output image in jpg
-    python .\inference.py --config_path .\configs\lsun_living_room.json --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --disable_truncation --image_fname images --grid_cols 12 --grid_rows 9 --save_in_jpg
+    python .\inference.py --config_path .\configs\lsun_living_room.json --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --disable_truncation --image_fname temp_images --grid_cols 12 --grid_rows 9 --save_in_jpg
     
     2) Provide options values for truncation trick (skip to use default ones from config) and save output image in png
-    python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --truncation_psi 0.7 --truncation_cutoff 8  --image_fname images --grid_cols 4 --grid_rows 3    
+    python .\inference.py --config_path .\configs\lsun_living_room.json  --weights_path .\weights\lsun_living_room\256x256\stabilization\step3000000\G_model_smoothed.h5 --truncation_psi 0.7 --truncation_cutoff 8  --image_fname temp_images --grid_cols 4 --grid_rows 3    
     """
     args = parse_args()
 

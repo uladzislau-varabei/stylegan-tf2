@@ -3,7 +3,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Lambda, Dropout, Conv2D, Permute
 from tensorflow.keras.applications.vgg16 import VGG16
 
-from utils import disable_mixed_precision_policy
+from tf_utils import disable_mixed_precision_policy
 
 
 def image_preprocess(image):

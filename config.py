@@ -1,5 +1,4 @@
 class Config:
-    # ---------- Config options ----------
 
     ### ---------- General options ---------- ###
 
@@ -63,6 +62,9 @@ class Config:
     # Resolution specific number of stabilization images
     # Note: keys should be given as powers of 2
     STABILIZATION_KIMAGES_DICT = 'stabilization_kimages_dict'
+    # Batch size for stabilization stage for target resolution.
+    # It's the longest training stage and sometimes it's possible to increase batch comparing with transition stage
+    FINAL_BATCH_SIZE = 'final_batch_size'
     # Batch size for each resolution (in a form of dict)
     # Note: keys should be powers of 2
     BATCH_SIZES = 'batch_sizes'
@@ -289,6 +291,7 @@ class Config:
     DEFAULT_D_ACTIVATION = 'leaky_relu'
     DEFAULT_G_KERNEL_SIZE = 3
     DEFAULT_D_KERNEL_SIZE = 3
+    DEFAULT_FINAL_BATCH_SIZE = None
     DEFAULT_BATCH_REPEATS = 1 # 4 - value used in the official implementation
     DEFAULT_G_LOSS_FN = 'G_logistic_nonsaturating'
     DEFAULT_D_LOSS_FN = 'D_logistic_simplegp'

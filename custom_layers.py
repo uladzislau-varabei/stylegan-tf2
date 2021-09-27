@@ -4,9 +4,10 @@ from tensorflow.keras.layers import Layer, Activation
 from tensorflow.keras import mixed_precision
 
 from config import Config as cfg
-from utils import ACTIVATION_FUNS_DICT, FP32_ACTIVATIONS,\
-    DEFAULT_DATA_FORMAT, NCHW_FORMAT, WSUM_NAME, RANDOMIZE_NOISE_VAR_NAME, HE_GAIN,\
-    validate_data_format
+from utils import validate_data_format
+from tf_utils import ACTIVATION_FUNS_DICT, FP32_ACTIVATIONS,\
+    DEFAULT_DATA_FORMAT, NCHW_FORMAT, WSUM_NAME, RANDOMIZE_NOISE_VAR_NAME, HE_GAIN
+
 
 LRMUL = 1.
 
@@ -535,7 +536,7 @@ class Noise(Layer):
             )
 
     def call(self, x, *args, **kwargs):
-        # One can change layer weights (tf_randomize_noise) to switch between random and non random noise
+        # One can change layer weights (see tf_randomize_noise) to switch between random and non random noise
         noise = tf.cond(
             tf.greater(self.tf_randomize_noise, self.tf_zero),
             lambda: tf.random.normal([tf.shape(x)[0]] + self.noise_tail_shape, dtype=self._dtype_policy.compute_dtype),
@@ -1055,12 +1056,13 @@ def naive_downsample(x, factor, data_format=DEFAULT_DATA_FORMAT):
     assert isinstance(factor, int) and factor >= 1
     validate_data_format(data_format)
 
+    s = tf.shape(x)
     if data_format == NCHW_FORMAT:
-        _, c, h, w = x.shape
+        c, h, w = s[1], s[2], s[3]
         target_shape = [-1, c, h // factor, factor, w // factor, factor]
         axis = [3, 5]
     else: # data_format == NHWC_FORMAT:
-        _, h, w, c = x.shape
+        h, w, c = s[1], s[2], s[3]
         target_shape = [-1, h // factor, factor, w // factor, factor, c]
         axis = [2, 4]
 

@@ -11,7 +11,8 @@ import numpy as np
 
 from config import Config as cfg
 from utils import LOGS_DIR, TRAIN_MODE, INFERENCE_MODE, TRANSITION_MODE, STABILIZATION_MODE
-from utils import load_config, prepare_gpu, load_images_paths, format_time, DEBUG_MODE
+from utils import load_config, load_images_paths, format_time, DEBUG_MODE
+from tf_utils import prepare_gpu
 from model import StyleGAN
 
 
@@ -21,8 +22,9 @@ def parse_args():
         '--config_path',
         help='Path to a config of a model to train (json format)',
         #default=os.path.join('configs', 'demo_config.json'),
-        default=os.path.join('configs', 'debug_config.json'),
+        #default=os.path.join('configs', 'debug_config.json'),
         #default=os.path.join('configs', 'lsun_living_room.json'),
+        default=os.path.join('configs', 'lsun_car_512x384.json'),
         #required=True
     )
     args = parser.parse_args()

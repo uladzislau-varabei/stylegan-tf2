@@ -13,6 +13,7 @@ from utils import should_log_debug_info, WEIGHTS_DIR, OPTIMIZER_POSTFIX
 
 H5_WEIGHTS_KEY = 'weights'
 LOSS_SCALE_KEY = 'loss_scale'
+STEP_DIR_PREFIX = 'step'
 DEFAULT_STORAGE_PATH = cfg.DEFAULT_STORAGE_PATH
 
 
@@ -111,7 +112,7 @@ def create_model_dir_path(model_name, res, stage, step=None, storage_path: str =
     """
     res_dir = f'{2**res}x{2**res}'
     stage_dir = stage
-    step_dir = 'step' + str(step) if step is not None else ''
+    step_dir = STEP_DIR_PREFIX + str(step) if step is not None else ''
     model_dir_path = os.path.join(WEIGHTS_DIR, model_name, res_dir, stage_dir, step_dir)
 
     if storage_path is not None:
@@ -133,8 +134,6 @@ def save_model(model, model_name, model_type, res,
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of saving model
     """
-    optimizer_call = OPTIMIZER_POSTFIX in model_type
-
     model_dir_path = create_model_dir_path(
         model_name=model_name,
         res=res,
@@ -142,10 +141,10 @@ def save_model(model, model_name, model_type, res,
         step=step,
         storage_path=storage_path
     )
-    if optimizer_call:
-        model_dir_path += OPTIMIZER_POSTFIX
-    if not os.path.exists(model_dir_path):
-        os.makedirs(model_dir_path)
+    optimizer_call = OPTIMIZER_POSTFIX in model_type
+    if optimizer_call and (step is None):
+        model_dir_path = os.path.join(model_dir_path, OPTIMIZER_POSTFIX)
+    os.makedirs(model_dir_path, exist_ok=True)
 
     filepath = os.path.join(model_dir_path, model_type + '.h5')
     weights_dict = weights_to_dict(model, optimizer_call=optimizer_call)
@@ -174,9 +173,9 @@ def save_optimizer_loss_scale(optimizer: mixed_precision.LossScaleOptimizer,
         step=step,
         storage_path=storage_path
     )
-    model_dir_path += OPTIMIZER_POSTFIX
-    if not os.path.exists(model_dir_path):
-        os.makedirs(model_dir_path)
+    if step is None:
+        model_dir_path = os.path.join(model_dir_path, OPTIMIZER_POSTFIX)
+    os.makedirs(model_dir_path, exist_ok=True)
 
     # This function is only called when loss scale is dynamic
     loss_scale = float(optimizer._loss_scale().numpy())
@@ -200,8 +199,6 @@ def load_model(model, model_name, model_type, res,
     storage_path - optional prefix path
     Note: should probably change this fun to standard way of loading model
     """
-    optimizer_call = OPTIMIZER_POSTFIX in model_type
-
     model_dir_path = create_model_dir_path(
         model_name=model_name,
         res=res,
@@ -209,8 +206,9 @@ def load_model(model, model_name, model_type, res,
         step=step,
         storage_path=storage_path
     )
-    if optimizer_call:
-        model_dir_path += OPTIMIZER_POSTFIX
+    optimizer_call = OPTIMIZER_POSTFIX in model_type
+    if optimizer_call and (step is None):
+        model_dir_path = os.path.join(model_dir_path, OPTIMIZER_POSTFIX)
     assert os.path.exists(model_dir_path),\
         f"Can't load weights: directory {model_dir_path} does not exist"
 
@@ -239,9 +237,8 @@ def load_optimizer_loss_scale(model_name: str, model_type: str, res: int, stage:
         step=step,
         storage_path=storage_path
     )
-    model_dir_path += OPTIMIZER_POSTFIX
-    if not os.path.exists(model_dir_path):
-        os.makedirs(model_dir_path)
+    if step is None:
+        model_dir_path = os.path.join(model_dir_path, OPTIMIZER_POSTFIX)
 
     filepath = os.path.join(model_dir_path, model_type +  OPTIMIZER_POSTFIX + '.json')
     with open(filepath, 'r') as fp:
@@ -262,10 +259,10 @@ def remove_old_models(model_name, res, stage, max_models_to_keep: int, storage_p
     max_models_to_keep - max number of models to keep
     storage_path - optional prefix path
     """
-    # step and model_type are not used, so jut use valid values
     log_debug_info = should_log_debug_info()
     if log_debug_info:
         logging.info('\nRemoving weights...')
+    # step and model_type are not used, so just use valid values
     weights_path = create_model_dir_path(
         model_name=model_name,
         res=res,
@@ -275,10 +272,10 @@ def remove_old_models(model_name, res, stage, max_models_to_keep: int, storage_p
     )
     res_stage_path = os.path.split(weights_path)[0]
     sorted_steps_paths = sorted(
-        [x for x in glob.glob(res_stage_path + os.sep + '*') if 'step' in x],
-        key=lambda x: int(x.split('step')[1])
+        [x for x in glob.glob(res_stage_path + os.sep + '*') if STEP_DIR_PREFIX in x],
+        key=lambda x: int(x.split(STEP_DIR_PREFIX)[1])
     )
-    # Remove weights for all steps except the last one
+    # Remove weights for all steps except the last ones
     for p in sorted_steps_paths[:-max_models_to_keep]:
         shutil.rmtree(p)
         if log_debug_info:

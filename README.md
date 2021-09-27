@@ -83,7 +83,7 @@ yet after a number of iterations other images might become black and others beco
 
 ## GPU memory usage
 
-To control GPU memory usage one can refer to a function `prepare_gpu()` in `utils.py`. 
+To control GPU memory usage one can refer to a function `prepare_gpu()` in `tf_utils.py`. 
 <br>
 Depending on your operating system and use case you might want to change memory managing. 
 By default, on Linux `memory_growth` option is used, while on Windows memory is limited with some reasonable number to allow use of PC (such as opening browsers with small number of tabs).

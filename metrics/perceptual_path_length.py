@@ -7,9 +7,9 @@ import tensorflow as tf
 from .lpips_models.lpips_tensorflow import learned_perceptual_metric_model
 from config import Config as cfg
 from custom_layers import naive_downsample, naive_upsample
-from utils import lerp, generate_latents, toNHWC_AXIS, toNCHW_AXIS, NCHW_FORMAT, enable_random_noise, disable_random_noise,\
-    validate_data_format, enable_mixed_precision_policy, disable_mixed_precision_policy, get_compute_dtype,\
-    to_hw_size, extract_images
+from utils import NCHW_FORMAT, validate_data_format, to_hw_size
+from tf_utils import toNHWC_AXIS, toNCHW_AXIS, lerp, generate_latents, enable_random_noise, disable_random_noise,\
+    enable_mixed_precision_policy, disable_mixed_precision_policy, get_compute_dtype, extract_images
 
 
 #----------------------------------------------------------------------------
@@ -28,7 +28,7 @@ def slerp(a, b, t):
     b = normalize(b)
     d = tf.reduce_sum(a * b, axis=-1, keepdims=True)
     # Make sure acos inputs have right boundaries (due to numeric rounds)
-    d = tf.clip_by_value(d, -1., 1.)
+    d = tf.clip_by_value(d, -1.0, 1.0)
     p = t * tf.math.acos(d)
     c = normalize(b - d * a)
     d = a * tf.math.cos(p) + c * tf.math.sin(p)

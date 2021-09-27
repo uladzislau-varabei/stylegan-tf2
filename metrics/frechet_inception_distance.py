@@ -10,8 +10,9 @@ from tensorflow.keras.applications.inception_v3 import preprocess_input as prepr
 from config import Config as cfg
 from custom_layers import naive_upsample
 from dataloader_utils import create_training_dataset
-from utils import generate_latents, CACHE_DIR, toNHWC_AXIS, NCHW_FORMAT, validate_data_format,\
-    enable_mixed_precision_policy, disable_mixed_precision_policy, to_hw_size, extract_images
+from utils import CACHE_DIR, NCHW_FORMAT, validate_data_format, to_hw_size
+from tf_utils import toNHWC_AXIS, NCHW_FORMAT, generate_latents,\
+    enable_mixed_precision_policy, disable_mixed_precision_policy, extract_images
 
 
 FID_DIR = 'fid'
@@ -129,9 +130,17 @@ class FID:
         return dist
 
     def run_metric(self, input_batch_size, G_model):
-        # TODO: determine max batch size. For now just always use 32
-        batch_size = min(max(input_batch_size, 32), 32)
+        if input_batch_size <= 8:
+            # Case for high resolutions
+            batch_size = 16
+        else:
+            # TODO: determine max batch size. For now just always use 32 for small resolutions
+            batch_size = min(max(input_batch_size, 32), 32)
         mu_real, sigma_real = self.evaluate_on_reals(batch_size)
         mu_fake, sigma_fake = self.evaluate_on_fakes(batch_size, G_model)
-        dist = self.calculate_fid((mu_real, sigma_real), (mu_fake, sigma_fake))
+        try:
+            dist = self.calculate_fid((mu_real, sigma_real), (mu_fake, sigma_fake))
+        except:
+            # Case when for some reason memory can't be allocated
+            dist = 0.0
         return dist

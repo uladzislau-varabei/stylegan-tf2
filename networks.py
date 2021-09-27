@@ -7,10 +7,11 @@ from custom_layers import WeightedSum, layer_dtype,\
     dense_layer, conv2d_layer, fused_bias_act_layer, bias_act_layer, const_layer, noise_layer, blur_layer,\
     pixel_norm_layer, instance_norm_layer, style_mod_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer
 from checkpoint_utils import weights_to_dict, load_model_weights_from_dict
-from utils import generate_latents, level_of_details, validate_data_format, create_model_type_key, to_int_dict, to_z_dim,\
-    get_start_fp16_resolution, should_use_fp16, get_compute_dtype, adjust_clamp, lerp
-from utils import DEFAULT_DATA_FORMAT, NHWC_FORMAT, NCHW_FORMAT, \
-    TRANSITION_MODE, STABILIZATION_MODE, WSUM_NAME, GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT
+from utils import level_of_details, validate_data_format, create_model_type_key, to_int_dict, to_z_dim,\
+    get_start_fp16_resolution, should_use_fp16, adjust_clamp,\
+    NHWC_FORMAT, NCHW_FORMAT, TRANSITION_MODE, STABILIZATION_MODE
+from tf_utils import generate_latents, get_compute_dtype, lerp,\
+    DEFAULT_DATA_FORMAT, WSUM_NAME, GAIN_INIT_MODE_DICT, GAIN_ACTIVATION_FUNS_DICT
 
 
 def n_filters(stage, fmap_base, fmap_decay, fmap_max):
