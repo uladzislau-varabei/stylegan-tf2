@@ -256,14 +256,14 @@ class ScaledConv2d(Layer):
         )
 
 
-class ScaledLinear(Layer):
+class ScaledDense(Layer):
 
     def __init__(self, units, gain=HE_GAIN,
                  use_wscale=DEFAULT_USE_WSCALE, lrmul=LRMUL, truncate_weights=DEFAULT_TRUNCATE_WEIGHTS,
                  dtype=DEFAULT_DTYPE, use_xla=DEFAULT_USE_XLA,
                  data_format=DEFAULT_DATA_FORMAT, scope='', name=None):
         layer_name = make_layer_name(name, scope, 'Linear')
-        super(ScaledLinear, self).__init__(dtype=dtype, name=layer_name)
+        super(ScaledDense, self).__init__(dtype=dtype, name=layer_name)
         validate_data_format(data_format)
         self.data_format = data_format
         self.units = units
@@ -461,7 +461,7 @@ class StyleMod(Layer):
             self.fc_units = x_shape[3] * 2
             self.style_target_shape = [-1, 2] + [1] * (len(x_shape) - 2) + [x_shape[3]]
 
-        self.fc = ScaledLinear(
+        self.fc = ScaledDense(
             units=self.fc_units, gain=1,
             use_wscale=self.use_wscale, truncate_weights=self.truncate_weights,
             dtype=self._dtype_policy, use_xla=self.use_xla,
@@ -890,7 +890,7 @@ def dense_layer(x, units, gain, lrmul=LRMUL, use_fp16=None, scope='', config=Non
     use_xla = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     policy = layer_dtype('dense', use_fp16=use_fp16)
-    return ScaledLinear(
+    return ScaledDense(
         units=units, gain=gain,
         use_wscale=use_wscale, lrmul=lrmul, truncate_weights=truncate_weights,
         dtype=policy, use_xla=use_xla, data_format=data_format, scope=scope

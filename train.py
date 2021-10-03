@@ -99,8 +99,8 @@ def train_model(config, config_path=None):
     # a sudden remove of a file with images paths
     images_paths = load_images_paths(config)
 
-    # run_process(target=trace_graphs, args=(config, config_path))
-    sleep(1)
+    run_process(target=trace_graphs, args=(config, config_path))
+    sleep(3)
 
     train_start_time = time.time()
 
@@ -117,14 +117,14 @@ def train_model(config, config_path=None):
                 target=run_train_stage,
                 args=(config, images_paths, res, TRANSITION_MODE, config_path)
             )
-            sleep(1)
+            sleep(3)
 
         # Stabilization stage
         run_process(
             target=run_train_stage,
             args=(config, images_paths, res, STABILIZATION_MODE, config_path)
         )
-        sleep(1)
+        sleep(3)
 
         res_total_time = time.time() - res_start_time
         logging.info(f'Training of {2**res}x{2**res} model took {format_time(res_total_time)}')

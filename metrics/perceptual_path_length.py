@@ -4,7 +4,7 @@ from tqdm import tqdm
 import numpy as np
 import tensorflow as tf
 
-from .lpips_models.lpips_tensorflow import learned_perceptual_metric_model
+from metrics.lpips_models.lpips_tensorflow import learned_perceptual_metric_model
 from config import Config as cfg
 from custom_layers import naive_downsample, naive_upsample
 from utils import NCHW_FORMAT, validate_data_format, to_hw_size
@@ -26,6 +26,7 @@ def normalize(v):
 def slerp(a, b, t):
     a = normalize(a)
     b = normalize(b)
+    # TODO: shouldn't axis arg also be changed due to a and b shape (the same as for normalize defined above)?
     d = tf.reduce_sum(a * b, axis=-1, keepdims=True)
     # Make sure acos inputs have right boundaries (due to numeric rounds)
     d = tf.clip_by_value(d, -1.0, 1.0)
@@ -62,8 +63,12 @@ class PPL:
         # TODO: think to which resolution should images be upsampled if size is smaller than that?
         # Always upscale to 256
         self.min_size = 256
+        self.target_size = 256
         self.hw_ratio = hw_ratio
-        self.image_size = to_hw_size(image_size if image_size > self.min_size else self.min_size, hw_ratio)
+        # TODO: Implement case for resolutions, which are higher than 256
+        # self.image_size = to_hw_size(image_size if image_size > self.min_size else self.min_size, hw_ratio)
+        # Images are always upscaled/downscaled to size 256
+        self.image_size = to_hw_size(self.target_size, hw_ratio)
 
         # Tf 2.x port of vgg16_zhang_perceptual
         vgg_ckpt_fn = os.path.join('metrics', 'lpips_models' ,'vgg', 'exported')
@@ -145,6 +150,15 @@ class PPL:
         batch_distance = self.lpips_model([img_e0, img_e1])
         return batch_distance
 
+    def get_batch_size(self, input_batch_size):
+        # TODO: determine max batch size. For now just always use 32 for small resolutions
+        if input_batch_size <= 8:
+            # Case for high resolutions
+            batch_size = 16 # Worked for 512 + transition
+        else:
+            batch_size = min(max(input_batch_size, 32), 32)
+        return batch_size
+
     def run_metric(self, input_batch_size, G_model):
         G_mapping = G_model.G_mapping
         G_synthesis = G_model.G_synthesis
@@ -157,8 +171,7 @@ class PPL:
 
         # Sampling loop.
         all_distances = []
-        # TODO: determine max batch size. For now just always use 32
-        batch_size = min(max(input_batch_size, 32), 32)
+        batch_size = self.get_batch_size(input_batch_size)
         for _ in tqdm(range(0, self.num_samples, batch_size), desc='PPL metric steps'):
             all_distances.append(self.evaluate_distance_for_batch(batch_size, G_mapping, G_synthesis).numpy())
         all_distances = np.concatenate(all_distances, axis=0)

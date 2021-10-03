@@ -1,4 +1,3 @@
-import os
 import argparse
 
 import numpy as np
@@ -30,7 +29,12 @@ def parse_args():
     )
     parser.add_argument(
         '--transition_stage',
-        help='Use transition stage of model? If not provided, stabilization mode is used',
+        help='Use transition stage of model? If not provided, stabilization stage is used',
+        action='store_true'
+    )
+    parser.add_argument(
+        '--run_metrics',
+        help='Run metrics in the config? False, if not provided',
         action='store_true'
     )
     args = parser.parse_args()
@@ -41,13 +45,14 @@ if __name__ == '__main__':
     # Example call:
     # python .\benchmark.py --config_path .\configs\new_lsun_living_room.json --images 1000 --res 256
     #
-    # python .\benchmark.py --config_path .\configs\new_lsun_living_room.json --images 1000 --res 512 --transition_stage
-    # python .\benchmark.py --config_path .\configs\lsun_car_512x384.json --images 1000 --res 512 --transition_stage
+    # python .\benchmark.py --config_path .\configs\new_lsun_living_room.json --images 1000 --res 512 --transition_stage --run_metrics
+    # python .\benchmark.py --config_path .\configs\lsun_car_512x384.json --images 1000 --res 512 --transition_stage --run_metrics
     args = parse_args()
 
     images = args.images
     res = args.res
     transition_stage = args.transition_stage
+    run_metrics = args.run_metrics
     config = load_config(args.config_path)
 
     # Determine res and stage of model
@@ -58,11 +63,11 @@ if __name__ == '__main__':
         res = int(np.log2(res))
         stage = TRANSITION_MODE if transition_stage else STABILIZATION_MODE
 
-    #prepare_gpu(mode='growth')
+    # prepare_gpu(mode='growth')
     prepare_gpu()
     StyleGAN_model = StyleGAN(config, mode=BENCHMARK_MODE, res=res, stage=stage)
     # Note: script benchmarks only model training time, metrics and other post train step actions are not run
-    StyleGAN_model.run_benchmark_stage(res, stage, images)
+    StyleGAN_model.run_benchmark_stage(res, stage, images, run_metrics)
 
 
 ### ----- Results -----

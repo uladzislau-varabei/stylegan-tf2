@@ -419,11 +419,10 @@ class Generator:
 
     def create_G_model(self, model_res, mode=STABILIZATION_MODE):
         # Note: model_res is should be log2(image_res)
-        # TODO: for debugging, remove later
-        print(f'Calling create G model: res={model_res}')
         assert mode in [TRANSITION_MODE, STABILIZATION_MODE], 'Mode ' + mode + ' is not supported'
         model_type_key = create_model_type_key(model_res, mode)
         if model_type_key not in self.G_models.keys():
+            print(f' ...Creating G model for res = {model_res} and mode = {mode}...')
             if model_res == 2:
                 x = self.input_block()
                 images_out = self.to_rgb(x, model_res)
@@ -454,7 +453,7 @@ class Generator:
             # Create full G model
             self.G_models[model_type_key] = GeneratorStyle(self.G_mapping, self.G_synthesis, model_res, self.config)
         else:
-            print('Taking model from cache')
+            print(f' ...Taking G model for res = {model_res} and mode = {mode} from cache...')
 
         return self.G_models[model_type_key]
 
@@ -471,7 +470,7 @@ class Generator:
                 G_model = self.create_G_model(res, mode=TRANSITION_MODE)
                 _ = G_model(latents, training=False)
 
-        print('G model built')
+        print(f' ...Built G model for res = {model_res} and mode = {mode}...')
 
     def save_G_weights_in_class(self, G_model):
         self.G_weights_dict = weights_to_dict(G_model)
@@ -674,11 +673,10 @@ class Discriminator:
 
     def create_D_model(self, model_res, mode=STABILIZATION_MODE):
         # Note: model_res is should be log2(image_res)
-        # TODO: for debugging, remove later
-        print(f'Calling create D model: res={model_res}')
         assert mode in [TRANSITION_MODE, STABILIZATION_MODE], 'Mode ' + mode + ' is not supported'
         model_type_key = create_model_type_key(model_res, mode)
         if model_type_key not in self.D_models.keys():
+            print(f' ...Creating D model for res = {model_res} and mode = {mode}...')
             if model_res >= 3:
                 inputs = self.D_input_layers[model_res]
                 if mode == STABILIZATION_MODE:
@@ -710,7 +708,7 @@ class Discriminator:
                 inputs, tf.identity(x, name='scores_out'), name='D_style'
             )
         else:
-            print('Taking model from cache')
+            print(f' ...Taking D model for res = {model_res} and mode = {mode} from cache...')
 
         return self.D_models[model_type_key]
 
@@ -727,7 +725,7 @@ class Discriminator:
                 D_model = self.create_D_model(res, mode=TRANSITION_MODE)
                 _ = D_model(images, training=False)
 
-        print('D model built')
+        print(f' ...Built D model for res = {model_res} and mode = {mode}...')
 
     def save_D_weights_in_class(self, D_model):
         self.D_weights_dict = weights_to_dict(D_model)

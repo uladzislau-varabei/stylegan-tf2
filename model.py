@@ -1,5 +1,6 @@
 import os
 import logging
+import shutil
 import time
 from tqdm import tqdm
 
@@ -26,7 +27,7 @@ from utils import NHWC_FORMAT, NCHW_FORMAT,\
     CACHE_DIR, DATASET_CACHE_DIR, TF_LOGS_DIR
 from tf_utils import generate_latents, update_wsum_alpha,\
     get_compute_dtype, is_finite_grad,\
-    trace_vars, trace_message, get_gpu_memory_usage,\
+    trace_vars, get_gpu_memory_usage,\
     maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, set_tf_logging,\
     smooth_model_weights, convert_outputs_to_images, smooth_crossfade_images, run_model_on_batches
 from tf_utils import DEFAULT_DATA_FORMAT, toNCHW_AXIS, toNHWC_AXIS
@@ -53,6 +54,8 @@ def show_vars_stats(vars):
         print(f'{idx}) {var.name}: mean={mean:.3f}, std={std:.3f}')
 
 
+CPU_DEVICE = '/CPU:0'
+
 D_KEY  = 'D'
 G_KEY  = 'G'
 GS_KEY = 'Gs'
@@ -63,6 +66,11 @@ STAGE_IMAGES_KEY             = 'stage_images'
 TRAINING_FINISHED_IMAGES_KEY = 'training_finished_images'
 WRITE_SCALARS_SUMMARY_KEY    = 'write_scalars_summary'
 WRITE_HISTS_SUMMARY_KEY      = 'write_hists_summary'
+WRITE_LOSS_SCALE_SUMMARY_KEY = 'write_loss_scale_summary'
+RUN_METRICS_KEY              = 'run_metrics'
+SAVE_MODELS_KEY              = 'save_models'
+SAVE_VALID_IMAGES_KEY        = 'save_valid_images'
+SMOOTH_G_WEIGHTS_KEY         = 'smooth_G_weights'
 
 
 class Scheduler:
@@ -330,6 +338,15 @@ class StyleGAN:
         else:
             self.setup_Gs_betas(res)
             self.create_images_datasets(res, stage)
+            # TODO: metrics result in a process crash for high resolutions with large batch sizes (which work for benchmark)
+            self.metrics_objects = setup_metrics(2 ** res,
+                                                 hw_ratio=self.dataset_hw_ratio,
+                                                 dataset_params=self.dataset_params,
+                                                 use_fp16=self.use_mixed_precision,
+                                                 use_xla=self.use_xla,
+                                                 model_name=self.model_name,
+                                                 metrics=self.metrics,
+                                                 benchmark_mode=(mode == BENCHMARK_MODE))
             if mode == BENCHMARK_MODE:
                 self.initialize_optimizers(create_all_variables=False, benchmark=True)
             elif mode == TRAIN_MODE:
@@ -337,16 +354,6 @@ class StyleGAN:
                     # TODO: think about using metrics and updating optimizers scales
                     self.initialize_optimizers(create_all_variables=True)
                 else:
-                    # TODO: metrics result in a process crash for high resolutions with large batch sizes (which work for benchmark)
-                    '''
-                    self.metrics_objects = setup_metrics(2 ** res,
-                                                         hw_ratio=self.dataset_hw_ratio,
-                                                         dataset_params=self.dataset_params,
-                                                         use_fp16=self.use_mixed_precision,
-                                                         use_xla=self.use_xla,
-                                                         model_name=self.model_name,
-                                                         metrics=self.metrics)
-                    '''
                     self.initialize_optimizers(create_all_variables=False, res=res, stage=stage)
 
     def initialize_valid_latents(self):
@@ -645,8 +652,6 @@ class StyleGAN:
                          f'for resolution lower then or equal to start_fp16_resolution')
             return None, True
 
-        print(f'res={res}, start_fp_res = {self.start_fp16_resolution_log2}')
-
         load_res, load_stage = self.scheduler.get_previous_res_and_stage(res, stage)
         kwargs = {
             'model_name': self.model_name,
@@ -735,11 +740,9 @@ class StyleGAN:
         if self.use_mixed_precision:
             self.D_optimizer._optimizer = load_model(**D_optimizer_kwargs)
             self.G_optimizer._optimizer = load_model(**G_optimizer_kwargs)
-            print('Loaded weight for loss scale optimizers')
         else:
             self.D_optimizer = load_model(**D_optimizer_kwargs)
             self.G_optimizer = load_model(**G_optimizer_kwargs)
-            print('Loaded weight for optimizers')
 
         optimizer_steps = self.scheduler.compute_optimizer_steps(res, stage)
         set_optimizer_iters(self.D_optimizer, optimizer_steps)
@@ -997,18 +1000,9 @@ class StyleGAN:
             #nums = tf.math.count_nonzero(tf.math.is_finite(grad))
             # tf.print('G, step =', step, f'{var.name}: nans =', nans, ',', tf.math.round(100 * nans / (nans + nums)), '%')
 
-        # Write gradients
-        with tf.name_scope('G-grads'):
-            if write_hists_summary:
-                for grad, var in zip(G_grads, G_vars):
-                    hist_grad = tf.cond(is_finite_grad(grad), lambda: grad, lambda: tf.zeros(grad.shape, grad.dtype))
-                    tf.summary.histogram(var.name, hist_grad, step=step)
+        # self.process_hists(G_model, G_grads, 'G', write_hists_summary, step)
 
-        # Write weights
-        with tf.name_scope('G-weights'):
-            if write_hists_summary:
-                for var in G_vars:
-                    tf.summary.histogram(var.name, var, step=step)
+        return G_grads
 
     @tf.function
     def D_train_step(self, G_model, D_model, latents, images, write_scalars_summary, write_hists_summary, step):
@@ -1036,31 +1030,49 @@ class StyleGAN:
             #nums = tf.math.count_nonzero(tf.math.is_finite(grad))
             # tf.print('D, step =', step, f'{var.name}: nans =', nans, ',', tf.math.round(100 * nans / (nans + nums)), '%')
 
-        # Write gradients
-        with tf.name_scope('D-grads'):
-            if write_hists_summary:
-                for grad, var in zip(D_grads, D_vars):
-                    hist_grad = tf.cond(is_finite_grad(grad), lambda: grad, lambda: tf.zeros(grad.shape, grad.dtype))
-                    tf.summary.histogram(var.name, hist_grad, step=step)
+        # self.process_hists(D_model, D_grads, 'D', write_hists_summary, step)
 
-        # Write weights
-        with tf.name_scope('D-weights'):
-            if write_hists_summary:
-                for var in D_vars:
-                    tf.summary.histogram(var.name, var, step=step)
+        return D_grads
 
-    @tf.function
+    def process_hists(self, model, grads, model_name, write_hists_summary, step):
+        if write_hists_summary:
+            print('Writing hists summaries...')
+            start_time = time.time()
+
+        # Note: it's important to have cond for summaries after name scope definition,
+        # otherwise all hists will have the same prefix, e.g. 'cond1'.
+        # It holds at least for summaries inside tf.function
+        vars = model.trainable_variables
+        with tf.device(CPU_DEVICE):
+            # Write gradients
+            with tf.name_scope(f'{model_name}-grads'):
+                if write_hists_summary:
+                    for grad, var in zip(grads, vars):
+                        hist_grad = tf.cond(is_finite_grad(grad), lambda: grad, lambda: tf.zeros(grad.shape, grad.dtype))
+                        tf.summary.histogram(var.name, hist_grad, step=step)
+            # Write weights
+            with tf.name_scope(f'{model_name}-weights'):
+                if write_hists_summary:
+                    for var in vars:
+                        tf.summary.histogram(var.name, var, step=step)
+
+        if write_hists_summary:
+            total_time = time.time() - start_time
+            print(f'Hists written in {total_time:.3f} seconds')
+
     def train_step(self, G_model, D_model, G_latents, D_latents,
                    images, write_scalars_summary, write_hists_summary, step):
-        trace_message(' ...Modified train step tracing... ')
-        print('\n ...Trace Train step calling...')
         # Note: explicit use of G and D models allows to make sure that
         # tf.function doesn't compile models (can they be?). Additionally tracing is used
         # (previously for res=3 and mode=transition G model used variables only from res=2)
-        self.D_train_step(G_model, D_model, D_latents, images, write_scalars_summary, write_hists_summary, step)
-        print('\n ...Trace D step done...')
-        self.G_train_step(G_model, D_model, G_latents, write_scalars_summary, write_hists_summary, step)
-        print('\n ...Trace G step done...')
+        D_grads = self.D_train_step(G_model, D_model, D_latents, images, write_scalars_summary, write_hists_summary, step)
+        G_grads = self.G_train_step(G_model, D_model, G_latents, write_scalars_summary, write_hists_summary, step)
+
+        # Note: processing hists summaries inside train_step functions leads to a process crash for large resolutions.
+        # Maybe due to compilation. To write hists to TensorBoard they need to be processed separately.
+        # This also allows larger batch sizes. Rear OOM warnings don't seem to affect performance
+        self.process_hists(D_model, D_grads, 'D', write_hists_summary, step)
+        self.process_hists(G_model, G_grads, 'G', write_hists_summary, step)
 
     def add_resources_summary(self, training_finished_images):
         for device, memory_stats in get_gpu_memory_usage().items():
@@ -1084,66 +1096,62 @@ class StyleGAN:
         tf.summary.scalar(f'Timing/Total(days)', total_time / (24.0 * 60.0 * 60.0), step=training_finished_images)
 
     def post_train_step_actions(self, models, res, mode, summary_options, summary_writer):
-        print('post train start')
         D_model, G_model, Gs_model = models[D_KEY], models[G_KEY], models[GS_KEY]
-        print('post train obtained models')
-        print('summary options:\n', summary_options)
-        # Get all needed options
-        first_step_cond          = summary_options[FIRST_STEP_COND_KEY]
+        # Adjust number of processed images if method is called for last step
         last_step_cond           = summary_options[LAST_STEP_COND_KEY]
         training_finished_images = summary_options[TRAINING_FINISHED_IMAGES_KEY]
-        write_scalars_summary    = summary_options[WRITE_SCALARS_SUMMARY_KEY]
-        batch_size               = self.get_batch_size(res, mode)
-        # Adjust number of processed images if method is called for last step
         if last_step_cond:
             training_finished_images = self.scheduler.get_stage_end_processed_images(res, mode)
 
-        if not first_step_cond:
-            # For the first step optimizers learning rates are zeros
+        if summary_options[SMOOTH_G_WEIGHTS_KEY]:
             if Gs_model is not None:
-                print('smoothing weight')
                 smooth_model_weights(
                     sm_model=Gs_model, src_model=G_model, beta=self.get_Gs_beta(res, mode), device=self.Gs_device
                 )
-                print('smoothed weights')
 
-        if should_write_summary(self.run_metrics_every, training_finished_images, batch_size) or last_step_cond:
-            1
-            #self.run_metrics(res, mode, training_finished_images)
+        if summary_options[RUN_METRICS_KEY]:
+            self.run_metrics(res, mode, training_finished_images)
 
-        if self.use_mixed_precision:
-            # The first step usually uses very high scale
-            if (write_scalars_summary or last_step_cond) and (not first_step_cond):
-                tf.summary.scalar('LossScale/D_optimizer', self.D_optimizer.loss_scale, step=training_finished_images)
-                tf.summary.scalar('LossScale/G_optimizer', self.G_optimizer.loss_scale, step=training_finished_images)
+        if summary_options[WRITE_LOSS_SCALE_SUMMARY_KEY]:
+            tf.summary.scalar('LossScale/D_optimizer', self.D_optimizer.loss_scale, step=training_finished_images)
+            tf.summary.scalar('LossScale/G_optimizer', self.G_optimizer.loss_scale, step=training_finished_images)
 
-        # TODO: think how to write summaries outside of this function
-        if write_scalars_summary:
+        # TODO: think how to flush summaries outside of this function
+        if summary_options[WRITE_SCALARS_SUMMARY_KEY]:
             self.add_resources_summary(training_finished_images)
             self.add_timing_summary(training_finished_images)
             summary_writer.flush()
 
-        if should_write_summary(self.save_model_every, training_finished_images, batch_size) or last_step_cond:
+        if summary_options[SAVE_MODELS_KEY]:
             self.save_models(models=models, res=res, mode=mode, step=training_finished_images)
             if self.is_last_stage(res, mode):
                 self.save_optimizers_weights(res=res, stage=mode, step=training_finished_images)
 
-        if should_write_summary(self.save_images_every, training_finished_images, batch_size) or last_step_cond:
+        if summary_options[SAVE_VALID_IMAGES_KEY]:
             self.save_valid_images(models, training_finished_images, res=res, stage=mode)
             if Gs_model is not None:
                 self.save_valid_images(models, training_finished_images, res=res, stage=mode, smoothed=True)
 
     def summary_options(self, step, stage_steps, n_finished_images, batch_size):
-        last_step_cond = is_last_step(step, stage_steps)
-        stage_images = (step + 1) * batch_size
+        first_step_cond          = step == 0
+        last_step_cond           = is_last_step(step, stage_steps)
+        stage_images             = (step + 1) * batch_size
+        write_scalars_summary    = should_write_summary(self.summary_scalars_every, stage_images, batch_size) or last_step_cond
+        write_loss_scale_summary = self.use_mixed_precision and write_scalars_summary and (not first_step_cond) # The first step usually uses very high scale
+
         # TODO: should summaries use stage_images or training_finished_images?
         return {
-            FIRST_STEP_COND_KEY         : step == 0,
+            FIRST_STEP_COND_KEY         : first_step_cond,
             LAST_STEP_COND_KEY          : last_step_cond,
             STAGE_IMAGES_KEY            : stage_images,
             TRAINING_FINISHED_IMAGES_KEY: stage_images + n_finished_images,
-            WRITE_SCALARS_SUMMARY_KEY   : should_write_summary(self.summary_scalars_every, stage_images, batch_size) or last_step_cond,
+            WRITE_LOSS_SCALE_SUMMARY_KEY: write_loss_scale_summary,
+            WRITE_SCALARS_SUMMARY_KEY   : write_scalars_summary,
             WRITE_HISTS_SUMMARY_KEY     : should_write_summary(self.summary_hists_every, stage_images, batch_size) or last_step_cond,
+            RUN_METRICS_KEY             : should_write_summary(self.run_metrics_every, stage_images + n_finished_images, batch_size) or last_step_cond,
+            SAVE_MODELS_KEY             : should_write_summary(self.save_model_every, stage_images + n_finished_images, batch_size) or last_step_cond,
+            SAVE_VALID_IMAGES_KEY       : should_write_summary(self.save_images_every, stage_images + n_finished_images, batch_size) or last_step_cond,
+            SMOOTH_G_WEIGHTS_KEY        : self.use_Gs and (not first_step_cond) # For the first step optimizers learning rates are zeros
         }
 
     def init_training_time(self):
@@ -1320,12 +1328,10 @@ class StyleGAN:
                 G_latents = self.generate_latents(batch_size)
                 D_latents = self.generate_latents(batch_size)
                 real_images = self.smooth_crossfade_images(next(images_dataset), alpha)
-                # TODO: summaries result in a process crash for high resolutions with large batch sizes (which work for benchmark)
                 self.train_step(
                     G_model=G_model, D_model=D_model,
                     G_latents=G_latents, D_latents=D_latents, images=real_images,
-                    #write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step,
-                    write_scalars_summary=False, write_hists_summary=False, step=-1,
+                    write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                 )
 
                 if summary_options[FIRST_STEP_COND_KEY]:
@@ -1376,13 +1382,11 @@ class StyleGAN:
 
                 G_latents = self.generate_latents(batch_size)
                 D_latents = self.generate_latents(batch_size)
-                # TODO: summaries result in a process crash for high resolutions with large batch sizes (which work for benchmark)
                 real_images = next(images_dataset)
                 self.train_step(
                     G_model=G_model, D_model=D_model,
                     G_latents=G_latents, D_latents=D_latents, images=real_images,
-                    #write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
-                    write_scalars_summary=False, write_hists_summary=False, step=-1,
+                    write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
                 )
 
                 if summary_options[FIRST_STEP_COND_KEY]:
@@ -1407,14 +1411,15 @@ class StyleGAN:
         stabilization_stage_total_time = time.time() - self.start_time
         logging.info(f'Stabilization stage took {format_time(stabilization_stage_total_time)}')
 
-    def run_metrics(self, res, mode, training_finished_images):
+    def run_metrics(self, res, mode, training_finished_images, summary_writer=None):
         if self.use_Gs:
             G_model = self.Gs_object.create_G_model(res, mode)
         else:
             G_model = self.G_object.create_G_model(res, mode)
 
         batch_size = self.get_batch_size(res, mode)
-        summary_writer = self.summary_writers[res]
+        if summary_writer is None:
+            summary_writer = self.summary_writers[res]
         with summary_writer.as_default():
             metrics_start_time = time.time()
             for idx, metric_object in enumerate(self.metrics_objects):
@@ -1433,47 +1438,71 @@ class StyleGAN:
             tf.summary.scalar(f'Metric/TotalRunTime/Time(s)', metrics_total_time, step=training_finished_images)
             summary_writer.flush()
 
-    def run_benchmark_stage(self, res, mode, images):
+    def run_benchmark_stage(self, res, mode, images, run_metrics):
         stage_start_time = time.time()
 
         D_model, G_model, Gs_model = self.create_models(res, mode=mode)
         self.adjust_optimizers_learning_rate(res)
 
-        images_dataset  = self.get_images_dataset(res, mode)
-        batch_size      = self.get_batch_size(res, mode)
-        benchmark_steps = images // batch_size
+        images_dataset           = self.get_images_dataset(res, mode)
+        batch_size               = self.get_batch_size(res, mode)
+        benchmark_steps          = images // batch_size
+        n_finished_images        = 0
+        tf_step                  = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
+        # TODO: usage of a tensor for hists leads to a process crash
+        tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
+        tf_write_hists_summary   = tf.Variable(True, trainable=False, dtype=tf.bool)
 
-        desc = f'Benchmark {2**res}x{2**res} model, {mode} steps'
-        for step in tqdm(range(benchmark_steps), desc=desc):
-            # Note: on the 1st step model is compiled, so don't count this time
-            if step == 1:
-                stage_start_time = time.time()
+        # TODO: add temp summary writer and remove logs after execution
+        benchmark_dir = os.path.join(TF_LOGS_DIR, 'temp_dir')
+        summary_writer = tf.summary.create_file_writer(benchmark_dir)
+        with summary_writer.as_default():
+            desc = f'Benchmark {2**res}x{2**res} model, {mode} steps'
+            for step in tqdm(range(benchmark_steps), desc=desc):
+                # Note: on the 1st step model is compiled, so don't count this time
+                if step == 1:
+                    stage_start_time = time.time()
+                    metrics_time = 0.
 
-            if mode == TRANSITION_MODE:
-                if step % self.batch_repeats == 0:
-                    alpha = compute_alpha(step, benchmark_steps)
-                    D_model = update_wsum_alpha(D_model, alpha)
-                    G_model = update_wsum_alpha(G_model, alpha)
-                    if Gs_model is not None:
-                        Gs_model = update_wsum_alpha(Gs_model, alpha)
+                summary_options = self.summary_options(step, benchmark_steps, n_finished_images, batch_size)
+                tf_write_scalars_summary.assign(summary_options[WRITE_SCALARS_SUMMARY_KEY])
+                tf_write_hists_summary.assign(summary_options[WRITE_HISTS_SUMMARY_KEY])
+                # tf_write_scalars_summary = summary_options[WRITE_SCALARS_SUMMARY_KEY]
+                # tf_write_hists_summary = False #summary_options[WRITE_HISTS_SUMMARY_KEY]
+                tf_step.assign(summary_options[TRAINING_FINISHED_IMAGES_KEY])
 
-            G_latents = self.generate_latents(batch_size)
-            D_latents = self.generate_latents(batch_size)
-            real_images = next(images_dataset)
-            if mode == TRANSITION_MODE:
-                real_images = self.smooth_crossfade_images(real_images, alpha)
-            self.train_step(
-                G_model=G_model, D_model=D_model,
-                G_latents=G_latents, D_latents=D_latents, images=real_images,
-                write_scalars_summary=False, write_hists_summary=False, step=-1
-            )
-            if step == 50:
-                1
-                #self.run_metrics(res, mode, -1)
+                if mode == TRANSITION_MODE:
+                    if step % self.batch_repeats == 0:
+                        alpha = compute_alpha(step, benchmark_steps)
+                        D_model = update_wsum_alpha(D_model, alpha)
+                        G_model = update_wsum_alpha(G_model, alpha)
+                        if Gs_model is not None:
+                            Gs_model = update_wsum_alpha(Gs_model, alpha)
+
+                G_latents = self.generate_latents(batch_size)
+                D_latents = self.generate_latents(batch_size)
+                real_images = next(images_dataset)
+                if mode == TRANSITION_MODE:
+                    real_images = self.smooth_crossfade_images(real_images, alpha)
+                self.train_step(
+                    G_model=G_model, D_model=D_model,
+                    G_latents=G_latents, D_latents=D_latents, images=real_images,
+                    write_scalars_summary=tf_write_scalars_summary, write_hists_summary=tf_write_hists_summary, step=tf_step
+                )
+
+                # Run metrics twice to make sure everything is fine
+                if run_metrics and (step == 50 or step == 100):
+                    metrics_start_time = time.time()
+                    self.run_metrics(res, mode, -1, summary_writer)
+                    metrics_time += time.time() - metrics_start_time
+
+        shutil.rmtree(benchmark_dir)
 
         stage_total_time = time.time() - stage_start_time
-        print(f'Benchmark took {format_time(stage_total_time)} for {images} images. '
-              f'In average {(images / stage_total_time):.3f} images/sec.')
+        train_time = stage_total_time - metrics_time
+        print(f'\nBenchmark finished in {format_time(stage_total_time)}. '
+              f'Metrics run (2 iterations) in {format_time(metrics_time)}.\n'
+              f'Training took {format_time(train_time)} for {images} images. In average {(images / train_time):.3f} images/sec.')
 
     def run_train_stage(self, res, mode):
         assert self.start_resolution_log2 <= res <= self.resolution_log2

@@ -149,7 +149,7 @@ def disable_random_noise(model: tf.keras.Model):
 
 @tf.function
 def smooth_model_weights(sm_model, src_model, beta, device):
-    trace_message('...Tracing smoothing weights...')
+    trace_message(' ...Tracing smoothing weights... ')
     smoothed_net_vars = sm_model.trainable_variables
     source_net_vars = src_model.trainable_variables
     trace_vars(smoothed_net_vars, 'Smoothed vars:')
@@ -385,7 +385,7 @@ def prepare_gpu(mode='auto', memory_limit=None):
 
     # Note: change this number based on your GPU
     if memory_limit is None:
-        memory_limit = 7650 # for real use
+        memory_limit = 7750 # for real use
     set_memory_growth = False
     set_memory_limit = False
 

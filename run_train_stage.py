@@ -70,7 +70,10 @@ def run_train_stage(config_path, res, mode):
 
 
 if __name__ == '__main__':
-    # python .\run_train_stage.py --config_path .\configs\lsun_car_512x384.json --res 256
+    # Note: this script can only be called if there exists a folder with weights from previous stage
+    # (if it's needed according to a config start resolution)
+    # python .\run_train_stage.py --config_path .\configs\lsun_car_512x384.json --res 256 --transition_stage
+    # python .\run_train_stage.py --config_path .\configs\lsun_car_512x384.json --res 512
 
     args = parse_args()
 

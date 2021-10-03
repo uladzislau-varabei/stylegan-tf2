@@ -37,7 +37,7 @@ class FID:
         self.use_fp16 = use_fp16
         self.use_xla = use_xla
         # Required field for each metric class (used in tensorboard)
-        self.name = f'FID_{num_samples // 1000}k'
+        self.name = f'FID_size{image_size}_{num_samples // 1000}k'
 
         self.cache_dir = os.path.join(CACHE_DIR, model_name)
         self.cache_file = os.path.join(self.cache_dir, self.name + '.npz')
@@ -129,13 +129,17 @@ class FID:
         dist = m + np.trace(sigma_fake + sigma_real - 2.0 * s.real)
         return dist
 
-    def run_metric(self, input_batch_size, G_model):
+    def get_batch_size(self, input_batch_size):
+        # TODO: determine max batch size. For now just always use 32 for small resolutions
         if input_batch_size <= 8:
             # Case for high resolutions
-            batch_size = 16
+            batch_size = 16 # Worked for 512 + transition
         else:
-            # TODO: determine max batch size. For now just always use 32 for small resolutions
             batch_size = min(max(input_batch_size, 32), 32)
+        return batch_size
+
+    def run_metric(self, input_batch_size, G_model):
+        batch_size = self.get_batch_size(input_batch_size)
         mu_real, sigma_real = self.evaluate_on_reals(batch_size)
         mu_fake, sigma_fake = self.evaluate_on_fakes(batch_size, G_model)
         try:
