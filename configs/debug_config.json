@@ -2,7 +2,7 @@
     "model_name": "debug_model",
     "images_paths_filename": "local_living_room_100k.txt",
     "target_resolution": 32,
-    "start_resolution": 4,
+    "start_resolution": 16,
     "latent_size": 512,
     "dlatent_size": 512,
     "use_bias": false,

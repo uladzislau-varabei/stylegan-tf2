@@ -7,10 +7,9 @@ import tensorflow as tf
 from tensorflow.keras.applications.inception_v3 import InceptionV3
 from tensorflow.keras.applications.inception_v3 import preprocess_input as preprocess_inception_input
 
-from config import Config as cfg
-from custom_layers import naive_upsample
+from metrics.metrics_base import MetricBase
 from dataloader_utils import create_training_dataset
-from utils import CACHE_DIR, NCHW_FORMAT, validate_data_format, to_hw_size
+from utils import CACHE_DIR, to_hw_size
 from tf_utils import toNHWC_AXIS, NCHW_FORMAT, generate_latents,\
     enable_mixed_precision_policy, disable_mixed_precision_policy, extract_images
 
@@ -20,27 +19,24 @@ MU_REAL_KEY = 'mu_real'
 SIGMA_REAL_KEY = 'sigma_real'
 
 
-class FID:
+class FID(MetricBase):
 
-    def __init__(self, image_size, hw_ratio, num_samples, dataset_params, use_fp16, use_xla, model_name, **kwargs):
-        assert isinstance(num_samples, int)
-        # Inception model was trained on 299x299 images. So set minimal size to 256x256
-        self.min_size = 256
-        self.hw_ratio = hw_ratio
-        self.image_size = to_hw_size(image_size if image_size > self.min_size else self.min_size, hw_ratio)
-        self.image_res_log2 = int(np.log2(self.image_size[1]))
-        self.num_samples = num_samples
-        self.model_name = model_name
-        self.dataset_params = dataset_params
-        self.data_format = dataset_params[cfg.DATA_FORMAT]
-        validate_data_format(self.data_format)
-        self.use_fp16 = use_fp16
-        self.use_xla = use_xla
-        # Required field for each metric class (used in tensorboard)
-        self.name = f'FID_size{image_size}_{num_samples // 1000}k'
-
+    def __init__(self, image_size, hw_ratio, num_samples, crop_face, dataset_params, use_fp16, use_xla, model_name, **kwargs):
+        super(FID, self).__init__(
+            hw_ratio=hw_ratio, num_samples=num_samples, crop_face=crop_face, dataset_params=dataset_params,
+            use_fp16=use_fp16, use_xla=use_xla, model_name=model_name
+        )
+        # Required field for each metric class (used in TensorBoard)
+        self.name = f'FID_{num_samples // 1000}k'
         self.cache_dir = os.path.join(CACHE_DIR, model_name)
-        self.cache_file = os.path.join(self.cache_dir, self.name + '.npz')
+        self.cache_file = os.path.join(self.cache_dir, self.name + f'_size{image_size}.npz')
+
+        # Inception was built for 299x299 images, so images are always upscaled/downscaled to size 256 (height is scaled accordingly for wise datasets)
+        self.min_size = 256
+        self.target_size = 256
+        self.image_size = to_hw_size(self.target_size, hw_ratio)
+        self.image_res_log2 = int(np.log2(self.image_size[1]))
+
         if self.use_fp16:
             enable_mixed_precision_policy()
         # With pooling specified output shape will always be (None, 2048), so no need to provide input shape
@@ -58,30 +54,17 @@ class FID:
 
     @tf.function
     def process_images(self, images):
+        images = self.maybe_crop_face(images)
         images = extract_images(images, self.hw_ratio, self.data_format)
-
-        # TODO: think about face cropping (like for PPL metric)
-        # TODO: think about downsampling images (like for PPL metric)
         # Upsample image to 256x256 if it's smaller than that. Inception was built for 299x299 images.
-        # Use W dimension due to wide images
-        if self.data_format == NCHW_FORMAT:
-            shape_idx = 3
-        else: # data_format == NHWC_FORMAT:
-            shape_idx = 2
-        if images.shape[shape_idx] < self.min_size:
-            factor = self.min_size // images.shape[shape_idx]
-            images = naive_upsample(images, factor, data_format=self.data_format)
-
+        images = self.adjust_resolution(images, self.target_size, self.min_size)
         # Scale dynamic range from [-1,1] to [0,255] for Inception.
-        images = (images + 1) * (255 / 2)
-
+        images = self.scale_dynamic_range_for_imagenet(images)
         # Convert images to network format (NHWC).
         if self.data_format == NCHW_FORMAT:
             images = tf.transpose(images, toNHWC_AXIS)
-
         # Prepare images for Inception model.
         images = preprocess_inception_input(images, data_format='channels_last')
-
         return images
 
     def compute_activations_stats(self, activations):
@@ -128,15 +111,6 @@ class FID:
         s, _ = sqrtm(np.dot(sigma_fake, sigma_real), disp=False)
         dist = m + np.trace(sigma_fake + sigma_real - 2.0 * s.real)
         return dist
-
-    def get_batch_size(self, input_batch_size):
-        # TODO: determine max batch size. For now just always use 32 for small resolutions
-        if input_batch_size <= 8:
-            # Case for high resolutions
-            batch_size = 16 # Worked for 512 + transition
-        else:
-            batch_size = min(max(input_batch_size, 32), 32)
-        return batch_size
 
     def run_metric(self, input_batch_size, G_model):
         batch_size = self.get_batch_size(input_batch_size)

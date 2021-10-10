@@ -1,6 +1,8 @@
 import os
+import sys
 import json
 import logging
+import time
 
 from PIL import Image, ImageDraw, ImageFont
 import matplotlib.pyplot as plt
@@ -47,6 +49,37 @@ def should_log_debug_info():
 #----------------------------------------------------------------------------
 # Utils.
 
+def prepare_logger(config_path):
+    if not os.path.exists(LOGS_DIR):
+        os.mkdir(LOGS_DIR)
+
+    fmt = '%(asctime)s - %(levelname)s - %(message)s'
+    datefmt = '%Y-%m-%d %H:%M:%S'
+    formatter = logging.Formatter(fmt, datefmt=datefmt)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(formatter)
+
+    filename = os.path.join(LOGS_DIR, 'logs_' + os.path.split(config_path)[1].split('.')[0] + '.txt')
+    fh = logging.FileHandler(filename)
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(sh)
+    root_logger.addHandler(fh)
+
+    print('Logging initialized!')
+
+
+def sleep(s):
+    print(f"Sleeping {s}s...")
+    time.sleep(s)
+    print("Sleeping finished")
+
+
 # Thanks to https://github.com/NVlabs/ffhq-dataset/blob/master/download_ffhq.py
 def format_time(seconds):
     s = int(np.rint(seconds))
@@ -55,6 +88,16 @@ def format_time(seconds):
     if s < 24 * 60 * 60: return '%dh %02dm' % (s // (60 * 60), (s // 60) % 60)
     if s < 100 * 24 * 60 * 60: return '%dd %02dh' % (s // (24 * 60 * 60), (s // (60 * 60)) % 24)
     return '>100d'
+
+
+def clean_array(arr):
+    nans = np.isnan(arr)
+    n_vals = len(arr)
+    n_nans = np.count_nonzero(nans)
+    message = f'Number of nans in array is {n_nans} or {(100 * (n_nans / n_vals)):.2f}% '
+    print(message)
+    logging.info(message)
+    return arr[~nans]
 
 
 def load_config(config_path):

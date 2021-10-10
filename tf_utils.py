@@ -385,7 +385,8 @@ def prepare_gpu(mode='auto', memory_limit=None):
 
     # Note: change this number based on your GPU
     if memory_limit is None:
-        memory_limit = 7750 # for real use
+        memory_limit = 7750 # for real use. Larger values crash the app when starting (system after reboot, memory usage around 300 Mb)
+        # memory_limit = 6000
     set_memory_growth = False
     set_memory_limit = False
 

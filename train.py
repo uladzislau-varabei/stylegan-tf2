@@ -10,8 +10,8 @@ import numpy as np
 # in a new process
 
 from config import Config as cfg
-from utils import LOGS_DIR, TRAIN_MODE, INFERENCE_MODE, TRANSITION_MODE, STABILIZATION_MODE
-from utils import load_config, load_images_paths, format_time, DEBUG_MODE
+from utils import TRAIN_MODE, INFERENCE_MODE, TRANSITION_MODE, STABILIZATION_MODE, DEBUG_MODE
+from utils import load_config, load_images_paths, format_time, prepare_logger, sleep
 from tf_utils import prepare_gpu
 from model import StyleGAN
 
@@ -22,40 +22,13 @@ def parse_args():
         '--config_path',
         help='Path to a config of a model to train (json format)',
         #default=os.path.join('configs', 'demo_config.json'),
-        #default=os.path.join('configs', 'debug_config.json'),
+        default=os.path.join('configs', 'debug_config.json'),
         #default=os.path.join('configs', 'lsun_living_room.json'),
-        default=os.path.join('configs', 'lsun_car_512x384.json'),
+        #default=os.path.join('configs', 'lsun_car_512x384.json'),
         #required=True
     )
     args = parser.parse_args()
     return args
-
-
-def prepare_logger(config_path):
-    if not os.path.exists(LOGS_DIR):
-        os.mkdir(LOGS_DIR)
-
-    fmt = '%(asctime)s - %(levelname)s - %(message)s'
-    datefmt = '%Y-%m-%d %H:%M:%S'
-    formatter = logging.Formatter(fmt, datefmt=datefmt)
-
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(formatter)
-
-    filename = os.path.join(
-        LOGS_DIR, 'logs_' + os.path.split(config_path)[1].split('.')[0] + '.txt'
-    )
-    fh = logging.FileHandler(filename)
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    root_logger.addHandler(sh)
-    root_logger.addHandler(fh)
-
-    print('Logging initialized!')
 
 
 def run_process(target, args):
@@ -80,9 +53,7 @@ def run_train_stage(config, images_paths, res, mode, config_path=None):
     pid = os.getpid()
     logging.info(f'Training for {2**res}x{2**res} resolution and {mode} mode uses PID={pid}')
     prepare_gpu()
-    StyleGAN_model = StyleGAN(
-        config, mode=TRAIN_MODE, images_paths=images_paths, res=res, stage=mode
-    )
+    StyleGAN_model = StyleGAN(config, mode=TRAIN_MODE, images_paths=images_paths, res=res, stage=mode)
     StyleGAN_model.run_train_stage(res=res, mode=mode)
 
 
@@ -133,12 +104,6 @@ def train_model(config, config_path=None):
 
     train_total_time = time.time() - train_start_time
     logging.info(f'Training finished in {format_time(train_total_time)}!')
-
-
-def sleep(s):
-    print(f"Sleeping {s}s...")
-    time.sleep(s)
-    print("Sleeping finished")
 
 
 if __name__ == '__main__':

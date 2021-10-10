@@ -147,3 +147,4 @@ Supported metrics are:
 - Fix training in a single process
 - Fix problems with name scopes inside `tf.function()`. 
   The current solution relies on the answer by `demmerichs`: https://github.com/tensorflow/tensorflow/issues/36464
+  

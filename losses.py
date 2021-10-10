@@ -26,7 +26,7 @@ def select_D_loss_fn(loss_name):
     return losses[loss_name.lower()]
 
 
-def tf_grads_reduce_fn(vals, axis=None):
+def tf_sum(vals, axis=None):
     return tf.reduce_sum(vals, axis=axis)
 
 def tf_mean(x):
@@ -38,8 +38,8 @@ def tf_mean(x):
 
 @tf.function
 def G_wgan(G, D, optimizer, latents, write_summary, step, **kwargs):
-    fake_images = G(latents)
-    fake_scores = fp32(D(fake_images))
+    fake_images = G(latents, training=True)
+    fake_scores = fp32(D(fake_images, training=True))
     loss = tf.reduce_mean(-fake_scores)
 
     with tf.name_scope('Loss/G_WGAN'):
@@ -54,9 +54,9 @@ def D_wgan(G, D, optimizer, latents, real_images, write_summary, step,
     wgan_epsilon = 0.001,  # Weight for the epsilon term, \epsilon_{drift}
     **kwargs):
 
-    fake_images = G(latents)
-    fake_scores = fp32(D(fake_images))
-    real_scores = fp32(D(real_images))
+    fake_images = G(latents, training=True)
+    fake_scores = fp32(D(fake_images, training=True))
+    real_scores = fp32(D(real_images, training=True))
     fake_part_loss = tf.reduce_mean(fake_scores)
     real_part_loss = tf.reduce_mean(real_scores)
     loss = fake_part_loss - real_part_loss
@@ -82,9 +82,9 @@ def D_wgan_gp(G, D, optimizer, latents, real_images, write_summary, step,
     wgan_target  = 1.0,    # Target value for gradient magnitudes
     **kwargs):
 
-    fake_images = G(latents)
-    fake_scores = fp32(D(fake_images))
-    real_scores = fp32(D(real_images))
+    fake_images = G(latents, training=True)
+    fake_scores = fp32(D(fake_images, training=True))
+    real_scores = fp32(D(real_images, training=True))
     fake_part_loss = tf.reduce_mean(fake_scores)
     real_part_loss = tf.reduce_mean(real_scores)
     loss = fake_part_loss - real_part_loss
@@ -92,21 +92,17 @@ def D_wgan_gp(G, D, optimizer, latents, real_images, write_summary, step,
     batch_size = real_scores.get_shape().as_list()[0]
 
     # Gradient penalty
-    alpha = tf.random.uniform(
-        shape=[batch_size, 1, 1, 1], minval=0.0, maxval=1.0, dtype=real_images.dtype
-    )
-    mixed_images = alpha * real_images + (1. - alpha) * fake_images
+    alpha = tf.random.uniform(shape=[batch_size, 1, 1, 1], minval=0.0, maxval=1.0, dtype=real_images.dtype)
+    mixed_images = alpha * real_images + (1.0 - alpha) * fake_images
     with tf.GradientTape(watch_accessed_variables=False) as tape_gp:
         tape_gp.watch(mixed_images)
-        mixed_scores = fp32(D(mixed_images))
-        mixed_loss = maybe_scale_loss(tf_grads_reduce_fn(mixed_scores), optimizer)
+        mixed_scores = fp32(D(mixed_images, training=True))
+        mixed_loss = maybe_scale_loss(tf_sum(mixed_scores), optimizer)
     gp_grads = fp32(tape_gp.gradient(mixed_loss, mixed_images))
     # Default grads unscaling doesn't work inside this function,
     # though it is ok to use it inside train steps
     gp_grads = maybe_custom_unscale_grads(gp_grads, mixed_images, optimizer)
-    gp_grads_norm = tf.sqrt(
-        tf_grads_reduce_fn(tf.square(gp_grads), axis=[1, 2, 3])
-    )
+    gp_grads_norm = tf.sqrt(tf_sum(tf.square(gp_grads), axis=[1, 2, 3]))
     grads_penalty = tf.reduce_mean((gp_grads_norm - wgan_target) ** 2)
     loss += wgan_lambda * grads_penalty
 
@@ -131,8 +127,8 @@ def D_wgan_gp(G, D, optimizer, latents, real_images, write_summary, step,
 
 @tf.function
 def G_logistic_saturating(G, D, optimizer, latents, write_summary, step, **kwargs):
-    fake_images = G(latents)
-    fake_scores = fp32(D(fake_images))
+    fake_images = G(latents, training=True)
+    fake_scores = fp32(D(fake_images, training=True))
     loss = -tf.math.softplus(fake_scores) # log(1 - logistic(fake_scores))
 
     with tf.name_scope('Loss/G_logistic_saturating'):
@@ -144,8 +140,8 @@ def G_logistic_saturating(G, D, optimizer, latents, write_summary, step, **kwarg
 
 @tf.function
 def G_logistic_nonsaturating(G, D, optimizer, latents, write_summary, step, **kwargs):
-    fake_images = G(latents)
-    fake_scores = fp32(D(fake_images))
+    fake_images = G(latents, training=True)
+    fake_scores = fp32(D(fake_images, training=True))
     loss = tf.math.softplus(-fake_scores) # -log(logistic(fake_scores))
 
     with tf.name_scope('Loss/G_logistic_nonsaturating'):
@@ -157,9 +153,9 @@ def G_logistic_nonsaturating(G, D, optimizer, latents, write_summary, step, **kw
 
 @tf.function
 def D_logistic(G, D, optimizer, latents, real_images, write_summary, step, **kwargs):
-    fake_images = G(latents)
-    fake_scores = fp32(D(fake_images))
-    real_scores = fp32(D(real_images))
+    fake_images = G(latents, training=True)
+    fake_scores = fp32(D(fake_images, training=True))
+    real_scores = fp32(D(real_images, training=True))
     loss = tf.nn.softplus(fake_scores) # -log(1 - logistic(fake_scores))
     loss += tf.nn.softplus(-real_scores) # -log(logistic(real_scores))
 
@@ -178,20 +174,20 @@ def D_logistic_simplegp(G, D, optimizer, latents, real_images, write_summary, st
     use_r1_penalty = r1_gamma > 0.0
     use_r2_penalty = r2_gamma > 0.0
     with tf.GradientTape(watch_accessed_variables=False, persistent=True) as tape_gp:
-        fake_images = G(latents)
+        fake_images = G(latents, training=True)
 
         if use_r1_penalty:
             tape_gp.watch(real_images)
         if use_r2_penalty:
             tape_gp.watch(fake_images)
 
-        fake_scores = fp32(D(fake_images))
-        real_scores = fp32(D(real_images))
+        fake_scores = fp32(D(fake_images, training=True))
+        real_scores = fp32(D(real_images, training=True))
 
         if use_r1_penalty:
-            real_loss = maybe_scale_loss(tf_grads_reduce_fn(real_scores), optimizer)
+            real_loss = maybe_scale_loss(tf_sum(real_scores), optimizer)
         if use_r2_penalty:
-            fake_loss = maybe_scale_loss(tf_grads_reduce_fn(fake_scores), optimizer)
+            fake_loss = maybe_scale_loss(tf_sum(fake_scores), optimizer)
 
     loss = tf.nn.softplus(fake_scores) # -log(1 - logistic(fake_scores))
     loss += tf.nn.softplus(-real_scores) # -log(logistic(real_scores))
@@ -199,13 +195,13 @@ def D_logistic_simplegp(G, D, optimizer, latents, real_images, write_summary, st
     if use_r1_penalty:
         real_grads = fp32(tape_gp.gradient(real_loss, real_images))
         real_grads = maybe_custom_unscale_grads(real_grads, real_images, optimizer)
-        r1_penalty = tf_grads_reduce_fn(tf.square(real_grads), axis=[1, 2, 3])
+        r1_penalty = tf_sum(tf.square(real_grads), axis=[1, 2, 3])
         loss += r1_penalty * (r1_gamma * 0.5)
 
     if use_r2_penalty:
         fake_grads = fp32(tape_gp.gradient(fake_loss, fake_images))
         fake_grads = maybe_custom_unscale_grads(fake_grads, fake_images, optimizer)
-        r2_penalty = tf_grads_reduce_fn(tf.square(fake_grads), axis=[1, 2, 3])
+        r2_penalty = tf_sum(tf.square(fake_grads), axis=[1, 2, 3])
         loss += r2_penalty * (r2_gamma * 0.5)
 
     with tf.name_scope('Loss/D_logistic_simpleGP'):

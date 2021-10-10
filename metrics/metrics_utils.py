@@ -8,7 +8,8 @@ from .perceptual_path_length import PPL
 BENCHMARK_NUM_SAMPLES = 3000
 
 DEFAULT_FID_PARAMS = {
-    'num_samples': 25000
+    'num_samples': 25000,
+    'crop_face': False
 }
 
 DEFAULT_PPL_PARAMS = {

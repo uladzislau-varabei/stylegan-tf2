@@ -4,12 +4,11 @@ from tqdm import tqdm
 import numpy as np
 import tensorflow as tf
 
+from metrics.metrics_base import MetricBase
 from metrics.lpips_models.lpips_tensorflow import learned_perceptual_metric_model
-from config import Config as cfg
-from custom_layers import naive_downsample, naive_upsample
-from utils import NCHW_FORMAT, validate_data_format, to_hw_size
+from utils import NCHW_FORMAT,to_hw_size, clean_array
 from tf_utils import toNHWC_AXIS, toNCHW_AXIS, lerp, generate_latents, enable_random_noise, disable_random_noise,\
-    enable_mixed_precision_policy, disable_mixed_precision_policy, get_compute_dtype, extract_images
+    enable_mixed_precision_policy, disable_mixed_precision_policy, extract_images
 
 
 #----------------------------------------------------------------------------
@@ -38,42 +37,31 @@ def slerp(a, b, t):
 
 #----------------------------------------------------------------------------
 
-class PPL:
+class PPL(MetricBase):
 
     def __init__(self, image_size, hw_ratio, num_samples, epsilon, space, sampling, crop_face,
-                 dataset_params, use_fp16, use_xla, **kwargs):
+                 dataset_params, use_fp16, use_xla, model_name, **kwargs):
+        super(PPL, self).__init__(
+            hw_ratio=hw_ratio, num_samples=num_samples, crop_face=crop_face, dataset_params=dataset_params,
+            use_fp16=use_fp16, use_xla=use_xla, model_name=model_name
+        )
         assert space in ['w', 'z']
         assert sampling in ['full', 'end']
-        assert isinstance(num_samples, int)
-        self.num_samples = num_samples
-        self.epsilon = epsilon
-        self.norm_constant = 1. / (epsilon ** 2)
         self.space = space
         self.sampling = sampling
-        self.crop_face = crop_face
-        self.data_format = dataset_params[cfg.DATA_FORMAT]
-        validate_data_format(self.data_format)
-        self.use_fp16 = use_fp16
-        self.compute_dtype = get_compute_dtype(self.use_fp16)
-        self.use_xla = use_xla
-        # Required field for each metric class (used in tensorboard)
+        self.epsilon = epsilon
+        self.norm_constant = 1. / (epsilon ** 2)
+        # Required field for each metric class (used in TensorBoard)
         self.name = f'PPL_{space}_{sampling}_{num_samples // 1000}k'
 
-        # Min size for the network is 32x32.
-        # TODO: think to which resolution should images be upsampled if size is smaller than that?
-        # Always upscale to 256
+        # VGG was built for 224x224 images, so images are always upscaled/downscaled to size 256 (height is scaled accordingly for wise datasets)
         self.min_size = 256
         self.target_size = 256
-        self.hw_ratio = hw_ratio
-        # TODO: Implement case for resolutions, which are higher than 256
-        # self.image_size = to_hw_size(image_size if image_size > self.min_size else self.min_size, hw_ratio)
-        # Images are always upscaled/downscaled to size 256
         self.image_size = to_hw_size(self.target_size, hw_ratio)
 
         # Tf 2.x port of vgg16_zhang_perceptual
         vgg_ckpt_fn = os.path.join('metrics', 'lpips_models' ,'vgg', 'exported')
         lin_ckpt_fn = os.path.join('metrics', 'lpips_models', 'lin', 'exported')
-        # TODO: fix fp16 implementation
         if self.use_fp16:
             enable_mixed_precision_policy()
         # Note: input images should be in NHWC format in range (0, 255)
@@ -85,37 +73,15 @@ class PPL:
 
     @tf.function
     def process_images(self, images):
-        # Crop only the face region
-        if self.crop_face:
-            if self.data_format == NCHW_FORMAT:
-                c = int(images.shape[2] // 8)
-                images = images[:, :, (c * 3) : (c * 7), (c * 2) : (c * 6)]
-            else:  # data_format == NHWC_FORMAT
-                c = int(images.shape[2] // 8)
-                images = images[:, (c * 3) : (c * 7), (c * 2) : (c * 6), :]
-
+        images = self.maybe_crop_face(images)
         images = extract_images(images, self.hw_ratio, self.data_format)
-
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
-        # Use W dimension due to wide images
-        if self.data_format == NCHW_FORMAT:
-            shape_idx = 3
-        else: # data_format == NHWC_FORMAT:
-            shape_idx = 2
-        if images.shape[shape_idx] > 256:
-            factor = images.shape[shape_idx] // 256
-            images = naive_downsample(images, factor, data_format=self.data_format)
-        elif images.shape[shape_idx] < self.min_size:
-            factor = self.min_size // images.shape[shape_idx]
-            images = naive_upsample(images, factor, data_format=self.data_format)
-
+        images = self.adjust_resolution(images, self.target_size, self.min_size)
         # Scale dynamic range from [-1,1] to [0,255] for VGG.
-        images = (images + 1) * (255 / 2)
-
+        images = self.scale_dynamic_range_for_imagenet(images)
         # Convert images to network format (NHWC).
         if self.data_format == NCHW_FORMAT:
             images = tf.transpose(images, toNHWC_AXIS)
-
         return images
 
     def evaluate_distance_for_batch(self, batch_size, G_mapping, G_synthesis):
@@ -150,15 +116,6 @@ class PPL:
         batch_distance = self.lpips_model([img_e0, img_e1])
         return batch_distance
 
-    def get_batch_size(self, input_batch_size):
-        # TODO: determine max batch size. For now just always use 32 for small resolutions
-        if input_batch_size <= 8:
-            # Case for high resolutions
-            batch_size = 16 # Worked for 512 + transition
-        else:
-            batch_size = min(max(input_batch_size, 32), 32)
-        return batch_size
-
     def run_metric(self, input_batch_size, G_model):
         G_mapping = G_model.G_mapping
         G_synthesis = G_model.G_synthesis
@@ -166,7 +123,7 @@ class PPL:
         randomize_noise = G_model.randomize_noise
         if randomize_noise:
             # This line is very important. Otherwise, images might have visible differences,
-            # which leads to very high PPl scores, e.g.. 2.5M - 3.5M.
+            # which leads to very high PPl scores, e.g., 2.5M-3.5M.
             disable_random_noise(G_synthesis)
 
         # Sampling loop.
@@ -175,6 +132,7 @@ class PPL:
         for _ in tqdm(range(0, self.num_samples, batch_size), desc='PPL metric steps'):
             all_distances.append(self.evaluate_distance_for_batch(batch_size, G_mapping, G_synthesis).numpy())
         all_distances = np.concatenate(all_distances, axis=0)
+        all_distances = clean_array(all_distances)
 
         if randomize_noise:
             enable_random_noise(G_synthesis)

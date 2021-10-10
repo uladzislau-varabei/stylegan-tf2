@@ -20,7 +20,7 @@ from utils import compute_alpha,\
     get_start_fp16_resolution, should_use_fp16,\
     create_images_dir_path, create_images_grid_title,\
     format_time, to_int_dict, validate_data_format, to_z_dim, mult_by_zero, is_last_step, should_write_summary,\
-    load_images_paths, fast_save_grid
+    load_images_paths, fast_save_grid, should_log_debug_info
 from utils import NHWC_FORMAT, NCHW_FORMAT,\
     DEFAULT_MODE, TRAIN_MODE, INFERENCE_MODE, BENCHMARK_MODE,\
     GENERATOR_NAME, DISCRIMINATOR_NAME, TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
@@ -47,11 +47,24 @@ How to load model:
 """
 
 
-def show_vars_stats(vars):
-    for idx, var in enumerate(vars):
-        mean = tf.math.reduce_mean(var).numpy()
-        std = tf.math.reduce_std(var).numpy()
-        print(f'{idx}) {var.name}: mean={mean:.3f}, std={std:.3f}')
+def maybe_show_vars_stats(vars, message=None):
+    if message is None:
+        message = ''
+    if should_log_debug_info():
+        print('\n', message)
+        for idx, var in enumerate(vars):
+            mean = tf.math.reduce_mean(var).numpy()
+            std = tf.math.reduce_std(var).numpy()
+            print(f'{idx}) {var.name}: mean={mean:.3f}, std={std:.3f}')
+
+
+def maybe_show_grads_stat(grads, vars, step, model_name):
+    if should_log_debug_info():
+        for grad, var in zip(grads, vars):
+            nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
+            nums = tf.math.count_nonzero(tf.math.is_finite(grad))
+            percent = tf.math.round(100 * nans / (nans + nums))
+            tf.print(f'{model_name}, step = {step} {var.name}: n_nans is {nans} or {percent}%')
 
 
 CPU_DEVICE = '/CPU:0'
@@ -144,15 +157,9 @@ class Scheduler:
         for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
             if res > self.start_resolution_log2:
                 n_kimages += self.transition_kimages_dict.get(2 ** res, self.transition_kimages)
-                # TODO: for debugging, remove later
-                # print(f'After res={res}, mode={TRANSITION_MODE}', n_kimages)
             if res < self.resolution_log2:
                 n_kimages += self.stabilization_kimages_dict.get(2 ** res, self.stabilization_kimages)
-                # TODO: for debugging, remove later
-                # print(f'After res={res}, mode={STABILIZATION_MODE}', n_kimages)
         n_kimages = self.total_kimages - n_kimages
-        # TODO: for debugging, remove later
-        # print(f'n_kimages for the last stage: {n_kimages}')
         logging.info(f'n_kimages for the last stage: {n_kimages}')
         assert n_kimages > 0, 'Total number of images is greater than total number of images for all stages'
         return int(np.ceil(1000 * n_kimages / batch_size))
@@ -326,19 +333,19 @@ class StyleGAN:
         if self.use_Gs:
             Gs_config = config
             self.Gs_valid_latents = self.valid_latents
-            self.Gs_device = '/GPU:0' if self.use_gpu_for_Gs else '/CPU:0'
+            self.Gs_device = '/GPU:0' if self.use_gpu_for_Gs else CPU_DEVICE
             if not self.use_gpu_for_Gs:
                 Gs_config[cfg.DATA_FORMAT] = NHWC_FORMAT
                 self.Gs_valid_latents = tf.transpose(self.valid_latents, toNHWC_AXIS)
             self.Gs_object = Generator(Gs_config)
 
+        # TODO: implement processing of a case when only graphs must be traced. Now all possible models are created even for Gs
         self.initialize_models(res, stage)
         if mode == INFERENCE_MODE:
             print('Ready for inference')
         else:
             self.setup_Gs_betas(res)
             self.create_images_datasets(res, stage)
-            # TODO: metrics result in a process crash for high resolutions with large batch sizes (which work for benchmark)
             self.metrics_objects = setup_metrics(2 ** res,
                                                  hw_ratio=self.dataset_hw_ratio,
                                                  dataset_params=self.dataset_params,
@@ -428,6 +435,8 @@ class StyleGAN:
         self.G_object.initialize_G_model(model_res=self.resolution_log2, mode=TRANSITION_MODE)
         G_model = self.G_object.create_G_model(model_res=self.resolution_log2, mode=TRANSITION_MODE)
         logging.info('\nThe biggest Generator:\n')
+        self.G_object.G_mapping.summary(print_fn=logging.info)
+        self.G_object.G_synthesis.summary(print_fn=logging.info)
         G_model.summary(print_fn=logging.info)
 
         self.D_object.initialize_D_model(model_res=self.resolution_log2, mode=TRANSITION_MODE)
@@ -748,9 +757,8 @@ class StyleGAN:
         set_optimizer_iters(self.D_optimizer, optimizer_steps)
         set_optimizer_iters(self.G_optimizer, optimizer_steps)
 
-        # TODO: for debugging, remove later
-        print('D opt iters:', self.D_optimizer.iterations)
-        print('G opt iters:', self.G_optimizer.iterations)
+        logging.info('D opt iters:', self.D_optimizer.iterations)
+        logging.info('G opt iters:', self.G_optimizer.iterations)
 
     def create_images_datasets(self, res=None, stage=None):
         start_time = time.time()
@@ -848,11 +856,8 @@ class StyleGAN:
         D_model, G_model, Gs_model = models[D_KEY], models[G_KEY], models[GS_KEY]
         step = self.scheduler.get_stage_end_processed_images(res, mode)
 
-        # TODO: for debugging, remove later
-        # print('\nD stats after init:')
-        # show_vars_stats(D_model.trainable_variables)
-        # print('\nG stats after init:')
-        # show_vars_stats(G_model.trainable_variables)
+        maybe_show_vars_stats(D_model.trainable_variables, 'D stats after init:')
+        maybe_show_vars_stats(G_model.trainable_variables, 'G stats after init:')
 
         D_model = load_model(
             D_model, self.model_name, DISCRIMINATOR_NAME,
@@ -868,11 +873,8 @@ class StyleGAN:
                 res=res, stage=mode, step=step, storage_path=self.storage_path
             )
 
-        # TODO: for debugging, remove later
-        # print('\nD stats after loading:')
-        # show_vars_stats(D_model.trainable_variables)
-        # print('\nG stats after loading:')
-        # show_vars_stats(G_model.trainable_variables)
+        maybe_show_vars_stats(D_model.trainable_variables, '\nD stats after loading:')
+        maybe_show_vars_stats(G_model.trainable_variables, '\nG stats after loading:')
 
         logging.info(f'Loaded model weights from res={res}, mode={mode}')
         return D_model, G_model, Gs_model
@@ -994,13 +996,7 @@ class StyleGAN:
         G_grads = maybe_unscale_grads(G_grads, self.G_optimizer)
         self.G_optimizer.apply_gradients(zip(G_grads, G_vars))
 
-        # TODO: for debugging, remove later
-        #for grad, var in zip(G_grads, G_vars):
-            #nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
-            #nums = tf.math.count_nonzero(tf.math.is_finite(grad))
-            # tf.print('G, step =', step, f'{var.name}: nans =', nans, ',', tf.math.round(100 * nans / (nans + nums)), '%')
-
-        # self.process_hists(G_model, G_grads, 'G', write_hists_summary, step)
+        maybe_show_grads_stat(G_grads, G_vars, step, 'G')
 
         return G_grads
 
@@ -1024,13 +1020,7 @@ class StyleGAN:
         D_grads = maybe_unscale_grads(D_grads, self.D_optimizer)
         self.D_optimizer.apply_gradients(zip(D_grads, D_vars))
 
-        # TODO: for debugging, remove later
-        #for grad, var in zip(D_grads, D_vars):
-            #nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
-            #nums = tf.math.count_nonzero(tf.math.is_finite(grad))
-            # tf.print('D, step =', step, f'{var.name}: nans =', nans, ',', tf.math.round(100 * nans / (nans + nums)), '%')
-
-        # self.process_hists(D_model, D_grads, 'D', write_hists_summary, step)
+        maybe_show_grads_stat(D_grads, D_grads, step, 'D')
 
         return D_grads
 
@@ -1083,14 +1073,16 @@ class StyleGAN:
         # 1. Get time info and update last used value
         # One tick is number of images after each scalar summaries is updated
         cur_update_time = time.time()
-        tick_time = cur_update_time - self.last_update_time
+        tick_time = cur_update_time - self.last_update_time - self.metrics_time
+        self.metrics_time = 0.
         self.last_update_time = cur_update_time
         kimg_denom = self.summary_scalars_every / 1000
         total_time = cur_update_time - self.start_time
         # 2. Summary tick time
-        # Note: picks when metrics are evaluated and on first call (graph compilation)
+        # Note: picks on the first call (graph compilation). Metrics time is subtracted
         tf.summary.scalar(f'Timing/Tick(s)', tick_time, step=training_finished_images)
         tf.summary.scalar(f'Timing/Kimg(s)', tick_time / kimg_denom, step=training_finished_images)
+        tf.summary.scalar(f'Timing/ImgsPerSec', self.summary_scalars_every / tick_time, step=training_finished_images)
         # 3. Summary total time
         tf.summary.scalar(f'Timing/Total(hours)', total_time / (60.0 * 60.0), step=training_finished_images)
         tf.summary.scalar(f'Timing/Total(days)', total_time / (24.0 * 60.0 * 60.0), step=training_finished_images)
@@ -1157,6 +1149,7 @@ class StyleGAN:
     def init_training_time(self):
         self.start_time = time.time()
         self.last_update_time = time.time()
+        self.metrics_time = 0.
 
     def train(self):
         # TODO: refactor this function, and make it consistent with training for each separate stage
@@ -1431,12 +1424,13 @@ class StyleGAN:
 
                 tf.summary.scalar(f'Metric/{metric_name}', metric_value, step=training_finished_images)
                 tf.summary.scalar(f'Metric/{metric_name}/Time(s)', total_time, step=training_finished_images)
-                summary_writer.flush()
-                logging.info(f'Evaluated {metric_name} metric in {format_time(total_time)}')
+                logging.info(f'Evaluated {metric_name} metric in {format_time(total_time)}. Value is {metric_value:.3f} ')
 
             metrics_total_time = time.time() - metrics_start_time
             tf.summary.scalar(f'Metric/TotalRunTime/Time(s)', metrics_total_time, step=training_finished_images)
             summary_writer.flush()
+
+        self.metrics_time = metrics_total_time
 
     def run_benchmark_stage(self, res, mode, images, run_metrics):
         stage_start_time = time.time()
@@ -1449,11 +1443,9 @@ class StyleGAN:
         benchmark_steps          = images // batch_size
         n_finished_images        = 0
         tf_step                  = tf.Variable(n_finished_images, trainable=False, dtype=tf.int64)
-        # TODO: usage of a tensor for hists leads to a process crash
         tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
         tf_write_hists_summary   = tf.Variable(True, trainable=False, dtype=tf.bool)
 
-        # TODO: add temp summary writer and remove logs after execution
         benchmark_dir = os.path.join(TF_LOGS_DIR, 'temp_dir')
         summary_writer = tf.summary.create_file_writer(benchmark_dir)
         with summary_writer.as_default():
