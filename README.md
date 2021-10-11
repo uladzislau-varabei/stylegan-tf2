@@ -127,16 +127,22 @@ Supported metrics are:
       * Optional face crop for dataset with human faces (default is *False*) 
       * Number of samples (the official implementation uses 100k, which takes lots of time to run, 
         so consider using a lower value, e.g., 20k or 50k)
-  - To calculate the metric when the resolution of generated images is less than 256 (VGG was trained for 224) 
-    images are naively upsampled to resolution 256, if their resolution is lower than that.
-      * Probably images should not be upsampled. It's not obvious how the case is handled in the official implementation.
+  - To calculate the metric when the resolution of generated images is less/greater than 256 (VGG was trained for 224) 
+    images are naively upsampled/downsampled to resolution 256, if their resolution is lower/higher than that.
+      * Resolution along width dimension is used for comparison. 
+        For wide dataset height dimension is scaled according to `dataset_hw_ratio` value. 
+        The same scale factor is used for width and height.
+      * Probably images should not be upsampled/downsampled. It's not obvious how the case is handled in the official implementation.
   - Supports mixed precision and XLA.
   - Slightly changed *TensorFlow 2* port of lpips model by `moono` is used: https://github.com/moono/lpips-tf2.x.
 * Frechet Inception Distance (FID)
   - Supports mixed precision and XLA.
-  - To calculate the metric when the resolution of generated images is less than 256 (Inception was trained for 299) 
-    images are naively upsampled to resolution 256, if their resolution is lower than that.
-      * Probably images should not be upsampled. It's not obvious how the case is handled in the official implementation.
+  - To calculate the metric when the resolution of generated images is less/greater than 256 (Inception was trained for 299) 
+    images are naively upsampled/downsampled to resolution 256, if their resolution is lower/higher than that.
+      * Resolution along width dimension is used for comparison. 
+        For wide dataset height dimension is scaled according to `dataset_hw_ratio` value. 
+        The same scale factor is used for width and height.
+      * Probably images should not be upsampled/downsampled. It's not obvious how the case is handled in the official implementation.
   
 
 ## Further improvements

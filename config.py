@@ -320,7 +320,7 @@ class Config:
     DEFAULT_VALID_GRID_NROWS = 5
     DEFAULT_VALID_GRID_NCOLS = 7
     DEFAULT_VALID_MIN_TARGET_SINGLE_IMAGE_SIZE = 2 ** 7 # or maybe 2**7 ?
-    DEFAULT_VALID_MAX_PNG_RES = 5
+    DEFAULT_VALID_MAX_PNG_RES = 7
 
     # Note: by default Generator and Discriminator use the same values for these constants
     # Note: for the light version described in the appendix set fmap_base to 2048
