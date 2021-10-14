@@ -31,7 +31,7 @@
         "512": 6
     },
     "final_batch_size": 8,
-    "batch_repeats": 1,
+    "batch_repeats": 2,
     "G_loss_fn": "G_logistic_nonsaturating",
     "D_loss_fn": "D_logistic_simplegp",
     "D_loss_fn_params": {
@@ -54,7 +54,7 @@
     "summary_scalars_every_kimages": 2.5,
     "summary_hists_every_kimages": 25,
     "save_model_every_kimages": 100,
-    "save_images_every_kimages": 5,
+    "save_images_every_kimages": 2.5,
     "run_metrics_every_kimages": 50,
     "metrics": {
         "FID": {

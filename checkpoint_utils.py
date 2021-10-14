@@ -8,7 +8,7 @@ from tensorflow.keras import mixed_precision
 import h5py
 
 from config import Config as cfg
-from utils import should_log_debug_info, WEIGHTS_DIR, OPTIMIZER_POSTFIX
+from utils import should_log_debug_info, MODELS_DIR, WEIGHTS_DIR, OPTIMIZER_POSTFIX
 
 
 H5_WEIGHTS_KEY = 'weights'
@@ -113,7 +113,7 @@ def create_model_dir_path(model_name, res, stage, step=None, storage_path: str =
     res_dir = f'{2**res}x{2**res}'
     stage_dir = stage
     step_dir = STEP_DIR_PREFIX + str(step) if step is not None else ''
-    model_dir_path = os.path.join(WEIGHTS_DIR, model_name, res_dir, stage_dir, step_dir)
+    model_dir_path = os.path.join(MODELS_DIR, model_name, WEIGHTS_DIR, res_dir, stage_dir, step_dir)
 
     if storage_path is not None:
         model_dir_path = os.path.join(storage_path, model_dir_path)

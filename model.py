@@ -24,7 +24,7 @@ from utils import compute_alpha,\
 from utils import NHWC_FORMAT, NCHW_FORMAT,\
     DEFAULT_MODE, TRAIN_MODE, INFERENCE_MODE, BENCHMARK_MODE,\
     GENERATOR_NAME, DISCRIMINATOR_NAME, TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
-    CACHE_DIR, DATASET_CACHE_DIR, TF_LOGS_DIR
+    CACHE_DIR, DATASET_CACHE_DIR, MODELS_DIR, TF_LOGS_DIR
 from tf_utils import generate_latents, update_wsum_alpha,\
     get_compute_dtype, is_finite_grad,\
     trace_vars, get_gpu_memory_usage,\
@@ -316,7 +316,7 @@ class StyleGAN:
         self.summary_hists_every   = int(1000 * config.get(cfg.SUMMARY_HISTS_EVERY_KIMAGES, cfg.DEFAULT_SUMMARY_HISTS_EVERY_KIMAGES))
         self.save_model_every      = int(1000 * config.get(cfg.SAVE_MODEL_EVERY_KIMAGES, cfg.DEFAULT_SAVE_MODEL_EVERY_KIMAGES))
         self.save_images_every     = int(1000 * config.get(cfg.SAVE_IMAGES_EVERY_KIMAGES, cfg.DEFAULT_SAVE_IMAGES_EVERY_KIMAGES))
-        self.logs_path = os.path.join(TF_LOGS_DIR, self.model_name)
+        self.logs_path = os.path.join(MODELS_DIR, self.model_name, TF_LOGS_DIR)
         self.writers_dirs = {
             res: os.path.join(self.logs_path, f'{2**res}x{2**res}')
             for res in range(self.start_resolution_log2, self.resolution_log2 + 1)
@@ -364,7 +364,7 @@ class StyleGAN:
                     self.initialize_optimizers(create_all_variables=False, res=res, stage=stage)
 
     def initialize_valid_latents(self):
-        latents_dir  = os.path.join(CACHE_DIR, self.model_name)
+        latents_dir = os.path.join(MODELS_DIR, self.model_name, CACHE_DIR)
         latents_path = os.path.join(latents_dir, 'latents.npy')
         if os.path.exists(latents_path):
             latents = tf.constant(np.load(latents_path, allow_pickle=False))
@@ -757,8 +757,10 @@ class StyleGAN:
         set_optimizer_iters(self.D_optimizer, optimizer_steps)
         set_optimizer_iters(self.G_optimizer, optimizer_steps)
 
-        logging.info('D opt iters:', self.D_optimizer.iterations)
-        logging.info('G opt iters:', self.G_optimizer.iterations)
+        D_iters = self.D_optimizer.iterations
+        G_iters = self.G_optimizer.iterations
+        logging.info(f'D opt iters: var is {D_iters.name} and value is {D_iters.numpy()}')
+        logging.info(f'G opt iters: var is {G_iters.name} and value is {G_iters.numpy()}')
 
     def create_images_datasets(self, res=None, stage=None):
         start_time = time.time()
@@ -791,7 +793,7 @@ class StyleGAN:
         cache = False
         if self.dataset_max_cache_res is not None:
             if res <= self.dataset_max_cache_res:
-                cache = os.path.join(self.storage_path or '', DATASET_CACHE_DIR, self.model_name)
+                cache = os.path.join(self.storage_path or '', MODELS_DIR, self.model_name, DATASET_CACHE_DIR)
                 os.makedirs(cache, exist_ok=True)
 
         batch_size = self.get_batch_size(res, stage)
@@ -1026,6 +1028,7 @@ class StyleGAN:
 
     def process_hists(self, model, grads, model_name, write_hists_summary, step):
         if write_hists_summary:
+            print()
             print('Writing hists summaries...')
             start_time = time.time()
 
@@ -1067,6 +1070,8 @@ class StyleGAN:
     def add_resources_summary(self, training_finished_images):
         for device, memory_stats in get_gpu_memory_usage().items():
             for k, v in memory_stats.items():
+                if 'peak' in k.lower():
+                    self.resources[device] = v
                 tf.summary.scalar(f'Resources/{device}/{k}(Mbs)', v, step=training_finished_images)
 
     def add_timing_summary(self, training_finished_images):
@@ -1076,16 +1081,41 @@ class StyleGAN:
         tick_time = cur_update_time - self.last_update_time - self.metrics_time
         self.metrics_time = 0.
         self.last_update_time = cur_update_time
+        self.cur_tick += 1
+        kimg = self.cur_tick * self.summary_scalars_every / 1000.0
         kimg_denom = self.summary_scalars_every / 1000
         total_time = cur_update_time - self.start_time
         # 2. Summary tick time
         # Note: picks on the first call (graph compilation). Metrics time is subtracted
+        timing_kimg = tick_time / kimg_denom
+        timing_imgs_per_sec = self.summary_scalars_every / tick_time
         tf.summary.scalar(f'Timing/Tick(s)', tick_time, step=training_finished_images)
-        tf.summary.scalar(f'Timing/Kimg(s)', tick_time / kimg_denom, step=training_finished_images)
-        tf.summary.scalar(f'Timing/ImgsPerSec', self.summary_scalars_every / tick_time, step=training_finished_images)
+        tf.summary.scalar(f'Timing/Kimg(s)', timing_kimg, step=training_finished_images)
+        tf.summary.scalar(f'Timing/ImgsPerSec', timing_imgs_per_sec, step=training_finished_images)
         # 3. Summary total time
-        tf.summary.scalar(f'Timing/Total(hours)', total_time / (60.0 * 60.0), step=training_finished_images)
-        tf.summary.scalar(f'Timing/Total(days)', total_time / (24.0 * 60.0 * 60.0), step=training_finished_images)
+        timing_hours = total_time / (60.0 * 60.0)
+        timing_days = total_time / (24.0 * 60.0 * 60.0)
+        tf.summary.scalar(f'Timing/Total(hours)', timing_hours, step=training_finished_images)
+        tf.summary.scalar(f'Timing/Total(days)', timing_days, step=training_finished_images)
+        # 4. Additionally log values
+        stats_message = [
+            f'tick {self.cur_tick:<5d}',
+            f'kimg {kimg:<8.1f}',
+            f'time {format_time(total_time):<7s}',
+            f'sec/tick {tick_time:<6.1f}',
+            f'sec/kimg {timing_kimg:<6.1f}',
+            f'imgs/sec {timing_imgs_per_sec:<5.1f}',
+            f'hours {timing_hours:<6.1f}',
+            f'days {timing_days:<5.2f}'
+        ]
+        stats_message += [f'gpumem {k} {int(v):<5d}' for k, v in self.resources.items()]
+        if self.use_mixed_precision:
+            stats_message += [
+                f'G loss scale {int(self.G_optimizer.loss_scale):<4d}',
+                f'D loss scale {int(self.D_optimizer.loss_scale):<4d}'
+            ]
+        print() # Start new line after tqdm pbar
+        logging.info(' | '.join(stats_message))
 
     def post_train_step_actions(self, models, res, mode, summary_options, summary_writer):
         D_model, G_model, Gs_model = models[D_KEY], models[G_KEY], models[GS_KEY]
@@ -1150,6 +1180,8 @@ class StyleGAN:
         self.start_time = time.time()
         self.last_update_time = time.time()
         self.metrics_time = 0.
+        self.cur_tick = -1
+        self.resources = {}
 
     def train(self):
         # TODO: refactor this function, and make it consistent with training for each separate stage
@@ -1446,7 +1478,7 @@ class StyleGAN:
         tf_write_scalars_summary = tf.Variable(True, trainable=False, dtype=tf.bool)
         tf_write_hists_summary   = tf.Variable(True, trainable=False, dtype=tf.bool)
 
-        benchmark_dir = os.path.join(TF_LOGS_DIR, 'temp_dir')
+        benchmark_dir = os.path.join('temp_dir', TF_LOGS_DIR)
         summary_writer = tf.summary.create_file_writer(benchmark_dir)
         with summary_writer.as_default():
             desc = f'Benchmark {2**res}x{2**res} model, {mode} steps'

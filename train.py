@@ -37,9 +37,8 @@ def run_process(target, args):
     p.join()
 
 
-def trace_graphs(config, config_path=None):
-    if config_path is not None:
-        prepare_logger(config_path)
+def trace_graphs(config):
+    prepare_logger(config[cfg.MODEL_NAME])
     pid = os.getpid()
     logging.info(f'Tracing graphs uses PID={pid}')
     prepare_gpu()
@@ -47,17 +46,16 @@ def trace_graphs(config, config_path=None):
     StyleGAN_model.trace_graphs()
 
 
-def run_train_stage(config, images_paths, res, mode, config_path=None):
-    if config_path is not None:
-        prepare_logger(config_path)
+def run_train_stage(config, images_paths, res, mode):
+    prepare_logger(config[cfg.MODEL_NAME])
     pid = os.getpid()
     logging.info(f'Training for {2**res}x{2**res} resolution and {mode} mode uses PID={pid}')
-    prepare_gpu()
+    prepare_gpu('growth')
     StyleGAN_model = StyleGAN(config, mode=TRAIN_MODE, images_paths=images_paths, res=res, stage=mode)
     StyleGAN_model.run_train_stage(res=res, mode=mode)
 
 
-def train_model(config, config_path=None):
+def train_model(config):
     target_resolution = config[cfg.TARGET_RESOLUTION]
     resolution_log2 = int(np.log2(target_resolution))
     assert target_resolution == 2 ** resolution_log2 and target_resolution >= 4
@@ -70,7 +68,7 @@ def train_model(config, config_path=None):
     # a sudden remove of a file with images paths
     images_paths = load_images_paths(config)
 
-    run_process(target=trace_graphs, args=(config, config_path))
+    # run_process(target=trace_graphs, args=(config, ))
     sleep(3)
 
     train_start_time = time.time()
@@ -86,14 +84,14 @@ def train_model(config, config_path=None):
             # Transition stage
             run_process(
                 target=run_train_stage,
-                args=(config, images_paths, res, TRANSITION_MODE, config_path)
+                args=(config, images_paths, res, TRANSITION_MODE)
             )
             sleep(3)
 
         # Stabilization stage
         run_process(
             target=run_train_stage,
-            args=(config, images_paths, res, STABILIZATION_MODE, config_path)
+            args=(config, images_paths, res, STABILIZATION_MODE)
         )
         sleep(3)
 
@@ -109,8 +107,8 @@ def train_model(config, config_path=None):
 if __name__ == '__main__':
     args = parse_args()
 
-    prepare_logger(args.config_path)
     config = load_config(args.config_path)
+    prepare_logger(config[cfg.MODEL_NAME])
     logging.info('Training with the following config:')
     logging.info(config)
 
@@ -128,4 +126,4 @@ if __name__ == '__main__':
         StyleGAN_model.trace_graphs()
         StyleGAN_model.train()
     else:
-        train_model(config, args.config_path)
+        train_model(config)

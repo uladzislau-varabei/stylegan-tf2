@@ -271,11 +271,11 @@ class Generator:
         self.compute_dtype              = get_compute_dtype(self.use_mixed_precision)
         self.conv_clamp                 = config.get(cfg.CONV_CLAMP, cfg.DEFAULT_CONV_CLAMP)
 
-        self.weights_init_mode = config.get(cfg.G_WEIGHTS_INIT_MODE, None)
-        if self.weights_init_mode is None:
+        self.G_weights_init_mode = config.get(cfg.G_WEIGHTS_INIT_MODE, None)
+        if self.G_weights_init_mode is None:
             self.gain = GAIN_ACTIVATION_FUNS_DICT[self.G_act_name]
         else:
-            self.gain = GAIN_INIT_MODE_DICT[self.weights_init_mode]
+            self.gain = GAIN_INIT_MODE_DICT[self.G_weights_init_mode]
 
         self.override_projecting_gain = config.get(cfg.OVERRIDE_G_PROJECTING_GAIN, cfg.DEFAULT_OVERRIDE_G_PROJECTING_GAIN)
         # Gain is overridden to match the original ProGAN implementation (sqrt(2) / 4 was used with He init)
@@ -557,11 +557,11 @@ class Discriminator:
         self.compute_dtype              = get_compute_dtype(self.use_mixed_precision)
         self.conv_clamp                 = config.get(cfg.CONV_CLAMP, cfg.DEFAULT_CONV_CLAMP)
 
-        self.weights_init_mode = config.get(cfg.D_WEIGHTS_INIT_MODE, None)
-        if self.weights_init_mode is None:
+        self.D_weights_init_mode = config.get(cfg.D_WEIGHTS_INIT_MODE, None)
+        if self.D_weights_init_mode is None:
             self.gain = GAIN_ACTIVATION_FUNS_DICT[self.D_act_name]
         else:
-            self.gain = GAIN_INIT_MODE_DICT[self.weights_init_mode]
+            self.gain = GAIN_INIT_MODE_DICT[self.D_weights_init_mode]
 
         # Might be useful to override number of units in projecting layer in case latent size is not 512
         # to make models have almost the same number of trainable params

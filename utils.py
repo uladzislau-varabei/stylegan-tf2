@@ -25,6 +25,7 @@ GENERATOR_NAME     = 'G_model'
 DISCRIMINATOR_NAME = 'D_model'
 
 # Dirs
+MODELS_DIR         = 'models'
 WEIGHTS_DIR        = 'weights'
 LOGS_DIR           = 'logs'
 TF_LOGS_DIR        = 'tf_logs'
@@ -49,7 +50,7 @@ def should_log_debug_info():
 #----------------------------------------------------------------------------
 # Utils.
 
-def prepare_logger(config_path):
+def prepare_logger(model_name):
     if not os.path.exists(LOGS_DIR):
         os.mkdir(LOGS_DIR)
 
@@ -61,7 +62,9 @@ def prepare_logger(config_path):
     sh.setLevel(logging.INFO)
     sh.setFormatter(formatter)
 
-    filename = os.path.join(LOGS_DIR, 'logs_' + os.path.split(config_path)[1].split('.')[0] + '.txt')
+    model_dir = os.path.join(MODELS_DIR, model_name)
+    os.makedirs(model_dir, exist_ok=True)
+    filename = os.path.join(model_dir, 'logs_' + model_name + '.txt')
     fh = logging.FileHandler(filename)
     fh.setLevel(logging.INFO)
     fh.setFormatter(formatter)
@@ -133,7 +136,7 @@ def to_hw_size(image_size, hw_ratio) -> tuple:
 
 
 def create_images_dir_path(model_name, res, mode):
-    return os.path.join(IMAGES_DIR, model_name, f'{2**res}x{2**res}', mode)
+    return os.path.join(MODELS_DIR, model_name, IMAGES_DIR, f'{2**res}x{2**res}', mode)
 
 
 def create_images_grid_title(res, mode, step):

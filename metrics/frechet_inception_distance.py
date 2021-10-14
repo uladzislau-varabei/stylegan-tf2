@@ -9,7 +9,7 @@ from tensorflow.keras.applications.inception_v3 import preprocess_input as prepr
 
 from metrics.metrics_base import MetricBase
 from dataloader_utils import create_training_dataset
-from utils import CACHE_DIR, to_hw_size
+from utils import CACHE_DIR, MODELS_DIR, to_hw_size
 from tf_utils import toNHWC_AXIS, NCHW_FORMAT, generate_latents,\
     enable_mixed_precision_policy, disable_mixed_precision_policy, extract_images
 
@@ -28,7 +28,7 @@ class FID(MetricBase):
         )
         # Required field for each metric class (used in TensorBoard)
         self.name = f'FID_{num_samples // 1000}k'
-        self.cache_dir = os.path.join(CACHE_DIR, model_name)
+        self.cache_dir = os.path.join(MODELS_DIR, model_name, CACHE_DIR)
         self.cache_file = os.path.join(self.cache_dir, self.name + f'_size{image_size}.npz')
 
         # Inception was built for 299x299 images, so images are always upscaled/downscaled to size 256 (height is scaled accordingly for wise datasets)

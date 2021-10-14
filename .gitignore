@@ -1,9 +1,13 @@
 # Folders generated in training
+models
+# Old folders used in training
 cache
 images
 logs
 tf_logs
 weights
+# Benchmarking dir
+temp_dir
 
 # Jupyter notebooks
 .ipynb_checkpoints

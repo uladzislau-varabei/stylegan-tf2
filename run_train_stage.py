@@ -4,6 +4,7 @@ import logging
 
 import numpy as np
 
+from config import Config as cfg
 from utils import TRAIN_MODE, TRANSITION_MODE, STABILIZATION_MODE
 from utils import load_config, load_images_paths, prepare_logger
 from tf_utils import prepare_gpu
@@ -31,9 +32,8 @@ def parse_args():
     return args
 
 
-def run_train_stage(config_path, res, mode):
-    prepare_logger(config_path)
-    config = load_config(args.config_path)
+def run_train_stage(config, res, mode):
+    prepare_logger(config[cfg.MODEL_NAME])
     images_paths = load_images_paths(config)
     pid = os.getpid()
     logging.info(f'Training for {2 ** res}x{2 ** res} resolution and {mode} mode uses PID={pid}')
@@ -53,5 +53,6 @@ if __name__ == '__main__':
     res = int(np.log2(args.res))
     transition_stage = args.transition_stage
     stage = TRANSITION_MODE if transition_stage else STABILIZATION_MODE
+    config = load_config(args.config_path)
 
-    run_train_stage(res=res, mode=stage, config_path=args.config_path)
+    run_train_stage(config=config, res=res, mode=stage)
