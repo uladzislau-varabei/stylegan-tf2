@@ -1105,8 +1105,6 @@ class StyleGAN:
             f'sec/tick {tick_time:<6.1f}',
             f'sec/kimg {timing_kimg:<6.1f}',
             f'imgs/sec {timing_imgs_per_sec:<5.1f}',
-            f'hours {timing_hours:<6.1f}',
-            f'days {timing_days:<5.2f}'
         ]
         stats_message += [f'gpumem {k} {int(v):<5d}' for k, v in self.resources.items()]
         if self.use_mixed_precision:
@@ -1170,7 +1168,7 @@ class StyleGAN:
             WRITE_LOSS_SCALE_SUMMARY_KEY: write_loss_scale_summary,
             WRITE_SCALARS_SUMMARY_KEY   : write_scalars_summary,
             WRITE_HISTS_SUMMARY_KEY     : should_write_summary(self.summary_hists_every, stage_images, batch_size) or last_step_cond,
-            RUN_METRICS_KEY             : should_write_summary(self.run_metrics_every, stage_images + n_finished_images, batch_size) or last_step_cond,
+            RUN_METRICS_KEY             : should_write_summary(self.run_metrics_every, stage_images + n_finished_images, batch_size) or last_step_cond or first_step_cond,
             SAVE_MODELS_KEY             : should_write_summary(self.save_model_every, stage_images + n_finished_images, batch_size) or last_step_cond,
             SAVE_VALID_IMAGES_KEY       : should_write_summary(self.save_images_every, stage_images + n_finished_images, batch_size) or last_step_cond,
             SMOOTH_G_WEIGHTS_KEY        : self.use_Gs and (not first_step_cond) # For the first step optimizers learning rates are zeros
