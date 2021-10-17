@@ -40,6 +40,8 @@ def run_train_stage(config, res, mode):
     prepare_gpu()
     StyleGAN_model = StyleGAN(config, mode=TRAIN_MODE, images_paths=images_paths, res=res, stage=mode)
     StyleGAN_model.run_train_stage(res=res, mode=mode)
+    logging.info('----------------------------------------------------------------------')
+    logging.info('')
 
 
 if __name__ == '__main__':

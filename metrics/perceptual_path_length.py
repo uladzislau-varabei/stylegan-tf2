@@ -15,17 +15,13 @@ from tf_utils import toNHWC_AXIS, toNCHW_AXIS, lerp, generate_latents, enable_ra
 
 # Normalize batch of vectors.
 def normalize(v):
-    # Note: this function differs from the original implementation, because input vector tensor is assumed to have 4 dimensions.
-    # If it has 2 dimensions, then axis arg should be changed to -1 (value from the official implementation).
-    # Changes are needed because latents are 4 dimensional. For NCHW format their shape is: [N, latent_size, 1, 1].
-    return v / tf.sqrt(tf.reduce_sum(tf.square(v), axis=[1, 2, 3], keepdims=True))
+    return v / tf.sqrt(tf.reduce_sum(tf.square(v), axis=[-1], keepdims=True))
 
 
 # Spherical interpolation of a batch of vectors.
 def slerp(a, b, t):
     a = normalize(a)
     b = normalize(b)
-    # TODO: shouldn't axis arg also be changed due to a and b shape (the same as for normalize defined above)?
     d = tf.reduce_sum(a * b, axis=-1, keepdims=True)
     # Make sure acos inputs have right boundaries (due to numeric rounds)
     d = tf.clip_by_value(d, -1.0, 1.0)
@@ -86,8 +82,8 @@ class PPL(MetricBase):
 
     def evaluate_distance_for_batch(self, batch_size, G_mapping, G_synthesis):
         # Generate random latents and interpolation t-values.
-        # TODO: change to use a noise consistent with the one used by network
-        lat_t01 = generate_latents(batch_size * 2, list(G_mapping.input_shape[1:]),  self.compute_dtype)
+        # TODO: change to use a noise consistent with the one used by the model.
+        lat_t01 = generate_latents(batch_size * 2, G_mapping.input_shape[1],  self.compute_dtype)
         lerp_t = tf.random.uniform([batch_size], 0.0, 1.0 if self.sampling == 'full' else 0.0, dtype=self.compute_dtype)
 
         # Interpolate in W or Z.
@@ -99,10 +95,8 @@ class PPL(MetricBase):
             dlat_e01 = tf.reshape(tf.stack([dlat_e0, dlat_e1], axis=1), dlat_t01.shape)
         else:  # space == 'z'
             lat_t0, lat_t1 = lat_t01[0::2], lat_t01[1::2]
-            # Note: lerp_t shape is different from that in the original implementation due to latents shape
-            # (2 additional fake dimensions for H and W).
-            lat_e0 = slerp(lat_t0, lat_t1, lerp_t[:, tf.newaxis, tf.newaxis, tf.newaxis])
-            lat_e1 = slerp(lat_t0, lat_t1, lerp_t[:, tf.newaxis, tf.newaxis, tf.newaxis] + self.epsilon)
+            lat_e0 = slerp(lat_t0, lat_t1, lerp_t[:, tf.newaxis])
+            lat_e1 = slerp(lat_t0, lat_t1, lerp_t[:, tf.newaxis] + self.epsilon)
             lat_e01 = tf.reshape(tf.stack([lat_e0, lat_e1], axis=1), lat_t01.shape)
             dlat_e01 = G_mapping(lat_e01, training=False)
 

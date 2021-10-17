@@ -17,9 +17,12 @@
     "conv_clamp": 256,
     "fused_bias_act": true,
     "use_XLA": true,
-    "total_kimages": 46000,
+    "total_kimages": 48000,
     "transition_kimages": 600,
     "stabilization_kimages": 600,
+    "transition_kimages_dict": {
+        "512": 1200
+    },
     "batch_sizes": {
         "4": 128,
         "8": 128,
@@ -28,7 +31,7 @@
         "64": 32,
         "128": 16,
         "256": 12,
-        "512": 6
+        "512": 8
     },
     "final_batch_size": 8,
     "batch_repeats": 2,
@@ -53,8 +56,8 @@
     "max_models_to_keep": 5,
     "summary_scalars_every_kimages": 2.5,
     "summary_hists_every_kimages": 25,
-    "save_model_every_kimages": 200,
-    "save_images_every_kimages": 2.5,
+    "save_model_every_kimages": 100,
+    "save_images_every_kimages": 5,
     "run_metrics_every_kimages": 50,
     "metrics": {
         "FID": {

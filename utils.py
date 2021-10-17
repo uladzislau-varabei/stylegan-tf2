@@ -10,6 +10,7 @@ import numpy as np
 
 from config import Config as cfg
 
+
 # Recommended for Tensorflow
 NCHW_FORMAT = 'NCHW'
 # Recommended by Nvidia
@@ -51,9 +52,6 @@ def should_log_debug_info():
 # Utils.
 
 def prepare_logger(model_name):
-    if not os.path.exists(LOGS_DIR):
-        os.mkdir(LOGS_DIR)
-
     fmt = '%(asctime)s - %(levelname)s - %(message)s'
     datefmt = '%Y-%m-%d %H:%M:%S'
     formatter = logging.Formatter(fmt, datefmt=datefmt)
@@ -83,14 +81,18 @@ def sleep(s):
     print("Sleeping finished")
 
 
-# Thanks to https://github.com/NVlabs/ffhq-dataset/blob/master/download_ffhq.py
 def format_time(seconds):
+    """Convert the seconds to human readable string with days, hours, minutes and seconds."""
     s = int(np.rint(seconds))
-    if s < 60: return '%ds' % s
-    if s < 60 * 60: return '%dm %02ds' % (s // 60, s % 60)
-    if s < 24 * 60 * 60: return '%dh %02dm' % (s // (60 * 60), (s // 60) % 60)
-    if s < 100 * 24 * 60 * 60: return '%dd %02dh' % (s // (24 * 60 * 60), (s // (60 * 60)) % 24)
-    return '>100d'
+
+    if s < 60:
+        return "{0}s".format(s)
+    elif s < 60 * 60:
+        return "{0}m {1:02}s".format(s // 60, s % 60)
+    elif s < 24 * 60 * 60:
+        return "{0}h {1:02}m {2:02}s".format(s // (60 * 60), (s // 60) % 60, s % 60)
+    else:
+        return "{0}d {1:02}h {2:02}m".format(s // (24 * 60 * 60), (s // (60 * 60)) % 24, (s // 60) % 60)
 
 
 def clean_array(arr):
@@ -119,15 +121,6 @@ def validate_data_format(data_format):
 
 def validate_hw_ratio(hw_ratio):
     assert hw_ratio == 1 or 0.1 < hw_ratio < 1.0
-
-
-def to_z_dim(latent_size, data_format) -> list:
-    validate_data_format(data_format)
-    if data_format == NCHW_FORMAT:
-        z_dim = [latent_size, 1, 1]
-    else:  # data_format == NHWC_FORMAT:
-        z_dim = [1, 1, latent_size]
-    return z_dim
 
 
 def to_hw_size(image_size, hw_ratio) -> tuple:
@@ -201,8 +194,8 @@ def get_start_fp16_resolution(num_fp16_resolutions, start_resolution_log2, targe
             min(start_resolution_log2 + 2, target_resolution_log2 - 4 + 1), start_resolution_log2
         )
         """
-        # Let start block resolution and two consequent ones use fp32
-        return 2 + 2
+        # Value from the official implementation (N = 4) of one of the next papers
+        return target_resolution_log2 - 4 + 1
     else:
         return target_resolution_log2 - num_fp16_resolutions + 1
 

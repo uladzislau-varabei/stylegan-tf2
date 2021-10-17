@@ -1,5 +1,4 @@
 import os
-import sys
 import argparse
 import logging
 import time
@@ -13,6 +12,7 @@ from config import Config as cfg
 from utils import TRAIN_MODE, INFERENCE_MODE, TRANSITION_MODE, STABILIZATION_MODE, DEBUG_MODE
 from utils import load_config, load_images_paths, format_time, prepare_logger, sleep
 from tf_utils import prepare_gpu
+from networks import ModelConfig
 from model import StyleGAN
 
 
@@ -50,19 +50,13 @@ def run_train_stage(config, images_paths, res, mode):
     prepare_logger(config[cfg.MODEL_NAME])
     pid = os.getpid()
     logging.info(f'Training for {2**res}x{2**res} resolution and {mode} mode uses PID={pid}')
-    prepare_gpu()
+    prepare_gpu('growth')
     StyleGAN_model = StyleGAN(config, mode=TRAIN_MODE, images_paths=images_paths, res=res, stage=mode)
     StyleGAN_model.run_train_stage(res=res, mode=mode)
 
 
 def train_model(config):
-    target_resolution = config[cfg.TARGET_RESOLUTION]
-    resolution_log2 = int(np.log2(target_resolution))
-    assert target_resolution == 2 ** resolution_log2 and target_resolution >= 4
-
-    start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
-    start_resolution_log2 = int(np.log2(start_resolution))
-    assert start_resolution == 2 ** start_resolution_log2 and start_resolution >= 4
+    model_cfg = ModelConfig(config)
 
     # Load images paths before training starts to avoid breaking training process in case of
     # a sudden remove of a file with images paths
@@ -73,11 +67,11 @@ def train_model(config):
 
     train_start_time = time.time()
 
-    for res in range(start_resolution_log2, resolution_log2 + 1):
+    for res in range(model_cfg.start_resolution_log2, model_cfg.resolution_log2 + 1):
         logging.info(f'Training {2**res}x{2**res} model...')
         res_start_time = time.time()
 
-        if res > start_resolution_log2:
+        if res > model_cfg.start_resolution_log2:
             # The first resolution doesn't use alpha parameter,
             # but has usual number of steps for stabilization phase
 

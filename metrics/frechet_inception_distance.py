@@ -92,12 +92,12 @@ class FID(MetricBase):
 
     def evaluate_on_fakes(self, batch_size, G_model):
         activations = np.empty(self.activations_shape, dtype=self.activations_dtype)
-        z_dim = G_model.z_dim
+        latent_size = G_model.latent_size
         dtype = G_model.model_compute_dtype
         for idx in tqdm(range(0, self.num_samples, batch_size), 'FID metric fakes steps'):
             start = idx * batch_size
             end = min(start + batch_size, self.num_samples)
-            latents = generate_latents(batch_size, z_dim, dtype)
+            latents = generate_latents(batch_size, latent_size, dtype)
             fake_images = G_model(latents, training=False, validation=True)
             fake_images = self.process_images(fake_images)
             activations[start:end] = self.inception_model(fake_images).numpy()[:(end-start)]

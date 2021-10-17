@@ -22,6 +22,7 @@ toNCHW_AXIS = [0, 3, 1, 2]
 OS_LINUX = 'Linux'
 OS_WIN = 'Windows'
 RANDOMIZE_NOISE_VAR_NAME = 'is_random_noise'
+WSUM_VAR_NAME = 'alpha'
 WSUM_NAME = 'WSum'
 
 
@@ -123,16 +124,9 @@ FP32_ACTIVATIONS = ['selu']
 # Model utils.
 
 def update_wsum_alpha(model: tf.keras.Model, alpha):
-    def recursive_update_wsum_alpha(model, alpha):
-        for layer in model.layers:
-            if isinstance(layer, tf.keras.Model):
-                recursive_update_wsum_alpha(layer, alpha)
-            else:
-                if WSUM_NAME in layer.name:
-                    layer.set_weights([np.array(alpha)])
-        return model
-
-    return recursive_update_wsum_alpha(model, alpha)
+    for var in model.variables:
+        if WSUM_VAR_NAME in var.name:
+            var.assign(alpha)
 
 
 def enable_random_noise(model: tf.keras.Model):
@@ -210,8 +204,8 @@ def is_finite_grad(grad):
 #----------------------------------------------------------------------------
 # Images utils.
 
-def generate_latents(batch_size: int, z_dim: list, dtype=tf.float32):
-    return tf.random.normal(shape=[batch_size] + z_dim, mean=0., stddev=1., dtype=dtype)
+def generate_latents(batch_size: int, latents_size: int, dtype=tf.float32):
+    return tf.random.normal(shape=[batch_size, latents_size], mean=0., stddev=1., dtype=dtype)
 
 
 def restore_images(images):
@@ -322,6 +316,26 @@ def set_tf_logging(debug_mode=True):
         tf.autograph.set_verbosity(0)
 
 
+def maybe_show_vars_stats(vars, message=None):
+    if message is None:
+        message = ''
+    if should_log_debug_info():
+        print('\n', message)
+        for idx, var in enumerate(vars):
+            mean = tf.math.reduce_mean(var).numpy()
+            std = tf.math.reduce_std(var).numpy()
+            print(f'{idx}) {var.name}: mean={mean:.3f}, std={std:.3f}')
+
+
+def maybe_show_grads_stat(grads, vars, step, model_name):
+    if should_log_debug_info():
+        for grad, var in zip(grads, vars):
+            nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
+            nums = tf.math.count_nonzero(tf.math.is_finite(grad))
+            percent = tf.math.round(100 * nans / (nans + nums))
+            tf.print(f'{model_name}, step = {step} {var.name}: n_nans is {nans} or {percent}%')
+
+
 #----------------------------------------------------------------------------
 # General utils.
 
@@ -392,8 +406,10 @@ def prepare_gpu(mode='auto', memory_limit=None):
 
     if mode == 'auto':
         if os_name == OS_LINUX:
-            print(os_message + 'memory growth option is used')
-            set_memory_growth = True
+            print(os_message + 'all memory is available for TensorFlow')
+            return
+            # print(os_message + 'memory growth option is used')
+            # set_memory_growth = True
         elif os_name == OS_WIN:
             print(os_message + 'memory limit option is used')
             set_memory_limit = True

@@ -7,7 +7,7 @@ import tensorflow as tf
 
 from config import Config as cfg
 from checkpoint_utils import load_weights
-from utils import INFERENCE_MODE, WEIGHTS_DIR, fast_save_grid, load_config, to_z_dim
+from utils import INFERENCE_MODE, WEIGHTS_DIR, fast_save_grid, load_config
 from tf_utils import DEFAULT_DATA_FORMAT, prepare_gpu, generate_latents, convert_outputs_to_images, run_model_on_batches
 from model import StyleGAN
 
@@ -75,8 +75,7 @@ def generate_images(model: tf.keras.Model, truncation_psi: float, truncation_cut
     data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
     hw_ratio = config.get(cfg.DATASET_HW_RATIO, cfg.DEFAULT_DATASET_HW_RATIO)
 
-    z_dim = to_z_dim(latent_size, data_format)
-    latents = generate_latents(grid_cols * grid_rows, z_dim)
+    latents = generate_latents(grid_cols * grid_rows, latent_size)
     model_kwargs = {'training': False, 'truncation_psi': truncation_psi, 'truncation_cutoff': truncation_cutoff}
     batch_size = 16
     images = run_model_on_batches(model, model_kwargs, latents, batch_size)
@@ -141,8 +140,6 @@ if __name__ == '__main__':
     images = generate_images(Gs_model, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, config=config)
 
     out_dir = 'results'
-    if not os.path.exists(out_dir):
-        os.mkdir(out_dir)
     fast_save_grid(
         out_dir=out_dir,
         fname=image_fname,

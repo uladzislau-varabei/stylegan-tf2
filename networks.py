@@ -7,7 +7,7 @@ from custom_layers import WeightedSum, layer_dtype,\
     dense_layer, conv2d_layer, fused_bias_act_layer, bias_act_layer, const_layer, noise_layer, blur_layer,\
     pixel_norm_layer, instance_norm_layer, style_mod_layer, downscale2d_layer, upscale2d_layer, minibatch_stddev_layer
 from checkpoint_utils import weights_to_dict, load_model_weights_from_dict
-from utils import level_of_details, validate_data_format, create_model_type_key, to_int_dict, to_z_dim,\
+from utils import level_of_details, validate_data_format, create_model_type_key, to_int_dict,\
     get_start_fp16_resolution, should_use_fp16, adjust_clamp,\
     NHWC_FORMAT, NCHW_FORMAT, TRANSITION_MODE, STABILIZATION_MODE
 from tf_utils import generate_latents, get_compute_dtype, lerp,\
@@ -23,7 +23,7 @@ def n_filters(stage, fmap_base, fmap_decay, fmap_max):
     return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
 
 
-class GeneratorMapping:
+class ModelConfig:
 
     def __init__(self, config):
         self.config = config
@@ -39,8 +39,29 @@ class GeneratorMapping:
         self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
         validate_data_format(self.data_format)
 
+        # Computations
+        self.fused_bias_act             = config.get(cfg.FUSED_BIAS_ACT, cfg.DEFAULT_FUSED_BIAS_ACT)
+        self.use_mixed_precision        = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
+        self.num_fp16_resolutions       = config.get(cfg.NUM_FP16_RESOLUTIONS, cfg.DEFAULT_NUM_FP16_RESOLUTIONS)
+        self.start_fp16_resolution_log2 =\
+            get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
+        self.model_compute_dtype        = get_compute_dtype(self.use_mixed_precision)
+        self.use_xla                    = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
+        self.conv_clamp                 = config.get(cfg.CONV_CLAMP, cfg.DEFAULT_CONV_CLAMP)
+
+        self.batch_sizes = to_int_dict(config[cfg.BATCH_SIZES])
+        self.final_batch_size = config.get(cfg.FINAL_BATCH_SIZE, cfg.DEFAULT_FINAL_BATCH_SIZE)
+        # If not provided, take value from common dict
+        if self.final_batch_size is None:
+            self.final_batch_size = self.batch_sizes[self.target_resolution]
+
+
+class GeneratorMapping(ModelConfig):
+
+    def __init__(self, config):
+        super(GeneratorMapping, self).__init__(config)
+
         self.latent_size       = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
-        self.z_dim             = to_z_dim(self.latent_size, self.data_format)
         self.dlatent_size      = config.get(cfg.DLATENT_SIZE, cfg.DEFAULT_DLATENT_SIZE)
         self.normalize_latents = config.get(cfg.NORMALIZE_LATENTS, cfg.DEFAULT_NORMALIZE_LATENTS)
         self.use_styles        = config.get(cfg.USE_STYLES, cfg.DEFAULT_USE_STYLES)
@@ -50,15 +71,6 @@ class GeneratorMapping:
         self.mapping_act_name  = config.get(cfg.MAPPING_ACTIVATION, cfg.DEFAULT_MAPPING_ACTIVATION)
         self.mapping_gain      = GAIN_ACTIVATION_FUNS_DICT[self.mapping_act_name]
         self.mapping_use_bias  = config.get(cfg.MAPPING_USE_BIAS, cfg.DEFAULT_MAPPING_USE_BIAS)
-
-        # Computations
-        self.fused_bias_act             = config.get(cfg.FUSED_BIAS_ACT, cfg.DEFAULT_FUSED_BIAS_ACT)
-        self.use_mixed_precision        = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
-        self.num_fp16_resolutions       = config.get(cfg.NUM_FP16_RESOLUTIONS, cfg.DEFAULT_NUM_FP16_RESOLUTIONS)
-        self.start_fp16_resolution_log2 =\
-            get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
-        self.compute_dtype              = get_compute_dtype(self.use_mixed_precision)
-        self.conv_clamp                 = config.get(cfg.CONV_CLAMP, cfg.DEFAULT_CONV_CLAMP)
 
         # Note: now mapping network is built for target resolution, so when current resolution is lower that that,
         # some broadcast outputs aren't connected to any part of the graph. It's fine, but may look strange.
@@ -85,7 +97,7 @@ class GeneratorMapping:
         # TODO: think about fp16 for this network
         use_fp16 = self.use_mixed_precision
 
-        self.latents = Input(self.z_dim, dtype=self.compute_dtype, name='Latents')
+        self.latents = Input([self.latent_size], dtype=self.model_compute_dtype, name='Latents')
         x = self.latents
         if self.normalize_latents:
             #with tf.name_scope('Latents_normalizer') as scope:
@@ -98,34 +110,25 @@ class GeneratorMapping:
                     x = self.dense(x, units, use_fp16=use_fp16, scope=scope)
                     x = self.bias_act(x, use_fp16=use_fp16, scope=scope)
 
-            with tf.name_scope('Broadcast'):
-                x = tf.tile(x[:, tf.newaxis], [1, self.num_styles, 1])
+        with tf.name_scope('Broadcast'):
+            x = tf.tile(x[:, tf.newaxis], [1, self.num_styles, 1])
 
         self.G_mapping = tf.keras.Model(self.latents, tf.identity(x, name='dlatents'), name='G_mapping')
 
 
-class GeneratorStyle(tf.keras.Model):
+class GeneratorStyle(tf.keras.Model, ModelConfig):
 
     def __init__(self, G_mapping, G_synthesis, model_res, config):
-        super(GeneratorStyle, self).__init__(name='G_style')
+        ModelConfig.__init__(self, config)
+        tf.keras.Model.__init__(self, name='G_style')
+
         self.G_mapping = G_mapping
         self.G_synthesis = G_synthesis
         self.model_res = model_res
-        self.config = config
-
-        self.target_resolution = config[cfg.TARGET_RESOLUTION]
-        self.resolution_log2 = int(np.log2(self.target_resolution))
-        assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
-
-        self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
-        validate_data_format(self.data_format)
 
         self.latent_size         = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
-        self.z_dim               = to_z_dim(self.latent_size, self.data_format)
         self.dlatent_size        = config.get(cfg.DLATENT_SIZE, cfg.DEFAULT_DLATENT_SIZE)
         self.randomize_noise     = config.get(cfg.RANDOMIZE_NOISE, cfg.DEFAULT_RANDOMIZE_NOISE)
-        self.use_mixed_precision = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
-        self.model_compute_dtype = get_compute_dtype(self.use_mixed_precision)
         self.truncation_psi      = config.get(cfg.TRUNCATION_PSI, cfg.DEFAULT_TRUNCATION_PSI)
         self.truncation_cutoff   = config.get(cfg.TRUNCATION_CUTOFF, cfg.DEFAULT_TRUNCATION_CUTOFF)
         self.dlatent_avg_beta    = config.get(cfg.DLATENT_AVG_BETA, cfg.DEFAULT_DLATENT_AVG_BETA)
@@ -172,7 +175,7 @@ class GeneratorStyle(tf.keras.Model):
         )
 
     def generate_latents(self, batch_size):
-        return generate_latents(batch_size, self.z_dim, self.model_compute_dtype)
+        return generate_latents(batch_size, self.latent_size, self.model_compute_dtype)
 
     def apply_style_mixing(self, dlatents):
         latents2 = self.generate_latents(tf.shape(dlatents)[0])
@@ -227,24 +230,12 @@ class GeneratorStyle(tf.keras.Model):
         return images_out
 
 
-class Generator:
+class Generator(ModelConfig):
 
     def __init__(self, config):
-        self.config = config
-
-        self.target_resolution = config[cfg.TARGET_RESOLUTION]
-        self.resolution_log2 = int(np.log2(self.target_resolution))
-        assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
-
-        self.start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
-        self.start_resolution_log2 = int(np.log2(self.start_resolution))
-        assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
-
-        self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
-        validate_data_format(self.data_format)
+        super(Generator, self).__init__(config)
 
         self.latent_size       = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
-        self.z_dim             = to_z_dim(self.latent_size, self.data_format)
         self.dlatent_size      = config.get(cfg.DLATENT_SIZE, cfg.DEFAULT_DLATENT_SIZE)
         self.normalize_latents = config.get(cfg.NORMALIZE_LATENTS, cfg.DEFAULT_NORMALIZE_LATENTS)
         self.const_input_layer = config.get(cfg.CONST_INPUT_LAYER, cfg.DEFAULT_CONST_INPUT_LAYER)
@@ -261,15 +252,6 @@ class Generator:
         self.G_fmap_max        = config.get(cfg.G_FMAP_MAX, cfg.DEFAULT_FMAP_MAX)
         self.G_act_name        = config.get(cfg.G_ACTIVATION, cfg.DEFAULT_G_ACTIVATION)
         self.blur_filter       = config.get(cfg.BLUR_FILTER, cfg.DEFAULT_BLUR_FILTER)
-
-        # Computations
-        self.fused_bias_act             = config.get(cfg.FUSED_BIAS_ACT, cfg.DEFAULT_FUSED_BIAS_ACT)
-        self.use_mixed_precision        = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
-        self.num_fp16_resolutions       = config.get(cfg.NUM_FP16_RESOLUTIONS, cfg.DEFAULT_NUM_FP16_RESOLUTIONS)
-        self.start_fp16_resolution_log2 =\
-            get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
-        self.compute_dtype              = get_compute_dtype(self.use_mixed_precision)
-        self.conv_clamp                 = config.get(cfg.CONV_CLAMP, cfg.DEFAULT_CONV_CLAMP)
 
         self.G_weights_init_mode = config.get(cfg.G_WEIGHTS_INIT_MODE, None)
         if self.G_weights_init_mode is None:
@@ -291,7 +273,6 @@ class Generator:
         self.projecting_units = np.prod(self.projecting_target_shape)
 
         self.num_layers = self.resolution_log2 * 2 - 2
-        self.batch_sizes = to_int_dict(config[cfg.BATCH_SIZES])
 
         self.create_model_layers()
         self.G_models = {}
@@ -316,7 +297,7 @@ class Generator:
         self.latents = self.G_mapping_object.latents
         self.G_mapping = self.G_mapping_object.G_mapping
         # Use mapping network to get shape of dlatents
-        self.dlatents = Input(self.G_mapping.output_shape[1:], dtype=self.compute_dtype, name='Dlatents')
+        self.dlatents = Input(self.G_mapping.output_shape[1:], dtype=self.model_compute_dtype, name='Dlatents')
 
     def to_rgb_layer(self, res):
         lod = level_of_details(res, self.resolution_log2)
@@ -392,7 +373,7 @@ class Generator:
                 with tf.name_scope('Const') as scope:
                     # Note: input to layer should be dlatents to allow having separate mapping and synthesis networks,
                     # though number of channels is taken according to latents
-                    x = const_layer(self.dlatents, self.latent_size, use_fp16=use_fp16, scope=scope, config=self.config)
+                    x = const_layer(self.dlatents[:, 0], self.latent_size, use_fp16=use_fp16, scope=scope, config=self.config)
                     x = self.layer_epilogue(x, 0, use_fp16=use_fp16, scope=scope)
             else:
                 with tf.name_scope('Dense') as scope:
@@ -460,13 +441,13 @@ class Generator:
     def initialize_G_model(self, model_res=None, mode=None):
         if model_res is not None:
             batch_size = self.batch_sizes[2 ** model_res]
-            latents = tf.zeros(shape=[batch_size] + self.z_dim, dtype=self.compute_dtype)
+            latents = tf.zeros(shape=[batch_size, self.dlatent_size], dtype=self.model_compute_dtype)
             G_model = self.create_G_model(model_res, mode=mode)
             _ = G_model(latents, training=False)
         else:
             for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
                 batch_size = self.batch_sizes[2 ** res]
-                latents = tf.zeros(shape=[batch_size] + self.z_dim, dtype=self.compute_dtype)
+                latents = tf.zeros(shape=[batch_size, self.dlatent_size], dtype=self.model_compute_dtype)
                 G_model = self.create_G_model(res, mode=TRANSITION_MODE)
                 _ = G_model(latents, training=False)
 
@@ -480,7 +461,7 @@ class Generator:
 
     def trace_G_graphs(self, summary_writers, writers_dirs):
         G_prefix = 'Generator_'
-        trace_G_input = tf.zeros(shape=[1] + self.z_dim, dtype=self.compute_dtype)
+        trace_G_input = tf.zeros(shape=[1, self.dlatent_size], dtype=self.model_compute_dtype)
         for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
             writer = summary_writers[res]
             profiler_dir = writers_dirs[res]
@@ -523,21 +504,10 @@ class Generator:
         print('All Generator models traced!')
 
 
-class Discriminator:
+class Discriminator(ModelConfig):
 
     def __init__(self, config):
-        self.config = config
-
-        self.target_resolution = config[cfg.TARGET_RESOLUTION]
-        self.resolution_log2 = int(np.log2(self.target_resolution))
-        assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
-
-        self.start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
-        self.start_resolution_log2 = int(np.log2(self.start_resolution))
-        assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
-
-        self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
-        validate_data_format(self.data_format)
+        super(Discriminator, self).__init__(config)
 
         self.use_bias         = config.get(cfg.USE_BIAS, cfg.DEFAULT_USE_BIAS)
         self.mbstd_group_size = config[cfg.MBSTD_GROUP_SIZE]
@@ -549,14 +519,6 @@ class Discriminator:
         self.D_act_name       = config.get(cfg.D_ACTIVATION, cfg.DEFAULT_D_ACTIVATION)
         self.blur_filter      = config.get(cfg.BLUR_FILTER, cfg.DEFAULT_BLUR_FILTER)
 
-        self.fused_bias_act             = config.get(cfg.FUSED_BIAS_ACT, cfg.DEFAULT_FUSED_BIAS_ACT)
-        self.use_mixed_precision        = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
-        self.num_fp16_resolutions       = config.get(cfg.NUM_FP16_RESOLUTIONS,cfg.DEFAULT_NUM_FP16_RESOLUTIONS)
-        self.start_fp16_resolution_log2 =\
-            get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
-        self.compute_dtype              = get_compute_dtype(self.use_mixed_precision)
-        self.conv_clamp                 = config.get(cfg.CONV_CLAMP, cfg.DEFAULT_CONV_CLAMP)
-
         self.D_weights_init_mode = config.get(cfg.D_WEIGHTS_INIT_MODE, None)
         if self.D_weights_init_mode is None:
             self.gain = GAIN_ACTIVATION_FUNS_DICT[self.D_act_name]
@@ -566,8 +528,6 @@ class Discriminator:
         # Might be useful to override number of units in projecting layer in case latent size is not 512
         # to make models have almost the same number of trainable params
         self.projecting_nf = config.get(cfg.D_PROJECTING_NF, self.D_n_filters(2 - 2))
-
-        self.batch_sizes = to_int_dict(config[cfg.BATCH_SIZES])
 
         self.create_model_layers()
         self.D_models = {}
@@ -584,7 +544,7 @@ class Discriminator:
     def create_model_layers(self):
         self.D_input_layers = {
             res: Input(
-                shape=self.D_input_shape(res), dtype=self.compute_dtype, name=f'Images_{2**res}x{2**res}'
+                shape=self.D_input_shape(res), dtype=self.model_compute_dtype, name=f'Images_{2**res}x{2**res}'
             ) for res in range(2, self.resolution_log2 + 1)
         }
         # TODO: change start resolution (problems with graphs tracing)
@@ -715,13 +675,13 @@ class Discriminator:
     def initialize_D_model(self, model_res=None, mode=None):
         if model_res is not None:
             batch_size = self.batch_sizes[2 ** model_res]
-            images = tf.zeros(shape=[batch_size] + self.D_input_shape(model_res), dtype=self.compute_dtype)
+            images = tf.zeros(shape=[batch_size] + self.D_input_shape(model_res), dtype=self.model_compute_dtype)
             D_model = self.create_D_model(model_res, mode=mode)
             _ = D_model(images, training=False)
         else:
             for res in range(self.start_resolution_log2, self.resolution_log2 + 1):
                 batch_size = self.batch_sizes[2 ** res]
-                images = tf.zeros(shape=[batch_size] + self.D_input_shape(res), dtype=self.compute_dtype)
+                images = tf.zeros(shape=[batch_size] + self.D_input_shape(res), dtype=self.model_compute_dtype)
                 D_model = self.create_D_model(res, mode=TRANSITION_MODE)
                 _ = D_model(images, training=False)
 
@@ -739,7 +699,7 @@ class Discriminator:
             writer = summary_writers[res]
             # TODO: Change it later!
             profiler_dir = writers_dirs[res]
-            trace_D_input = tf.zeros([1] + self.D_input_shape(res), dtype=self.compute_dtype)
+            trace_D_input = tf.zeros([1] + self.D_input_shape(res), dtype=self.model_compute_dtype)
             if res == self.start_resolution_log2:
                 trace_D_model = tf.function(self.create_D_model(res, mode=STABILIZATION_MODE))
                 with writer.as_default():

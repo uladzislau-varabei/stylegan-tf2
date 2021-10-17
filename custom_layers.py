@@ -6,7 +6,7 @@ from tensorflow.keras import mixed_precision
 from config import Config as cfg
 from utils import validate_data_format
 from tf_utils import ACTIVATION_FUNS_DICT, FP32_ACTIVATIONS,\
-    DEFAULT_DATA_FORMAT, NCHW_FORMAT, WSUM_NAME, RANDOMIZE_NOISE_VAR_NAME, HE_GAIN
+    DEFAULT_DATA_FORMAT, NCHW_FORMAT, WSUM_VAR_NAME, WSUM_NAME, RANDOMIZE_NOISE_VAR_NAME, HE_GAIN
 
 
 LRMUL = 1.
@@ -395,13 +395,19 @@ class PixelNorm(Layer):
         super(PixelNorm, self).__init__(dtype=dtype, name=layer_name)
         validate_data_format(data_format)
         self.data_format = data_format
-        if self.data_format == NCHW_FORMAT:
-            self.channel_axis = 1
-        else: # self.data_format == NHWC_FORMAT:
-            self.channel_axis = 3
         self.epsilon = 1e-8 if self._dtype_policy.compute_dtype == 'float32' else 1e-4
         self.use_xla = use_xla
         self.call = tf.function(self.call, jit_compile=self.use_xla)
+
+    def build(self, input_shape):
+        # Layer might also be used to normalize latents, which hase shape [batch, channels]
+        if len(input_shape) == 2:
+            self.channel_axis = 1
+        else:
+            if self.data_format == NCHW_FORMAT:
+                self.channel_axis = 1
+            else:  # self.data_format == NHWC_FORMAT:
+                self.channel_axis = 3
 
     def call(self, x, *args, **kwargs):
         return x * tf.math.rsqrt(
@@ -629,7 +635,7 @@ class WeightedSum(Layer):
         super(WeightedSum, self).__init__(dtype=dtype, name=name)
         # Note: for mixed precision training constants can have float16 dtype
         self.alpha =self.add_weight(
-            name='alpha',
+            name=WSUM_VAR_NAME,
             initializer=tf.constant_initializer(0.0),
             trainable=False,
             dtype=self._dtype_policy.compute_dtype,

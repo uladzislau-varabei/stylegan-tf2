@@ -12,22 +12,20 @@ from config import Config as cfg
 from dataloader_utils import create_training_dataset
 from losses import select_G_loss_fn, select_D_loss_fn
 from metrics.metrics_utils import setup_metrics
-from networks import Generator, Discriminator
+from networks import ModelConfig, Generator, Discriminator
 # Utils imports
 from checkpoint_utils import save_model, load_model, save_optimizer_loss_scale, load_optimizer_loss_scale,\
     remove_old_models
-from utils import compute_alpha,\
-    get_start_fp16_resolution, should_use_fp16,\
+from utils import compute_alpha, should_use_fp16,\
     create_images_dir_path, create_images_grid_title,\
-    format_time, to_int_dict, validate_data_format, to_z_dim, mult_by_zero, is_last_step, should_write_summary,\
-    load_images_paths, fast_save_grid, should_log_debug_info
+    format_time, to_int_dict, mult_by_zero, is_last_step, should_write_summary,\
+    load_images_paths, fast_save_grid
 from utils import NHWC_FORMAT, NCHW_FORMAT,\
     DEFAULT_MODE, TRAIN_MODE, INFERENCE_MODE, BENCHMARK_MODE,\
     GENERATOR_NAME, DISCRIMINATOR_NAME, TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
     CACHE_DIR, DATASET_CACHE_DIR, MODELS_DIR, TF_LOGS_DIR
-from tf_utils import generate_latents, update_wsum_alpha,\
-    get_compute_dtype, is_finite_grad,\
-    trace_vars, get_gpu_memory_usage,\
+from tf_utils import generate_latents, update_wsum_alpha, is_finite_grad,\
+    trace_vars, maybe_show_vars_stats, maybe_show_grads_stat, get_gpu_memory_usage,\
     maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, set_tf_logging,\
     smooth_model_weights, convert_outputs_to_images, smooth_crossfade_images, run_model_on_batches
 from tf_utils import DEFAULT_DATA_FORMAT, toNCHW_AXIS, toNHWC_AXIS
@@ -37,35 +35,6 @@ set_tf_logging(debug_mode=False)
 
 
 MIXED_PRECISION_MAX_INIT_OPTIMIZER_ITERS = 20
-
-
-"""
-How to load model:
-1) Create model
-2) Initialize model
-3) Load weights
-"""
-
-
-def maybe_show_vars_stats(vars, message=None):
-    if message is None:
-        message = ''
-    if should_log_debug_info():
-        print('\n', message)
-        for idx, var in enumerate(vars):
-            mean = tf.math.reduce_mean(var).numpy()
-            std = tf.math.reduce_std(var).numpy()
-            print(f'{idx}) {var.name}: mean={mean:.3f}, std={std:.3f}')
-
-
-def maybe_show_grads_stat(grads, vars, step, model_name):
-    if should_log_debug_info():
-        for grad, var in zip(grads, vars):
-            nans = tf.math.count_nonzero(~tf.math.is_finite(grad))
-            nums = tf.math.count_nonzero(tf.math.is_finite(grad))
-            percent = tf.math.round(100 * nans / (nans + nums))
-            tf.print(f'{model_name}, step = {step} {var.name}: n_nans is {nans} or {percent}%')
-
 
 CPU_DEVICE = '/CPU:0'
 
@@ -86,23 +55,11 @@ SAVE_VALID_IMAGES_KEY        = 'save_valid_images'
 SMOOTH_G_WEIGHTS_KEY         = 'smooth_G_weights'
 
 
-class Scheduler:
+class Scheduler(ModelConfig):
 
     def __init__(self, config):
-        self.target_resolution = config[cfg.TARGET_RESOLUTION]
-        self.resolution_log2 = int(np.log2(self.target_resolution))
-        assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
+        super(Scheduler, self).__init__(config)
 
-        self.start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
-        self.start_resolution_log2 = int(np.log2(self.start_resolution))
-        assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
-
-        # Training images and batches
-        self.batch_sizes                = to_int_dict(config[cfg.BATCH_SIZES])
-        self.final_batch_size           =             config.get(cfg.FINAL_BATCH_SIZE, cfg.DEFAULT_FINAL_BATCH_SIZE)
-        # If not provided, take value from common dict
-        if self.final_batch_size is None:
-            self.final_batch_size = self.batch_sizes[self.target_resolution]
         self.total_kimages              =             config.get(cfg.TOTAL_KIMAGES, cfg.DEFAULT_TOTAL_KIMAGES)
         self.transition_kimages         =             config.get(cfg.TRANSITION_KIMAGES, cfg.DEFAULT_TRANSITION_KIMAGES)
         self.transition_kimages_dict    = to_int_dict(config.get(cfg.TRANSITION_KIMAGES_DICT, cfg.DEFAULT_TRANSITION_KIMAGES_DICT))
@@ -219,41 +176,18 @@ class Scheduler:
         return load_res, load_stage
 
 
-class StyleGAN:
+class StyleGAN(ModelConfig):
 
     def __init__(self, config, mode=DEFAULT_MODE, images_paths=None, res=None, stage=None,
                  single_process_training=False):
+        super(StyleGAN, self).__init__(config)
 
-        self.target_resolution = config[cfg.TARGET_RESOLUTION]
-        self.resolution_log2 = int(np.log2(self.target_resolution))
-        assert self.target_resolution == 2 ** self.resolution_log2 and self.target_resolution >= 4
-
-        self.start_resolution = config.get(cfg.START_RESOLUTION, cfg.DEFAULT_START_RESOLUTION)
-        self.start_resolution_log2 = int(np.log2(self.start_resolution))
-        assert self.start_resolution == 2 ** self.start_resolution_log2 and self.start_resolution >= 4
-
-        self.data_format = config.get(cfg.DATA_FORMAT, DEFAULT_DATA_FORMAT)
-        validate_data_format(self.data_format)
-
-        self.latent_size = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
-        self.z_dim = to_z_dim(self.latent_size, self.data_format)
-
-        # Training images and batches
         self.scheduler = Scheduler(config)
-        self.batch_sizes = to_int_dict(config[cfg.BATCH_SIZES])
-        self.final_batch_size = config.get(cfg.FINAL_BATCH_SIZE, cfg.DEFAULT_FINAL_BATCH_SIZE)
-        # If not provided, take value from common dict
-        if self.final_batch_size is None:
-            self.final_batch_size = self.batch_sizes[self.target_resolution]
+        # Training images and batches
+        self.latent_size = config.get(cfg.LATENT_SIZE, cfg.DEFAULT_LATENT_SIZE)
         self.batch_repeats = config.get(cfg.BATCH_REPEATS, cfg.DEFAULT_BATCH_REPEATS)
 
-        # Computations
-        self.use_mixed_precision  = config.get(cfg.USE_MIXED_PRECISION, cfg.DEFAULT_USE_MIXED_PRECISION)
-        self.num_fp16_resolutions = config.get(cfg.NUM_FP16_RESOLUTIONS, cfg.DEFAULT_NUM_FP16_RESOLUTIONS)
-        self.start_fp16_resolution_log2 =\
-            get_start_fp16_resolution(self.num_fp16_resolutions, self.start_resolution_log2, self.resolution_log2)
-        self.compute_dtype        = get_compute_dtype(self.use_mixed_precision)
-        self.use_xla              = config.get(cfg.USE_XLA, cfg.DEFAULT_USE_XLA)
+        # Smoothed generator
         self.use_Gs               = config.get(cfg.USE_G_SMOOTHING, cfg.DEFAULT_USE_G_SMOOTHING)
         self.use_gpu_for_Gs       = config.get(cfg.USE_GPU_FOR_GS, cfg.DEFAULT_USE_GPU_FOR_GS)
         self.Gs_beta              = config.get(cfg.G_SMOOTHING_BETA, cfg.DEFAULT_G_SMOOTHING_BETA)
@@ -285,12 +219,12 @@ class StyleGAN:
         self.D_loss_fn_name = config.get(cfg.D_LOSS_FN, cfg.DEFAULT_D_LOSS_FN)
         self.G_loss_fn = select_G_loss_fn(self.G_loss_fn_name)
         self.D_loss_fn = select_D_loss_fn(self.D_loss_fn_name)
-        self.G_loss_params = config.get(cfg.G_LOSS_FN_PARAMS, cfg.DEFAULT_G_LOSS_FN_PARAMS)
-        self.D_loss_params = config.get(cfg.D_LOSS_FN_PARAMS, cfg.DEFAULT_D_LOSS_FN_PARAMS)
+        self.G_loss_params  = config.get(cfg.G_LOSS_FN_PARAMS, cfg.DEFAULT_G_LOSS_FN_PARAMS)
+        self.D_loss_params  = config.get(cfg.D_LOSS_FN_PARAMS, cfg.DEFAULT_D_LOSS_FN_PARAMS)
 
         # Optimizers options
-        self.G_learning_rate = config.get(cfg.G_LEARNING_RATE, cfg.DEFAULT_G_LEARNING_RATE)
-        self.D_learning_rate = config.get(cfg.D_LEARNING_RATE, cfg.DEFAULT_D_LEARNING_RATE)
+        self.G_learning_rate  = config.get(cfg.G_LEARNING_RATE, cfg.DEFAULT_G_LEARNING_RATE)
+        self.D_learning_rate  = config.get(cfg.D_LEARNING_RATE, cfg.DEFAULT_D_LEARNING_RATE)
         self.G_learning_rate_dict = to_int_dict(config.get(cfg.G_LEARNING_RATE_DICT, cfg.DEFAULT_G_LEARNING_RATE_DICT))
         self.D_learning_rate_dict = to_int_dict(config.get(cfg.D_LEARNING_RATE_DICT, cfg.DEFAULT_D_LEARNING_RATE_DICT))
         self.beta1 = config.get(cfg.ADAM_BETA1, cfg.DEFAULT_ADAM_BETA1)
@@ -497,7 +431,7 @@ class StyleGAN:
             # toRGB layers
             to_layer = self.G_object.toRGB_layers[res]
             to_input_shape = [batch_size] + list(to_layer.input_shape[1:])
-            to_inputs = tf.zeros(shape=to_input_shape, dtype=self.compute_dtype)
+            to_inputs = tf.zeros(shape=to_input_shape, dtype=self.model_compute_dtype)
 
             with tf.GradientTape() as tape:
                 # Use outputs as loss values
@@ -561,7 +495,7 @@ class StyleGAN:
             latents = self.generate_latents(batch_size)
             # It's probably better to use ranges which are similar to the ones in real images
             images = tf.random.uniform(
-                shape=[batch_size] + D_input_shape, minval=-1.0, maxval=1.0, dtype=self.compute_dtype
+                shape=[batch_size] + D_input_shape, minval=-1.0, maxval=1.0, dtype=self.model_compute_dtype
             )
             with tf.GradientTape(watch_accessed_variables=False) as D_tape:
                 D_tape.watch(D_vars)
@@ -597,7 +531,7 @@ class StyleGAN:
             # fromRGB layers
             from_layer = self.D_object.fromRGB_layers[res]
             from_input_shape = [batch_size] + list(from_layer.input_shape[1:])
-            from_inputs = tf.zeros(shape=from_input_shape, dtype=self.compute_dtype)
+            from_inputs = tf.zeros(shape=from_input_shape, dtype=self.model_compute_dtype)
 
             with tf.GradientTape() as tape:
                 # Use outputs as loss values
@@ -977,7 +911,7 @@ class StyleGAN:
 
     @tf.function
     def generate_latents(self, batch_size):
-        return generate_latents(batch_size, self.z_dim, self.compute_dtype)
+        return generate_latents(batch_size, self.latent_size, self.model_compute_dtype)
 
     @tf.function
     def G_train_step(self, G_model, D_model, latents, write_scalars_summary, write_hists_summary, step):
@@ -1101,7 +1035,7 @@ class StyleGAN:
         stats_message = [
             f'tick {self.cur_tick:<5d}',
             f'kimg {kimg:<8.1f}',
-            f'time {format_time(total_time):<7s}',
+            f'time {format_time(total_time):<12s}',
             f'sec/tick {tick_time:<6.1f}',
             f'sec/kimg {timing_kimg:<6.1f}',
             f'imgs/sec {timing_imgs_per_sec:<5.1f}',
@@ -1168,7 +1102,7 @@ class StyleGAN:
             WRITE_LOSS_SCALE_SUMMARY_KEY: write_loss_scale_summary,
             WRITE_SCALARS_SUMMARY_KEY   : write_scalars_summary,
             WRITE_HISTS_SUMMARY_KEY     : should_write_summary(self.summary_hists_every, stage_images, batch_size) or last_step_cond,
-            RUN_METRICS_KEY             : should_write_summary(self.run_metrics_every, stage_images + n_finished_images, batch_size) or last_step_cond or first_step_cond,
+            RUN_METRICS_KEY             : should_write_summary(self.run_metrics_every, stage_images + n_finished_images, batch_size) or last_step_cond,
             SAVE_MODELS_KEY             : should_write_summary(self.save_model_every, stage_images + n_finished_images, batch_size) or last_step_cond,
             SAVE_VALID_IMAGES_KEY       : should_write_summary(self.save_images_every, stage_images + n_finished_images, batch_size) or last_step_cond,
             SMOOTH_G_WEIGHTS_KEY        : self.use_Gs and (not first_step_cond) # For the first step optimizers learning rates are zeros
@@ -1231,10 +1165,10 @@ class StyleGAN:
 
                         if step % self.batch_repeats == 0:
                             alpha = compute_alpha(step, transition_steps)
-                            D_model = update_wsum_alpha(D_model, alpha)
-                            G_model = update_wsum_alpha(G_model, alpha)
+                            update_wsum_alpha(D_model, alpha)
+                            update_wsum_alpha(G_model, alpha)
                             if Gs_model is not None:
-                                Gs_model = update_wsum_alpha(Gs_model, alpha)
+                                update_wsum_alpha(Gs_model, alpha)
 
                         if summary_options[WRITE_SCALARS_SUMMARY_KEY]:
                             tf.summary.scalar('Alpha', alpha, step=summary_options[TRAINING_FINISHED_IMAGES_KEY])
@@ -1340,10 +1274,10 @@ class StyleGAN:
 
                 if step % self.batch_repeats == 0:
                     alpha = compute_alpha(step, transition_steps)
-                    D_model = update_wsum_alpha(D_model, alpha)
-                    G_model = update_wsum_alpha(G_model, alpha)
+                    update_wsum_alpha(D_model, alpha)
+                    update_wsum_alpha(G_model, alpha)
                     if Gs_model is not None:
-                        Gs_model = update_wsum_alpha(Gs_model, alpha)
+                        update_wsum_alpha(Gs_model, alpha)
 
                 if summary_options[WRITE_SCALARS_SUMMARY_KEY]:
                     tf.summary.scalar('Alpha', alpha, step=summary_options[TRAINING_FINISHED_IMAGES_KEY])
@@ -1496,10 +1430,10 @@ class StyleGAN:
                 if mode == TRANSITION_MODE:
                     if step % self.batch_repeats == 0:
                         alpha = compute_alpha(step, benchmark_steps)
-                        D_model = update_wsum_alpha(D_model, alpha)
-                        G_model = update_wsum_alpha(G_model, alpha)
+                        update_wsum_alpha(D_model, alpha)
+                        update_wsum_alpha(G_model, alpha)
                         if Gs_model is not None:
-                            Gs_model = update_wsum_alpha(Gs_model, alpha)
+                            update_wsum_alpha(Gs_model, alpha)
 
                 G_latents = self.generate_latents(batch_size)
                 D_latents = self.generate_latents(batch_size)

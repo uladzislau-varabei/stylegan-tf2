@@ -9,7 +9,7 @@ Tensorflow 2 implementation of the paper
 **"A Style-Based Generator Architecture for Generative Adversarial Networks"** (https://arxiv.org/abs/1812.04948) <br>
 The code is based on the official implementation: https://github.com/NVlabs/stylegan.
 
-**Note:** the code is under active development, so some things have not yet been tested, though when training in 
+*Note:* the code is under active development, so some things have not yet been tested, though when training in 
 *fp32* or *mixed precision* no problems were observed. 
 Settings for stabilization for *mixed precision* tricks might need to be improved to stabilize training for various configs and datasets.
 
@@ -52,7 +52,7 @@ Configs which were used in the official implementation to train on FFHQ dataset:
 * `paper_config_ffhq_res1024_short.json` — similar to the previous config except that omitted keys automatically use default values;
 * `paper_config_ffhq_res1024_short_fast.json` — similar to the previous config but with all available speed-ups (mixed precision, XLA, fused bias and activation layer). 
 
-*Note*: options related to summaries are not aligned with the values in the official implementation. Set them according to your needs.
+*Note:* options related to summaries are not aligned with the values in the official implementation. Set them according to your needs.
 
 For debugging, it's convenient to use `debug_config.json`.
 
@@ -74,7 +74,7 @@ Some notes about the tricks to enable stable mixed precision training (inspired 
 
 Enabling XLA (Accelerated Linear Algebra, jit compilation) should improve training speed and memory usage.
 
-Note: when training with mixed precision on LSUN Living Room dataset loss scale became 1 for both (G and D) optimizers
+*Note*: when training with mixed precision on LSUN Living Room dataset loss scale became 1 for both (G and D) optimizers
 after about 8.5M images (around 3M for the last train stage). 
 It might indicate that mixed precision should be made more stable. 
 As a result of this behaviour some of valid images became all black (after converting), 
@@ -86,13 +86,14 @@ yet after a number of iterations other images might become black and others beco
 To control GPU memory usage one can refer to a function `prepare_gpu()` in `tf_utils.py`. 
 <br>
 Depending on your operating system and use case you might want to change memory managing. 
-By default, on Linux `memory_growth` option is used, while on Windows memory is limited with some reasonable number to allow use of PC (such as opening browsers with small number of tabs).
+By default, on Linux all available memory is used, while on Windows memory is limited with some reasonable number to allow use of PC (such as opening browsers with small number of tabs).
 <br>
-*Note:* the code was used with GPUs with 8 Gb of memory, so if your card has more/less memory it is strongly recommended to consider modifying `prepare_gpu()` function. 
+*Note:* the code was used with GPUs with 8 Gb of memory, so if your card has more/less memory it is strongly recommended to consider modifying `prepare_gpu()` function and batch size in training configs. 
+
 
 ## System requirements
 
-* The code was tested on Windows (and will be on Linux later, I hope). 
+* The code was tested on Windows and Linux. 
 * The following software should be installed on your machine:
 ```
 - NVIDIA driver 461.92 or newer
@@ -147,10 +148,9 @@ Supported metrics are:
 
 ## Further improvements
 
-- Add CUDA implementations for fused layers
-- Tune settings for *mixed precision* training stabilization tricks
-- Add multi GPU support
-- Fix training in a single process
+- Tune settings of stabilization tricks for *mixed precision* training;
+- Add multi GPU support;
+- Fix training in a single process;
 - Fix problems with name scopes inside `tf.function()`. 
-  The current solution relies on the answer by `demmerichs`: https://github.com/tensorflow/tensorflow/issues/36464
+  The current solution relies on the answer by `demmerichs`: https://github.com/tensorflow/tensorflow/issues/36464.
   
