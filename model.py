@@ -219,12 +219,12 @@ class StyleGAN(ModelConfig):
         self.D_loss_fn_name = config.get(cfg.D_LOSS_FN, cfg.DEFAULT_D_LOSS_FN)
         self.G_loss_fn = select_G_loss_fn(self.G_loss_fn_name)
         self.D_loss_fn = select_D_loss_fn(self.D_loss_fn_name)
-        self.G_loss_params  = config.get(cfg.G_LOSS_FN_PARAMS, cfg.DEFAULT_G_LOSS_FN_PARAMS)
-        self.D_loss_params  = config.get(cfg.D_LOSS_FN_PARAMS, cfg.DEFAULT_D_LOSS_FN_PARAMS)
+        self.G_loss_params = config.get(cfg.G_LOSS_FN_PARAMS, cfg.DEFAULT_G_LOSS_FN_PARAMS)
+        self.D_loss_params = config.get(cfg.D_LOSS_FN_PARAMS, cfg.DEFAULT_D_LOSS_FN_PARAMS)
 
         # Optimizers options
-        self.G_learning_rate  = config.get(cfg.G_LEARNING_RATE, cfg.DEFAULT_G_LEARNING_RATE)
-        self.D_learning_rate  = config.get(cfg.D_LEARNING_RATE, cfg.DEFAULT_D_LEARNING_RATE)
+        self.G_learning_rate = config.get(cfg.G_LEARNING_RATE, cfg.DEFAULT_G_LEARNING_RATE)
+        self.D_learning_rate = config.get(cfg.D_LEARNING_RATE, cfg.DEFAULT_D_LEARNING_RATE)
         self.G_learning_rate_dict = to_int_dict(config.get(cfg.G_LEARNING_RATE_DICT, cfg.DEFAULT_G_LEARNING_RATE_DICT))
         self.D_learning_rate_dict = to_int_dict(config.get(cfg.D_LEARNING_RATE_DICT, cfg.DEFAULT_D_LEARNING_RATE_DICT))
         self.beta1 = config.get(cfg.ADAM_BETA1, cfg.DEFAULT_ADAM_BETA1)

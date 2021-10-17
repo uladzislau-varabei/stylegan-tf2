@@ -50,7 +50,7 @@ def run_train_stage(config, images_paths, res, mode):
     prepare_logger(config[cfg.MODEL_NAME])
     pid = os.getpid()
     logging.info(f'Training for {2**res}x{2**res} resolution and {mode} mode uses PID={pid}')
-    prepare_gpu('growth')
+    prepare_gpu()
     StyleGAN_model = StyleGAN(config, mode=TRAIN_MODE, images_paths=images_paths, res=res, stage=mode)
     StyleGAN_model.run_train_stage(res=res, mode=mode)
 
