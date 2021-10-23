@@ -63,8 +63,10 @@ def prepare_logger(model_name, res=None, stage=None):
     model_dir = os.path.join(MODELS_DIR, model_name, LOGS_DIR)
     if (res is not None) and (stage is not None):
         model_dir = os.path.join(model_dir, f'{2 ** res}x{2 ** res}', stage)
+        filename = os.path.join(model_dir, f'logs_{model_name}_{2 ** res}x{2 ** res}_{stage}.txt')
+    else:
+        filename = os.path.join(model_dir, f'logs_{model_name}.txt')
     os.makedirs(model_dir, exist_ok=True)
-    filename = os.path.join(model_dir, 'logs_' + model_name + '.txt')
     fh = logging.FileHandler(filename)
     fh.setLevel(logging.INFO)
     fh.setFormatter(formatter)
