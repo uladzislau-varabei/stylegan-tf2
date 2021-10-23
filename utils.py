@@ -51,7 +51,7 @@ def should_log_debug_info():
 #----------------------------------------------------------------------------
 # Utils.
 
-def prepare_logger(model_name):
+def prepare_logger(model_name, res=None, stage=None):
     fmt = '%(asctime)s - %(levelname)s - %(message)s'
     datefmt = '%Y-%m-%d %H:%M:%S'
     formatter = logging.Formatter(fmt, datefmt=datefmt)
@@ -60,7 +60,9 @@ def prepare_logger(model_name):
     sh.setLevel(logging.INFO)
     sh.setFormatter(formatter)
 
-    model_dir = os.path.join(MODELS_DIR, model_name)
+    model_dir = os.path.join(MODELS_DIR, model_name, LOGS_DIR)
+    if (res is not None) and (stage is not None):
+        model_dir = os.path.join(model_dir, f'{2 ** res}x{2 ** res}', stage)
     os.makedirs(model_dir, exist_ok=True)
     filename = os.path.join(model_dir, 'logs_' + model_name + '.txt')
     fh = logging.FileHandler(filename)
@@ -100,12 +102,11 @@ def clean_array(arr):
     n_vals = len(arr)
     n_nans = np.count_nonzero(nans)
     message = f'Number of nans in array is {n_nans} or {(100 * (n_nans / n_vals)):.2f}% '
-    print(message)
     logging.info(message)
     return arr[~nans]
 
 
-def load_config(config_path):
+def load_config(config_path) -> dict:
     with open(config_path, 'r') as fp:
         config = json.load(fp)
     return config
@@ -115,7 +116,7 @@ def to_int_dict(d: dict) -> dict:
     return {int(k): v for k, v in d.items()}
 
 
-def validate_data_format(data_format):
+def validate_data_format(data_format: str):
     assert data_format in [NCHW_FORMAT, NHWC_FORMAT]
 
 
@@ -128,15 +129,15 @@ def to_hw_size(image_size, hw_ratio) -> tuple:
     return (int(hw_ratio * image_size), image_size)
 
 
-def create_images_dir_path(model_name, res, mode):
+def create_images_dir_path(model_name, res, mode) -> str:
     return os.path.join(MODELS_DIR, model_name, IMAGES_DIR, f'{2**res}x{2**res}', mode)
 
 
-def create_images_grid_title(res, mode, step):
+def create_images_grid_title(res, mode, step) -> str:
     return f'{2**res}x{2**res}, mode={mode}, step={step}'
 
 
-def load_images_paths(config):
+def load_images_paths(config) -> list:
     images_paths_filename = config[cfg.IMAGES_PATHS_FILENAME]
     with open(images_paths_filename, 'r') as f:
         file_lines = f.readlines()

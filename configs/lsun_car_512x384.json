@@ -21,7 +21,7 @@
     "transition_kimages": 600,
     "stabilization_kimages": 600,
     "transition_kimages_dict": {
-        "512": 1200
+        "512": 900
     },
     "batch_sizes": {
         "4": 128,

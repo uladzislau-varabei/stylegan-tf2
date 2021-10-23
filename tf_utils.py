@@ -13,6 +13,7 @@ from utils import NCHW_FORMAT, NHWC_FORMAT,\
 DEFAULT_DATA_FORMAT = NCHW_FORMAT
 DEFAULT_DTYPE = 'float32'
 DEFAULT_USE_FP16 = False
+MAX_LOSS_SCALE = 2 ** 15 # Max loss scale taken from source code for LossScaleOptimizer. Valid for TF 2.5
 
 # NCHW -> NHWC
 toNHWC_AXIS = [0, 2, 3, 1]
@@ -201,6 +202,29 @@ def is_finite_grad(grad):
     return tf.equal(tf.math.count_nonzero(~tf.math.is_finite(grad)), 0)
 
 
+def should_update_loss_scale(optimizer, threshold_scale):
+    state = True
+    if optimizer.use_mixed_precision:
+        if optimizer.dynamic:  # Bool indicating whether dynamic loss scaling is used.
+            return optimizer.loss_scale < threshold_scale
+    return state
+
+
+def update_loss_scale(optimizer, name):
+    try:
+        if optimizer.use_mixed_precision:
+            if optimizer.dynamic: # Bool indicating whether dynamic loss scaling is used.
+                loss_scale_object = optimizer._loss_scale
+                new_loss_scale = min(optimizer.loss_scale * (2 ** 4), MAX_LOSS_SCALE)
+                logging.info(f'Forcefully increased {name} optimizer loss scale to {new_loss_scale}')
+                # Taken from source code for LossScaleOptimizer
+                loss_scale_object.counter.assign(0)
+                loss_scale_object.current_loss_scale.assign(new_loss_scale)
+    except:
+        logging.error(f'Could not access required fields for loss scale optimizer in {tf.version.VERSION}. '
+                      f'See source code of LossScaleOptimizer to fix the code accordingly.')
+
+
 #----------------------------------------------------------------------------
 # Images utils.
 
@@ -356,7 +380,7 @@ def get_gpu_memory_usage():
     Returns dict with info about memory usage (in Mb) by each GPU. {device_name: {dict}}
     """
     def format_device_name(n):
-        # For Tf2.5 name is like '/device:GPU:0', for other versions this function might need changes
+        # For TF 2.5 name is like '/device:GPU:0', for other versions this function might need changes
         return n.split('device')[1][1:]
 
     def to_mb_size(bytes_size):

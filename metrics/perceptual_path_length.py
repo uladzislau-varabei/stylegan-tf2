@@ -55,7 +55,7 @@ class PPL(MetricBase):
         self.target_size = 256
         self.image_size = to_hw_size(self.target_size, hw_ratio)
 
-        # Tf 2.x port of vgg16_zhang_perceptual
+        # TF 2.x port of vgg16_zhang_perceptual
         vgg_ckpt_fn = os.path.join('metrics', 'lpips_models' ,'vgg', 'exported')
         lin_ckpt_fn = os.path.join('metrics', 'lpips_models', 'lin', 'exported')
         if self.use_fp16:

@@ -24,11 +24,11 @@ from utils import NHWC_FORMAT, NCHW_FORMAT,\
     DEFAULT_MODE, TRAIN_MODE, INFERENCE_MODE, BENCHMARK_MODE,\
     GENERATOR_NAME, DISCRIMINATOR_NAME, TRANSITION_MODE, STABILIZATION_MODE, SMOOTH_POSTFIX, OPTIMIZER_POSTFIX,\
     CACHE_DIR, DATASET_CACHE_DIR, MODELS_DIR, TF_LOGS_DIR
-from tf_utils import generate_latents, update_wsum_alpha, is_finite_grad,\
+from tf_utils import generate_latents, update_wsum_alpha, is_finite_grad, update_loss_scale, should_update_loss_scale, \
     trace_vars, maybe_show_vars_stats, maybe_show_grads_stat, get_gpu_memory_usage,\
     maybe_scale_loss, maybe_unscale_grads, is_optimizer_ready, set_optimizer_iters, set_tf_logging,\
     smooth_model_weights, convert_outputs_to_images, smooth_crossfade_images, run_model_on_batches
-from tf_utils import DEFAULT_DATA_FORMAT, toNCHW_AXIS, toNHWC_AXIS
+from tf_utils import DEFAULT_DATA_FORMAT, toNCHW_AXIS, toNHWC_AXIS, MAX_LOSS_SCALE
 
 
 set_tf_logging(debug_mode=False)
@@ -53,6 +53,7 @@ RUN_METRICS_KEY              = 'run_metrics'
 SAVE_MODELS_KEY              = 'save_models'
 SAVE_VALID_IMAGES_KEY        = 'save_valid_images'
 SMOOTH_G_WEIGHTS_KEY         = 'smooth_G_weights'
+RESET_LOSS_SCALE_STATS_KEY   = 'reset_loss_scale_stats'
 
 
 class Scheduler(ModelConfig):
@@ -230,6 +231,7 @@ class StyleGAN(ModelConfig):
         self.beta1 = config.get(cfg.ADAM_BETA1, cfg.DEFAULT_ADAM_BETA1)
         self.beta2 = config.get(cfg.ADAM_BETA2, cfg.DEFAULT_ADAM_BETA2)
         self.reset_opt_state_for_new_lod = config.get(cfg.RESET_OPT_STATE_FOR_NEW_LOD, cfg.DEFAULT_RESET_OPT_STATE_FOR_NEW_LOD)
+        self.loss_scale_cycle_length = 1000 # Number of iterations for loss scale cycle length. Used for dealing with small loss scales
 
         # Valid images options
         self.valid_grid_nrows = config.get(cfg.VALID_GRID_NROWS, cfg.DEFAULT_VALID_GRID_NROWS)
@@ -578,7 +580,7 @@ class StyleGAN(ModelConfig):
     def get_optimizer_initial_loss_scale(self, model_type, res, stage, benchmark: bool = False):
         if benchmark:
             # Use default values for loss scale optimizer
-            return 2 ** 15, True
+            return MAX_LOSS_SCALE, True
 
         use_fp16 = should_use_fp16(res, self.start_fp16_resolution_log2, self.use_mixed_precision)
         if not use_fp16:
@@ -606,7 +608,7 @@ class StyleGAN(ModelConfig):
         }
         last_loss_scale = load_optimizer_loss_scale(**kwargs)
         # Note: init default loss scale is 2 ** 15. Start with a value which is several steps higher than the last one
-        init_loss_scale = min(last_loss_scale * (2 ** 4), 2 ** 15)
+        init_loss_scale = min(last_loss_scale * (2 ** 4), MAX_LOSS_SCALE)
         logging.info(f'Loss scale for {model_type} optimizer for res={res}, stage={stage}: '
                      f'init_loss_scale = {init_loss_scale}, last_loss_scale = {last_loss_scale}')
         return init_loss_scale, True
@@ -623,6 +625,7 @@ class StyleGAN(ModelConfig):
     def initialize_optimizers(self, res=None, stage=None, create_all_variables: bool = False, benchmark: bool = False):
         start_time = time.time()
         logging.info('Initializing optimizers...')
+        self.reset_loss_scale_states() # Always reset states even if mixed precision is not used
 
         # 1: create optimizer states for all internal and final output layers
         # 2: create optimizer states for all intermediate output layers
@@ -695,6 +698,25 @@ class StyleGAN(ModelConfig):
         G_iters = self.G_optimizer.iterations
         logging.info(f'D opt iters: var is {D_iters.name} and value is {D_iters.numpy()}')
         logging.info(f'G opt iters: var is {G_iters.name} and value is {G_iters.numpy()}')
+
+    def reset_loss_scale_states(self):
+        # If loss scaly is lower than that, then try forcefully increasing it
+        self.loss_scale_threshold = 8
+        # Max number of updates during loss scale cycles
+        self.G_cycle_left_updates = 5
+        self.D_cycle_left_updates = 5
+
+    def maybe_update_loss_scales(self):
+        # G optimizer
+        if self.G_cycle_left_updates > 0:
+            if should_update_loss_scale(self.G_optimizer, self.loss_scale_threshold):
+                update_loss_scale(self.G_optimizer, 'G')
+                self.G_cycle_left_updates -= 1
+        # D optimizer
+        if self.D_cycle_left_updates > 0:
+            if should_update_loss_scale(self.D_optimizer, self.loss_scale_threshold):
+                update_loss_scale(self.D_optimizer, 'D')
+                self.D_cycle_left_updates -= 1
 
     def create_images_datasets(self, res=None, stage=None):
         start_time = time.time()
@@ -1076,6 +1098,10 @@ class StyleGAN(ModelConfig):
             self.add_timing_summary(training_finished_images)
             summary_writer.flush()
 
+        self.maybe_update_loss_scales()
+        if summary_options[RESET_LOSS_SCALE_STATS_KEY]:
+            self.reset_loss_scale_states()
+
         if summary_options[SAVE_MODELS_KEY]:
             self.save_models(models=models, res=res, mode=mode, step=training_finished_images)
             if self.is_last_stage(res, mode):
@@ -1105,7 +1131,8 @@ class StyleGAN(ModelConfig):
             RUN_METRICS_KEY             : should_write_summary(self.run_metrics_every, stage_images + n_finished_images, batch_size) or last_step_cond,
             SAVE_MODELS_KEY             : should_write_summary(self.save_model_every, stage_images + n_finished_images, batch_size) or last_step_cond,
             SAVE_VALID_IMAGES_KEY       : should_write_summary(self.save_images_every, stage_images + n_finished_images, batch_size) or last_step_cond,
-            SMOOTH_G_WEIGHTS_KEY        : self.use_Gs and (not first_step_cond) # For the first step optimizers learning rates are zeros
+            SMOOTH_G_WEIGHTS_KEY        : self.use_Gs and (not first_step_cond), # For the first step optimizers learning rates are zeros
+            RESET_LOSS_SCALE_STATS_KEY  : stage_steps % self.loss_scale_cycle_length == 0 # Cycle length is set in iterations
         }
 
     def init_training_time(self):

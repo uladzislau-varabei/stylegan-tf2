@@ -4,9 +4,7 @@ import logging
 import time
 from multiprocessing import Process
 
-import numpy as np
-# Note: do not import tensorflow here or you won't be able to train each stage
-# in a new process
+# Note: do not import tensorflow here or you won't be able to train each stage in a new process
 
 from config import Config as cfg
 from utils import TRAIN_MODE, INFERENCE_MODE, TRANSITION_MODE, STABILIZATION_MODE, DEBUG_MODE
@@ -47,7 +45,7 @@ def trace_graphs(config):
 
 
 def run_train_stage(config, images_paths, res, mode):
-    prepare_logger(config[cfg.MODEL_NAME])
+    prepare_logger(config[cfg.MODEL_NAME], res, mode)
     pid = os.getpid()
     logging.info(f'Training for {2**res}x{2**res} resolution and {mode} mode uses PID={pid}')
     prepare_gpu()
