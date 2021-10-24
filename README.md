@@ -1,4 +1,4 @@
-# StyleGAN - TensorFlow 2.x
+﻿# StyleGAN - TensorFlow 2.x
 
 ![Python 3.9](https://img.shields.io/badge/python-3.9-green.svg?style=plastic)
 ![TensorFlow 2.5](https://img.shields.io/badge/tensorflow-2.5-green.svg?style=plastic)
@@ -9,8 +9,6 @@ Tensorflow 2 implementation of the paper
 **"A Style-Based Generator Architecture for Generative Adversarial Networks"** (https://arxiv.org/abs/1812.04948) <br>
 The code is based on the official implementation: https://github.com/NVlabs/stylegan.
 
-*Note:* the code is under active development, so some things have not yet been tested, though when training in 
-*fp32* or *mixed precision* no problems were observed. 
 Settings for stabilization for *mixed precision* tricks might need to be improved to stabilize training for various configs and datasets.
 
 This implementation allows finer control of a training process and model complexity: 
