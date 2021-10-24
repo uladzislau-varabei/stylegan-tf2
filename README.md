@@ -5,8 +5,7 @@
 ![CUDA Toolkit 11.2.2](https://img.shields.io/badge/cudatoolkit-11.2.2-green.svg?style=plastic)
 ![cuDNN 8.1.0.77](https://img.shields.io/badge/cudnn-8.1.0.77-green.svg?style=plastic)
 
-Tensorflow 2 implementation of the paper 
-**"A Style-Based Generator Architecture for Generative Adversarial Networks"** (https://arxiv.org/abs/1812.04948) <br>
+TensorFlow 2 implementation of the paper **"A Style-Based Generator Architecture for Generative Adversarial Networks"** (https://arxiv.org/abs/1812.04948) <br>
 The code is based on the official implementation: https://github.com/NVlabs/stylegan.
 
 Settings for stabilization for *mixed precision* tricks might need to be improved to stabilize training for various configs and datasets.
