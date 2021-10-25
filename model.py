@@ -683,6 +683,10 @@ class StyleGAN(ModelConfig):
             **shared_kwargs
         }
 
+
+        # For stabilization stage, if states not reset, variables from new layers will be incorrectly initialized
+        self.D_optimizer.set_weights(mult_by_zero(self.D_optimizer.get_weights()))
+        self.G_optimizer.set_weights(mult_by_zero(self.G_optimizer.get_weights()))
         if self.use_mixed_precision:
             self.D_optimizer._optimizer = load_model(**D_optimizer_kwargs)
             self.G_optimizer._optimizer = load_model(**G_optimizer_kwargs)

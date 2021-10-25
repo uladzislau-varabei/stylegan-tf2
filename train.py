@@ -46,6 +46,8 @@ def trace_graphs(config):
 
 def run_train_stage(config, images_paths, res, mode):
     prepare_logger(config[cfg.MODEL_NAME], res, mode)
+    logging.info('Running stage with the following config:')
+    logging.info(config)
     pid = os.getpid()
     logging.info(f'Training for {2**res}x{2**res} resolution and {mode} mode uses PID={pid}')
     prepare_gpu()

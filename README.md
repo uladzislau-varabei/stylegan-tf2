@@ -13,8 +13,7 @@ Settings for stabilization for *mixed precision* tricks might need to be improve
 This implementation allows finer control of a training process and model complexity: 
 one can use different parameters which define number of filters of each network (consider function `n_filters()` in `networks.py`), 
 size of latent vector, change activation functions, add/remove biases, set different numbers of images for each stage, 
-use different optimizers settings,
-etc.
+use different optimizers settings, etc.
 
 
 ## Training
